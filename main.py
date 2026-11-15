@@ -5,7 +5,7 @@ import sys
 import aiohttp
 from dotenv import load_dotenv
 from pyrogram import Client, idle
-from pyrogram.errors import SessionExpired, SessionRevoked, Unauthorized
+from pyrogram.errors import FloodWait, SessionExpired, SessionRevoked, Unauthorized
 
 from ai import AiRewriter
 from config import Config, ConfigError
@@ -14,6 +14,27 @@ from panel import Panel
 from registry import Registry, RegistryError
 
 log = logging.getLogger("pars")
+
+
+async def start_panel(panel_client: Client, panel: Panel, owner_id: int, account_name: str) -> bool:
+    """Входит ботом панели. FloodWait ждём на месте: перезапуск процесса только удлиняет бан."""
+    while True:
+        try:
+            await panel_client.start()
+            bot_me = await panel_client.get_me()
+            await panel.start(owner_id, account_name)
+            log.info("Панель управления: @%s - открой её и нажми /start", bot_me.username or bot_me.id)
+            return True
+        except FloodWait as exc:
+            wait = int(getattr(exc, "value", 0) or 0) + 5
+            log.warning("Telegram просит паузу %s сек перед входом бота - пережду сам, автопостинг уже работает.", wait)
+            await asyncio.sleep(wait)
+        except Unauthorized:
+            log.error("BOT_TOKEN не принял Telegram - кнопок не будет, автопостинг работает.")
+            return False
+        except Exception as exc:  # noqa: BLE001 - панель не должна ронять процесс
+            log.error("Панель не поднялась (%s: %s) - кнопки молчат, автопостинг работает.", type(exc).__name__, exc)
+            return False
 
 
 async def amain(cfg: Config) -> None:
@@ -47,18 +68,14 @@ async def amain(cfg: Config) -> None:
         me = await client.get_me()
         log.info("Вход выполнен: %s (id %s)", me.first_name or me.username or "аккаунт", me.id)
 
-        if panel_client:
-            await panel_client.start()
-            bot_me = await panel_client.get_me()
-            await panel.start(me.id, me.first_name or "аккаунт")
-            log.info("Панель управления: @%s - открой её и нажми /start", bot_me.username or bot_me.id)
+        panel_live = bool(panel_client) and await start_panel(panel_client, panel, me.id, me.first_name or "аккаунт")
 
         while not registry.ready:
             try:
                 await bot.setup()
             except RegistryError as exc:
                 log.error("Управление донорами не настроено: %s", exc)
-                if panel_client:
+                if panel_live:
                     log.info("Нажми «🏛 Создать группу» в панели бота - проверю заново через минуту.")
                 else:
                     log.info("Без BOT_TOKEN кнопок нет: создай группу с темами и добавь туда этот аккаунт.")

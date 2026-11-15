@@ -7,9 +7,11 @@ Telegram и нейросеть не трогаем: подменяем клие�
 import asyncio
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from typing import List
 
 from pyrogram.enums import ChatMemberStatus, ChatType
-from pyrogram.errors import ChatForwardsRestricted, FloodWait
+from pyrogram.errors import ChatForwardsRestricted, FloodWait, Unauthorized
 from pyrogram.types import InputMediaPhoto
 from pyrogram.types import Message as _PyrogramMessage
 
@@ -403,6 +405,7 @@ async def main():
     await check_failures()
     await check_panel()
     check_startup_wiring()
+    await check_panel_login_flood()
 
     print(f"\nПроверок: {len(CHECKS)}, неудач: {len(FAILED)}")
     if FAILED:
@@ -893,6 +896,57 @@ def check_startup_wiring() -> None:
     check("у Kurigram нет client.idle", not hasattr(Client, "idle"))
     check("main ждёт через pyrogram.idle", callable(idle) and "await idle()" in source, str(hasattr(idle, "__call__")))
     check("в main не осталось client.idle", "client.idle()" not in source)
+
+
+async def check_panel_login_flood():
+    print("\n[11] Вход бота панели под FloodWait")
+    import main as main_module
+
+    waits: List[int] = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds):
+        waits.append(int(seconds))
+
+    class PanelClient:
+        def __init__(self, errors):
+            self.errors = list(errors)
+            self.starts = 0
+
+        async def start(self):
+            self.starts += 1
+            if self.errors:
+                raise self.errors.pop(0)
+
+        async def get_me(self):
+            return SimpleNamespace(username="panel_bot", id=777)
+
+    class PanelStub:
+        def __init__(self):
+            self.started = 0
+
+        async def start(self, owner_id, account_name):
+            self.started += 1
+
+    asyncio.sleep = fake_sleep
+    try:
+        client = PanelClient([FloodWait(2037, "auth.ImportBotAuthorization"), FloodWait(5, "auth.ImportBotAuthorization")])
+        panel = PanelStub()
+        live = await main_module.start_panel(client, panel, 1, "аккаунт")
+        check("панель дождалась пауз и вошла", live and client.starts == 3 and panel.started == 1, f"{live} {client.starts}")
+        check("пауза равна тому, что просит Telegram", waits == [2042, 10], str(waits))
+
+        broken = PanelClient([Unauthorized("x")])
+        check("плохой BOT_TOKEN не роняет процесс", await main_module.start_panel(broken, PanelStub(), 1, "аккаунт") is False)
+
+        crashed = PanelClient([RuntimeError("что-то не так")])
+        check(
+            "любая ошибка входа панели - только журнал",
+            await main_module.start_panel(crashed, PanelStub(), 1, "аккаунт") is False and crashed.starts == 1,
+            str(crashed.starts),
+        )
+    finally:
+        asyncio.sleep = real_sleep
 
 
 if __name__ == "__main__":
