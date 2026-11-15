@@ -25,7 +25,7 @@ NAME_LIMIT = 50
 DONOR_LIMIT = 1000
 MAX_DONOR_BUTTONS = 30
 
-COMMANDS = [BotCommand("start", "Меню управления"), BotCommand("помощь", "Как это работает")]
+COMMANDS = [BotCommand("start", "Меню управления"), BotCommand("help", "Как это работает")]
 
 HELP = (
     "Как пользоваться:\n"
