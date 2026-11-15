@@ -548,6 +548,19 @@ async def check_flood_and_ai():
     )
 
 
+    broke = FakeSession([FakeResponse(402, text="insufficient balance (1008)") for _ in range(5)])
+    cfg4 = make_cfg(minimax_api_key="key")
+    world4 = build_world(cfg4)
+    bot4 = ParsBot(world4["client"], cfg4, AiRewriter(cfg4, broke), Registry(world4["client"], cfg4))
+    await bot4.setup()
+    await bot4.on_message(world4["client"], Message(world4["client"], 54, world4["donor_sport_1"], caption="исходный текст", photo=Photo("k3")))
+    check(
+        "пустой баланс ИИ: одна попытка и оригинал",
+        len(broke.calls) == 1 and world4["client"].posted[0].caption == "исходный текст",
+        f"{len(broke.calls)} попыток, {world4['client'].posted[0].caption[:20]}",
+    )
+
+
 async def check_commands():
     print("\n[5] Команды в группе")
     world = build_world()

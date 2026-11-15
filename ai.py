@@ -7,6 +7,8 @@ import aiohttp
 log = logging.getLogger("ai")
 
 HARD_LIMIT = 1024
+# Ключ не подошёл или закончился баланс: повторять бессмысленно, ждём только пополнения счёта.
+FATAL_STATUSES = (401, 402, 403)
 
 
 def cut(text: str, limit: int = HARD_LIMIT) -> str:
@@ -52,6 +54,14 @@ class AiRewriter:
         for attempt in range(1, self.cfg.ai_retries + 1):
             try:
                 async with self.session.post(self.cfg.ai_url, json=payload, headers=headers, timeout=timeout) as resp:
+                    if resp.status in FATAL_STATUSES:
+                        log.warning(
+                            "ИИ ответил HTTP %s (%s) -> публикуем оригинальный текст. "
+                            "Нужен рабочий ключ или баланс MiniMax.",
+                            resp.status,
+                            brief(await resp.text()),
+                        )
+                        return cut(text)
                     if resp.status != 200:
                         log.warning("ИИ attempt %s/%s: HTTP %s %s", attempt, self.cfg.ai_retries, resp.status, brief(await resp.text()))
                     else:
