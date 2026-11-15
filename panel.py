@@ -29,7 +29,10 @@ COMMANDS = [BotCommand("start", "Меню управления"), BotCommand("he
 
 HELP = (
     "Как пользоваться:\n"
-    "1) «➕ Новый канал» - напиши название своего канала, куда постить. Тема в группе создаётся сама.\n"
+    "0) «🏛 Создать группу» - напиши название (например «АвтоПост»). "
+    "Бот создаст форум-группу, ты в ней владелец - там живёт весь список.\n"
+    "1) «➕ Новый канал» - напиши название своего канала, куда постить. "
+    "Тема с таким же названием создаётся сама.\n"
     "2) Открой канал и нажми «➕ Донор» - пришли @юзернейм или ссылку https://t.me/... "
     "Сколько ссылок в одном сообщении, столько доноров и добавится.\n"
     "3) Кнопка 🗑 под донором - убрать его из списка.\n"
@@ -42,12 +45,9 @@ HELP = (
 
 NO_GROUP = (
     "Группы-хранилища пока нет - в ней живёт список доноров.\n\n"
-    "1) Создай группу (например «АвтоПост») - ты должен быть её владельцем.\n"
-    "2) В настройках группы включи «Темы».\n"
-    "3) Добавь в группу аккаунт {account} и дай ему права администратора: "
-    "управлять темами и удалять сообщения.\n"
-    "4) Нажми «🔄 Обновить список».\n\n"
-    "Если таких групп несколько, бот сам возьмёт ту, где ты владелец."
+    "Нажми «🏛 Создать группу» и напиши её название (например «АвтоПост»). "
+    "Бот создаст форум-группу сам, ты в ней владелец - руками ничего настраивать не нужно.\n\n"
+    "Если группа уже есть и ты в ней владелец - нажми «🔄 Обновить список»."
 )
 
 Cell = Tuple[str, str]
@@ -142,8 +142,8 @@ class Panel:
             await self._show(query, key)
         elif key == "cat":
             await self._show(query, "cat", arg)
-        elif key in ("add", "channel", "rename"):
-            self.awaiting = {"add": ("donor", arg), "channel": ("channel", 0), "rename": ("rename", arg)}[key]
+        elif key in ("add", "channel", "rename", "group"):
+            self.awaiting = {"add": ("donor", arg), "channel": ("channel", 0), "rename": ("rename", arg), "group": ("group", 0)}[key]
             await self._show(query, key, arg)
         elif key == "del":
             message_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
@@ -182,13 +182,17 @@ class Panel:
                 category = await registry.add_category(text[:NAME_LIMIT])
                 self.notice = self._category_notice(category, f"Канал «{category.name}» добавлен")
                 screen = ("cat", category.topic_id)
+            elif kind == "group":
+                name = await registry.create_storage_group(text[:NAME_LIMIT])
+                self.notice = f"✅ Создал группу-хранилище «{name}». Её владелец - {self.account}. Жми «➕ Новый канал»."
+                screen = ("main", 0)
             else:
                 category = await registry.rename_category(topic_id, text[:NAME_LIMIT])
                 self.notice = self._category_notice(category, f"Переименовал в «{category.name}»")
                 screen = ("cat", topic_id)
         except RegistryError as exc:
             self.notice = f"⚠ {exc}"
-            screen = ("main", 0) if kind == "channel" else ("cat", topic_id)
+            screen = ("main", 0) if kind in ("channel", "group") else ("cat", topic_id)
         except Exception as exc:  # noqa: BLE001 - действие всегда должно заканчиваться ответом
             log.error("Действие из панели упало: %s: %s", type(exc).__name__, exc)
             self.notice = f"⚠ Ошибка: {type(exc).__name__}"
@@ -216,6 +220,8 @@ class Panel:
             return self._add_view(topic_id)
         if kind == "channel":
             return self._new_channel_view()
+        if kind == "group":
+            return self._new_group_view()
         if kind == "rename":
             return self._rename_view(topic_id)
         return self._main_view()
@@ -223,8 +229,9 @@ class Panel:
     def _main_view(self) -> Tuple[str, InlineKeyboardMarkup]:
         registry = self.registry
         if not registry.ready or not registry.group_id:
-            return cut(NO_GROUP.format(account=self.account), TEXT_LIMIT), markup(
-                [("🔄 Обновить список", "update"), ("❓ Как это работает", "help")]
+            return cut(NO_GROUP, TEXT_LIMIT), markup(
+                [("🏛 Создать группу", "group"), ("🔄 Обновить список", "update")],
+                [("❓ Как это работает", "help")],
             )
 
         stats = self.bot.stats
@@ -334,6 +341,17 @@ class Panel:
                 "Напиши название канала, куда постить (например «Спорт»). "
                 "Тема с таким названием создастся в группе сама.\n\n"
                 "Если название темы должно отличаться от названия канала, напиши так: Спорт @sport_ch",
+                TEXT_LIMIT,
+            ),
+            markup([("⬅️ Отмена", "main")]),
+        )
+
+    def _new_group_view(self) -> Tuple[str, InlineKeyboardMarkup]:
+        return (
+            cut(
+                "Напиши название новой группы-хранилища (например «АвтоПост»).\n\n"
+                "Бот создаст форум-группу с этим названием, ты станешь её владельцем, "
+                "а список доноров будет жить внутри неё. Больше ничего настраивать не нужно.",
                 TEXT_LIMIT,
             ),
             markup([("⬅️ Отмена", "main")]),

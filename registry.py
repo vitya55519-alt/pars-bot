@@ -20,6 +20,7 @@ ChatRef = Union[int, str]
 
 GENERAL_TOPIC_ID = 1
 TOPIC_NAME_LIMIT = 50
+GROUP_TITLE_LIMIT = 42
 MANAGER_STATUSES = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
 PUBLIC_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{4,31})", re.I)
 PRIVATE_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/c/(\d{4,20})", re.I)
@@ -157,7 +158,8 @@ class Registry:
                 ) from exc
         elif not self._forums:
             raise RegistryError(
-                "Среди чатов нет группы с темами. Создай группу, включи в ней «Темы» и добавь туда этот аккаунт."
+                "Среди чатов нет группы с темами. Нажми «🏛 Создать группу» в боте - "
+                "темы в ней уже включены."
             )
         elif len(self._forums) == 1:
             chat = self._forums[0]
@@ -368,10 +370,35 @@ class Registry:
             log.warning("Сообщение %s в группе удалить не удалось (%s).", message_id, type(exc).__name__)
         return removed
 
+    async def create_storage_group(self, title: str) -> str:
+        """Создаёт форум-группу-хранилище от имени аккаунта и делает её рабочей."""
+        clean = " ".join((title or "").split())[:GROUP_TITLE_LIMIT]
+        if not clean:
+            raise RegistryError("Нужно название группы, например «АвтоПост».")
+        if self.group_id:
+            raise RegistryError(f"Группа-хранилище уже есть: «{self.group_name}». Удали её, чтобы создать новую.")
+        async with self.lock:
+            try:
+                chat = await call(self.client.create_supergroup, clean, is_forum=True)
+            except Exception as exc:  # noqa: BLE001 - понятная причина в тексте ошибки
+                raise RegistryError(f"Группа не создалась ({type(exc).__name__}). Повтори позже.") from exc
+            self.group = chat.id
+            self.group_id = chat.id
+            self.group_name = chat_name(chat)
+            self.categories = {}
+            self.routes = {}
+            self.target_ids.clear()
+            self.unreadable.clear()
+            self.suppressed.clear()
+            self.ready = True
+            self.last_error = ""
+            log.info("Создал группу-хранилище «%s» (id %s).", self.group_name, self.group_id)
+        return self.group_name
+
     def _need_group(self) -> None:
         if not self.group_id:
             raise RegistryError(
-                "Группы с темами нет. Создай группу, включи в ней «Темы» и добавь туда этот аккаунт."
+                "Группы с темами нет. Нажми «🏛 Создать группу» в боте - она создастся сама."
             )
 
     def _category(self, topic_id: int) -> Category:

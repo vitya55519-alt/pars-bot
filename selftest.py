@@ -258,6 +258,15 @@ class FakeClient:
         self.topics.setdefault(chat_id, []).append(topic)
         return topic
 
+    async def create_supergroup(self, title, description="", is_forum=None, **kwargs):
+        self.next_group = getattr(self, "next_group", -1009000)
+        chat = Chat(self.next_group, title=title, chat_type=ChatType.SUPERGROUP, is_forum=bool(is_forum))
+        self.next_group -= 1
+        self.add_chat(chat)
+        self.created_groups = getattr(self, "created_groups", [])
+        self.created_groups.append(chat)
+        return chat
+
     async def edit_forum_topic(self, chat_id, message_thread_id, name, *args, **kwargs):
         for topic in self.topics.get(chat_id, []):
             if topic.id == message_thread_id:
@@ -696,7 +705,7 @@ async def check_failures():
         await Registry(nothing, make_cfg()).rebuild()
         check("без группы - понятная ошибка", False)
     except RegistryError as exc:
-        check("без группы - понятная ошибка", "создай" in str(exc).lower(), str(exc))
+        check("без группы - понятная ошибка", "создать группу" in str(exc).lower(), str(exc))
 
     two_groups = FakeClient()
     two_groups.add_chat(Chat(-10010, title="Раз", chat_type=ChatType.SUPERGROUP, is_forum=True))
@@ -849,7 +858,17 @@ async def check_panel():
     remote = Panel(lonely, lonely_cfg, lonely_registry, lonely_bot)
     await remote.start(boss.id, "Фогель")
     await remote.on_message(lonely, Message(lonely, 5011, boss, text="/start"))
-    check("без группы даётся инструкция", "Темы" in lonely.replies[-1][1], lonely.replies[-1][1][:120])
+    check("без группы предлагается создать её кнопкой", "Создать группу" in lonely.replies[-1][1], lonely.replies[-1][1][:120])
+
+    def lonely_press(data):
+        msg = Message(lonely, 6001, boss, text="меню")
+        return Query(lonely, data, boss.id, msg)
+
+    await remote.on_button(lonely, lonely_press("group"))
+    await remote.on_message(lonely, Message(lonely, 5012, boss, text="АвтоПост"))
+    check("группа-хранилище создана кнопкой", lonely_registry.ready and lonely_registry.group_name == "АвтоПост", f"{lonely_registry.ready} {lonely_registry.group_name}")
+    check("созданная группа - форум", bool(lonely.created_groups) and lonely.created_groups[-1].is_forum, str(lonely.created_groups[-1].is_forum) if lonely.created_groups else "нет")
+    check("после создания видно меню", "АвтоПост" in lonely.replies[-1][1], lonely.replies[-1][1][:120])
 
 
 if __name__ == "__main__":
