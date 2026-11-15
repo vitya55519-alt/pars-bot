@@ -58,7 +58,10 @@ async def amain(cfg: Config) -> None:
                 await bot.setup()
             except RegistryError as exc:
                 log.error("Управление донорами не настроено: %s", exc)
-                log.info("Создай группу с темами и добавь туда этот аккаунт - проверю заново через минуту.")
+                if panel_client:
+                    log.info("Нажми «🏛 Создать группу» в панели бота - проверю заново через минуту.")
+                else:
+                    log.info("Без BOT_TOKEN кнопок нет: создай группу с темами и добавь туда этот аккаунт.")
                 await asyncio.sleep(60)
 
         log.info("Настройки:\n%s", cfg.describe())
