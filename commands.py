@@ -32,13 +32,13 @@ COMMANDS = {
 }
 
 HELP = (
-    "Как управлять донорами:\n"
-    "1) Создай тему с названием своего канала (например «Спорт» - и канал должен называться «Спорт»).\n"
-    "   Если канал называется иначе, напиши его юзернейм в название темы: Спорт @sport_channel\n"
-    "2) Кинь в эту тему ссылки доноров: @donor_channel или https://t.me/donor - их можно несколько в одном сообщении.\n"
-    "3) /обнови - перечитать все темы заново, /список - что получилось, /статус - как работает.\n"
-    "4) /убери ответом на сообщение со ссылкой - вычеркнуть этого донора.\n"
-    "5) /пауза - ничего не публиковать, /старт - возобновить."
+    "Основное управление - кнопками в твоём боте (@bot_post_sam_bot): там добавляются каналы и доноры.\n"
+    "Эти команды - запасной способ, если бот недоступен:\n"
+    "1) /список - что сейчас в списке, /статус - как работает.\n"
+    "2) /обнови - перечитать все темы заново.\n"
+    "3) /убери ответом на сообщение со ссылкой - вычеркнуть донора.\n"
+    "4) /пауза - ничего не публиковать, /старт - возобновить.\n"
+    "Ссылки в темах = доноры этой темы; название темы = канал, куда постить."
 )
 
 
@@ -78,7 +78,10 @@ class Controls:
 
     async def on_deleted(self, client, messages) -> None:
         group = self.registry.group_id
-        if not group or self._rebuilding or not any(message.chat.id == group for message in messages):
+        ids = {message.id for message in messages if message.chat.id == group}
+        if not group or self._rebuilding or not ids:
+            return
+        if {message_id for message_id in ids if self.registry.took_out(message_id)} == ids:
             return
         self._rebuilding = True
         try:

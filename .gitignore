@@ -1,5 +1,6 @@
 .env
 login_journal.txt
+_diag.py
 __pycache__/
 *.pyc
 *.session

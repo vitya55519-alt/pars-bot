@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass, field
-from typing import Union
+from typing import List, Union
 
 MINIMAX_URL = "https://api.minimax.io/v1/chat/completions"
 DEFAULT_MODEL = "MiniMax-M3"
@@ -41,6 +41,10 @@ def _number(name: str, default: float) -> float:
         return default
 
 
+def _ids(name: str) -> list:
+    return [int(part) for part in _text(name).replace(";", ",").split(",") if part.strip().lstrip("-").isdigit()]
+
+
 @dataclass
 class Config:
     api_id: int
@@ -64,10 +68,16 @@ class Config:
     cache_size: int = 500
     history_limit: int = 200
     caption_limit: int = field(default=1024)
+    bot_token: str = ""
+    panel_admins: List[int] = field(default_factory=list)
 
     @property
     def promo_enabled(self) -> bool:
         return bool(self.promo_bot)
+
+    @property
+    def panel_enabled(self) -> bool:
+        return bool(self.bot_token)
 
     @classmethod
     def load(cls) -> "Config":
@@ -100,6 +110,8 @@ class Config:
             album_wait=_number("ALBUM_WAIT", 2.0),
             cache_size=int(_number("CACHE_SIZE", 500)),
             history_limit=int(_number("HISTORY_LIMIT", 200)),
+            bot_token=_text("BOT_TOKEN"),
+            panel_admins=_ids("PANEL_ADMINS"),
         )
 
     def describe(self) -> str:
@@ -113,8 +125,10 @@ class Config:
         else:
             promo = "выключено"
         group = self.management_chat or "найду сам среди групп с темами"
+        panel = "ключ задан - управляй кнопками в своём боте" if self.panel_enabled else "нет BOT_TOKEN - команды в группе"
         return (
             f"Группа управления донорами: {group}\n"
+            f"Панель кнопок: {panel}\n"
             f"Промо-бот: {promo}\n"
             f"Нейросеть: {self.ai_model} (глубина {self.ai_reasoning_effort}), "
             f"попыток: {self.ai_retries}, пауза: {self.ai_retry_delay} сек"

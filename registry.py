@@ -19,6 +19,7 @@ log = logging.getLogger("registry")
 ChatRef = Union[int, str]
 
 GENERAL_TOPIC_ID = 1
+TOPIC_NAME_LIMIT = 50
 MANAGER_STATUSES = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
 PUBLIC_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{4,31})", re.I)
 PRIVATE_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/c/(\d{4,20})", re.I)
@@ -92,6 +93,7 @@ class Registry:
         self.ready = False
         self.last_error = ""
         self.unreadable: List[str] = []
+        self.suppressed: Set[int] = set()
         self._titles: Dict[str, ChatRef] = {}
         self._forums: List = []
         self._general_hint_shown = False
@@ -104,6 +106,7 @@ class Registry:
             await self._pick_group()
             self.target_ids.clear()
             self.unreadable.clear()
+            self.suppressed.clear()
 
             categories: Dict[int, Category] = {}
             async for topic in self.client.get_forum_topics(self.group_id):
@@ -263,16 +266,105 @@ class Registry:
 
     async def forget(self, message) -> List[Donor]:
         """Команда /убери ответом на сообщение со ссылкой."""
+        return await self.forget_ids({message.id})
+
+    async def forget_ids(self, message_ids: Set[int]) -> List[Donor]:
         removed: List[Donor] = []
         async with self.lock:
             for category in self.categories.values():
                 for chat_id, donor in list(category.donors.items()):
-                    if donor.message_id != message.id:
+                    if donor.message_id not in message_ids:
                         continue
                     del category.donors[chat_id]
                     self.routes.pop(chat_id, None)
                     removed.append(donor)
         return removed
+
+    # ==== действия по кнопкам из бота управления ====
+
+    async def add_category(self, name: str) -> Category:
+        """Новая категория = новая тема с названием целевого канала."""
+        clean = " ".join((name or "").split())[:TOPIC_NAME_LIMIT]
+        if not clean:
+            raise RegistryError("Нужно название канала, например «Спорт» или Спорт @sport_ch.")
+        self._need_group()
+        if self.categories:
+            for category in self.categories.values():
+                if norm_title(category.name) == norm_title(clean):
+                    raise RegistryError(f"Канал «{category.name}» уже есть в списке.")
+
+        async with self.lock:
+            topic = await call(self.client.create_forum_topic, self.group_id, clean)
+            topic_id = int(getattr(topic, "id", 0) or getattr(topic, "message_thread_id", 0) or 0)
+            if not topic_id:
+                raise RegistryError("Telegram не прислал id новой темы - повтори позже.")
+            category = Category(topic_id, clean)
+            self.categories[topic_id] = category
+            await self._resolve_target(category)
+            self._reindex()
+        return category
+
+    async def rename_category(self, topic_id: int, name: str) -> Category:
+        clean = " ".join((name or "").split())[:TOPIC_NAME_LIMIT]
+        category = self._category(topic_id)
+        if not clean:
+            raise RegistryError("Новое название пустое.")
+
+        async with self.lock:
+            await call(self.client.edit_forum_topic, self.group_id, topic_id, clean)
+            old = category.target
+            category.name = clean
+            category.problem = ""
+            await self._resolve_target(category)
+            if old and old not in (c.target for c in self.categories.values()):
+                self.target_ids.discard(old)
+            self._reindex()
+        return category
+
+    async def add_donor(self, topic_id: int, text: str) -> List[Donor]:
+        """Пишем ссылку в тему - и она сразу становится донором."""
+        category = self._category(topic_id)
+        refs = extract_refs(text or "")
+        if not refs:
+            raise RegistryError("Это не ссылка на канал. Нужен @юзернейм или https://t.me/...")
+
+        posted = await call(self.client.send_message, self.group_id, text, message_thread_id=topic_id)
+        async with self.lock:
+            added = await self._absorb(text, posted.id, category)
+            for donor in added:
+                self.routes[donor.chat_id] = topic_id
+        if not added:
+            await call(self.client.delete_messages, self.group_id, [posted.id])
+            raise RegistryError(
+                f"Канал {', '.join(str(ref) for ref in refs)} не открылся: "
+                "подпишись на него этим аккаунтом или возьми точный @юзернейм."
+            )
+        return added
+
+    async def remove_donor(self, message_id: int) -> List[Donor]:
+        removed = await self.forget_ids({message_id})
+        if not removed:
+            raise RegistryError("Этого донора в списке уже нет - нажми «Обновить».")
+        self.suppressed.add(message_id)
+        try:
+            await call(self.client.delete_messages, self.group_id, [message_id])
+        except Exception as exc:  # noqa: BLE001 - вычеркнули, а удалить не дали права
+            self.suppressed.discard(message_id)
+            log.warning("Сообщение %s в группе удалить не удалось (%s).", message_id, type(exc).__name__)
+        return removed
+
+    def _need_group(self) -> None:
+        if not self.group_id:
+            raise RegistryError(
+                "Группы с темами нет. Создай группу, включи в ней «Темы» и добавь туда этот аккаунт."
+            )
+
+    def _category(self, topic_id: int) -> Category:
+        self._need_group()
+        category = self.categories.get(topic_id)
+        if category is None:
+            raise RegistryError("Такой темы уже нет - нажми «Обновить».")
+        return category
 
     # ==== чтение ====
 
@@ -306,3 +398,10 @@ class Registry:
         if self.unreadable:
             found.append("не открылись ссылки: " + ", ".join(sorted(set(self.unreadable))))
         return found
+
+    def took_out(self, message_id: int) -> bool:
+        """Удаление по кнопке не должно запускать перечитывание всей группы."""
+        if message_id not in self.suppressed:
+            return False
+        self.suppressed.discard(message_id)
+        return True

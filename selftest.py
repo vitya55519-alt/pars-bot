@@ -16,6 +16,7 @@ from pyrogram.types import Message as _PyrogramMessage
 from ai import AiRewriter
 from config import Config
 from handlers import ParsBot
+from panel import Panel
 from registry import Registry, RegistryError, extract_refs
 
 CHECKS = []
@@ -92,7 +93,7 @@ class Message(_PyrogramMessage):
         self.client = client
 
     async def reply(self, text, *args, **kwargs):
-        self.client.replies.append((self.chat.id, text))
+        self.client.replies.append((self.chat.id, text, kwargs.get("reply_markup")))
         return Message(self.client, 9000 + len(self.client.replies), self.chat, text=text)
 
     async def delete(self, *args, **kwargs):
@@ -111,6 +112,20 @@ class Clickable(Message):
         return None
 
 
+class Query:
+    """Клик по inline-кнопке: data, кто нажал, на каком сообщении."""
+
+    def __init__(self, client, data, user_id, message):
+        self.data = data
+        self.from_user = User(user_id)
+        self.message = message
+        self.answers = []
+
+    async def answer(self, text="", show_alert=False, **kwargs):
+        self.answers.append((text, show_alert))
+        return True
+
+
 class FakeClient:
     def __init__(self):
         self.chats = {}
@@ -126,6 +141,11 @@ class FakeClient:
         self.replies = []
         self.deleted = []
         self.sent = []
+        self.topic_posts = []
+        self.edits = []
+        self.commands = []
+        self.topic_edits = []
+        self.next_topic = 90
         self.delete_fails = False
         self.flood_left = 0
         self.handlers = []
@@ -208,7 +228,40 @@ class FakeClient:
 
     async def send_message(self, chat, text, *args, **kwargs):
         self.sent.append((chat, text))
-        return Message(self, 1000, await self.get_chat(chat), text=text)
+        thread = kwargs.get("message_thread_id")
+        self.topic_posts.append((chat, text, thread))
+        message = Message(self, 1000 + len(self.sent), await self.get_chat(chat), text=text, thread=thread)
+        if thread:
+            self.group_messages.append(message)
+        return message
+
+    async def delete_messages(self, chat, message_ids, *args, **kwargs):
+        ids = [message_ids] if isinstance(message_ids, int) else list(message_ids)
+        if self.delete_fails:
+            raise RuntimeError("не админ")
+        self.deleted += ids
+        return len(ids)
+
+    async def create_forum_topic(self, chat_id, name, *args, **kwargs):
+        topic = Topic(self.next_topic, name)
+        self.next_topic += 1
+        self.topics.setdefault(chat_id, []).append(topic)
+        return topic
+
+    async def edit_forum_topic(self, chat_id, message_thread_id, name, *args, **kwargs):
+        for topic in self.topics.get(chat_id, []):
+            if topic.id == message_thread_id:
+                topic.name = name
+        self.topic_edits.append((message_thread_id, name))
+        return True
+
+    async def edit_message_text(self, chat, message_id, text, reply_markup=None, **kwargs):
+        self.edits.append((chat, message_id, text, reply_markup))
+        return Message(self, message_id, await self.get_chat(chat), text=text)
+
+    async def set_bot_commands(self, commands, *args, **kwargs):
+        self.commands += list(commands)
+        return True
 
     async def get_messages(self, chat, limit=None):
         return []
@@ -329,6 +382,7 @@ async def main():
     await check_live_and_delete()
     await check_promo_flow()
     await check_failures()
+    await check_panel()
 
     print(f"\nПроверок: {len(CHECKS)}, неудач: {len(FAILED)}")
     if FAILED:
@@ -522,7 +576,7 @@ async def check_commands():
     check("ссылку чужого человека не добавляем", world["donor_other"].id not in registry.categories[21].donors)
 
     await controls.on_group_message(client, Message(client, 70, group, text="/помощь", thread=21))
-    check("/помощь объясняет", "Создай тему" in client.replies[-1][1], client.replies[-1][1][:60])
+    check("/помощь объясняет", "кнопками" in client.replies[-1][1], client.replies[-1][1][:60])
 
 
 async def check_live_and_delete():
@@ -653,6 +707,133 @@ async def check_failures():
     check("битая ссылка не рвёт сборку", registry6.ready and registry6.unreadable == ["ghost_channel"], str(registry6.unreadable))
     check("тема без канала помечена", "нет канала" in registry6.categories[32].problem, registry6.categories[32].problem)
     check("замечания видны в /статус", any("нет канала" in line for line in registry6.problems()), str(registry6.problems()))
+
+
+async def check_panel():
+    print("\n[9] Панель управления кнопками в боте")
+    cfg = make_cfg(bot_token="900:AAstub")
+    world = build_world(cfg)
+    client = world["client"]
+    group = world["group"]
+    fitnes = client.add_chat(Chat(-10081, title="Фитнес", chat_type=ChatType.CHANNEL))
+    yoga = client.add_chat(Chat(-10082, title="Йога", chat_type=ChatType.CHANNEL))
+    new_donor = client.add_chat(Chat(-10080, title="Бег", username="donor_run"))
+    owner = client.add_user(User(777, "Витя"))
+    stranger = client.add_user(User(888, "Чужой"))
+
+    bot, registry, _ = await make_bot(world)
+    panel = Panel(client, cfg, registry, bot)
+    panel.setup()
+    await panel.start(owner.id, "Фогель")
+
+    rebuilt = []
+    original_rebuild = registry.rebuild
+
+    async def spy():
+        rebuilt.append(1)
+        return await original_rebuild()
+
+    registry.rebuild = spy
+
+    def press(data, user_id=None):
+        return Query(client, data, user_id or owner.id, Message(client, 5001, owner, text="x"))
+
+    def last_edit():
+        return client.edits[-1][2]
+
+    def last_reply():
+        return client.replies[-1]
+
+    check("подсказки команд заданы", len(client.commands) == 2, str(len(client.commands)))
+    check("у бота два обработчика", len(client.handlers) == 5, str(len(client.handlers)))
+
+    await panel.on_message(client, Message(client, 5002, owner, text="/start"))
+    check("меню знает группу и счётчики", "АвтоПост" in last_reply()[1] and "Каналов: 2" in last_reply()[1], last_reply()[1][:90])
+    cells = [button.callback_data for row in last_reply()[2].inline_keyboard for button in row]
+    check("в меню есть кнопка списков", "topics" in cells, str(cells))
+
+    await panel.on_message(client, Message(client, 5003, stranger, text="/start"))
+    check("чужому доступ закрыт", "только владельца" in last_reply()[1], last_reply()[1][:60])
+    wrong = press("topics", stranger.id)
+    await panel.on_button(client, wrong)
+    check("чужая кнопка не исполняется", client.edits == [] and "Доступ" in wrong.answers[0][0], str(wrong.answers))
+
+    await panel.on_button(client, press("cat|21"))
+    check("экран канала показывает доноров", "Доноры (2)" in last_edit(), last_edit()[:90])
+    await panel.on_button(client, press("topics"))
+    check("список каналов назван", "Спорт" in last_edit() and "Юмор" in last_edit(), last_edit()[:90])
+    await panel.on_button(client, press("status"))
+    check("статус описывает настройки", "Промо-бот" in last_edit() and "promo_bot" in last_edit(), last_edit()[:90])
+    await panel.on_button(client, press("help"))
+    check("помощь объясняет кнопки", "Как пользоваться" in last_edit(), last_edit()[:60])
+
+    await panel.on_button(client, press("del|21|1"))
+    check("донор убран кнопкой", world["donor_sport_1"].id not in registry.categories[21].donors)
+    check("сообщение со ссылкой удалено", 1 in client.deleted, str(client.deleted))
+    check("убранное не перечитывает группу", rebuilt == [], str(rebuilt))
+    check("экран подтверждает удаление", "Убрал донора" in last_edit(), last_edit()[:80])
+    await panel.on_button(client, press("del|21|999"))
+    check("несуществующий донор - понятный отказ", "уже нет" in last_edit(), last_edit()[:80])
+
+    await panel.on_button(client, press("add|21"))
+    check("кнопка донора просит ссылку", "Пришли ссылку" in last_edit(), last_edit()[:80])
+    await panel.on_message(client, Message(client, 5004, owner, text="https://t.me/donor_run"))
+    check("донор добавлен из бота", new_donor.id in registry.categories[21].donors)
+    check("маршрут появился", registry.routes.get(new_donor.id) == 21, str(registry.routes))
+    check("ссылка записана в тему группы", client.topic_posts[-1] == (group.id, "https://t.me/donor_run", 21), str(client.topic_posts[-1]))
+    check("ответ подтверждает добавление", "Добавил доноров" in last_reply()[1], last_reply()[1][:80])
+
+    await panel.on_button(client, press("add|21"))
+    await panel.on_message(client, Message(client, 5005, owner, text="привет"))
+    check("текст без ссылки отклонён", "не ссылка" in last_reply()[1], last_reply()[1][:80])
+    await panel.on_button(client, press("add|21"))
+    await panel.on_message(client, Message(client, 5006, owner, text="@ghost_channel"))
+    check("битая ссылка отклонена", "не открылся" in last_reply()[1], last_reply()[1][:80])
+    check("мусорная запись из темы удалена", client.deleted[-1] >= 1000, str(client.deleted[-3:]))
+
+    await panel.on_button(client, press("channel"))
+    check("кнопка канала просит название", "Напиши название" in last_edit(), last_edit()[:80])
+    await panel.on_message(client, Message(client, 5007, owner, text="Фитнес"))
+    fitness_topic = next(id_ for id_, category in registry.categories.items() if category.name == "Фитнес")
+    check("тема для нового канала создана", any(topic.id == fitness_topic for topic in client.topics[group.id]))
+    check("канал привязан по названию", registry.categories[fitness_topic].target == fitnes.id)
+    check("добавление подтверждено", "добавлен" in last_reply()[1], last_reply()[1][:80])
+    await panel.on_button(client, press("channel"))
+    await panel.on_message(client, Message(client, 5008, owner, text="Фитнес"))
+    check("дубликат канала отклонён", "уже есть" in last_reply()[1], last_reply()[1][:80])
+
+    await panel.on_button(client, press(f"rename|{fitness_topic}"))
+    await panel.on_message(client, Message(client, 5009, owner, text="Йога"))
+    category = registry.categories[fitness_topic]
+    check("канал переименован", category.name == "Йога" and category.target == yoga.id, f"{category.name} -> {category.target_name}")
+    check("тема переименована в группе", client.topic_edits[-1] == (fitness_topic, "Йога"), str(client.topic_edits))
+
+    await panel.on_button(client, press("pause"))
+    check("пауза кнопкой", registry.paused is True and "пауза" in last_edit(), last_edit()[:80])
+    await bot.on_message(client, Message(client, 5010, world["donor_sport_1"], caption="текст", photo=Photo("pa1")))
+    check("на паузе не публикуем", not client.posted)
+    await panel.on_button(client, press("start"))
+    check("пуск кнопкой", registry.paused is False, last_edit()[:80])
+
+    await panel.on_button(client, press("update"))
+    check("обновление перечитывает группу", rebuilt == [1], str(rebuilt))
+    check("после обновления виден результат", "Список обновлён" in last_edit(), last_edit()[:90])
+    check("добавленный из бота донор пережил перечитку", new_donor.id in registry.categories[21].donors)
+    registry.rebuild = original_rebuild
+
+    lonely = FakeClient()
+    boss = lonely.add_user(User(777, "Витя"))
+    lonely_cfg = make_cfg(bot_token="900:AAstub")
+    lonely_registry = Registry(lonely, lonely_cfg)
+    lonely_bot = ParsBot(lonely, lonely_cfg, StubAI(), lonely_registry)
+    try:
+        await lonely_bot.setup()
+    except RegistryError:
+        pass
+    remote = Panel(lonely, lonely_cfg, lonely_registry, lonely_bot)
+    await remote.start(boss.id, "Фогель")
+    await remote.on_message(lonely, Message(lonely, 5011, boss, text="/start"))
+    check("без группы даётся инструкция", "Темы" in lonely.replies[-1][1], lonely.replies[-1][1][:120])
 
 
 if __name__ == "__main__":
