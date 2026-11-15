@@ -1,0 +1,6 @@
+.env
+login_journal.txt
+__pycache__/
+*.pyc
+*.session
+*.session-journal
