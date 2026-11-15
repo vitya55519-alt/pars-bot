@@ -402,6 +402,7 @@ async def main():
     await check_promo_flow()
     await check_failures()
     await check_panel()
+    check_startup_wiring()
 
     print(f"\nПроверок: {len(CHECKS)}, неудач: {len(FAILED)}")
     if FAILED:
@@ -882,6 +883,16 @@ async def check_panel():
     check("группа-хранилище создана кнопкой", lonely_registry.ready and lonely_registry.group_name == "АвтоПост", f"{lonely_registry.ready} {lonely_registry.group_name}")
     check("созданная группа - форум", bool(lonely.created_groups) and lonely.created_groups[-1].is_forum, str(lonely.created_groups[-1].is_forum) if lonely.created_groups else "нет")
     check("после создания видно меню", "АвтоПост" in lonely.replies[-1][1], lonely.replies[-1][1][:120])
+
+
+def check_startup_wiring() -> None:
+    print("\n[10] Запуск процесса")
+    from pyrogram import Client, idle
+
+    source = open("main.py", encoding="utf-8").read()
+    check("у Kurigram нет client.idle", not hasattr(Client, "idle"))
+    check("main ждёт через pyrogram.idle", callable(idle) and "await idle()" in source, str(hasattr(idle, "__call__")))
+    check("в main не осталось client.idle", "client.idle()" not in source)
 
 
 if __name__ == "__main__":

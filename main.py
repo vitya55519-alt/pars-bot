@@ -4,7 +4,7 @@ import sys
 
 import aiohttp
 from dotenv import load_dotenv
-from pyrogram import Client
+from pyrogram import Client, idle
 from pyrogram.errors import SessionExpired, SessionRevoked, Unauthorized
 
 from ai import AiRewriter
@@ -66,7 +66,7 @@ async def amain(cfg: Config) -> None:
 
         log.info("Настройки:\n%s", cfg.describe())
         log.info("Готов - жду новые посты от доноров.")
-        await client.idle()
+        await idle()
     except (Unauthorized, SessionExpired, SessionRevoked) as exc:
         log.error("Сессия недействительна (%s). Нужно создать SESSION_STRING заново: python make_session.py", type(exc).__name__)
         raise SystemExit(1)
