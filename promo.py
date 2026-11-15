@@ -11,21 +11,22 @@ class Promoter:
         self.client = client
         self.cfg = cfg
 
-    async def push(self, message) -> None:
+    async def push(self, message) -> bool:
         if not self.cfg.promo_enabled:
-            return
+            return False
 
         try:
             await call(self.client.forward_messages, self.cfg.promo_bot, message.chat.id, message.id)
             log.info("Переслано в промо-бота %s.", self.cfg.promo_bot)
         except Exception as exc:  # noqa: BLE001 - продвижение не должно ронять публикацию
             log.error("Не удалось переслать в промо-бота: %s: %s", type(exc).__name__, exc)
-            return
+            return False
 
         if self.cfg.promo_mode == "command":
             await self._send_command()
         elif self.cfg.promo_mode == "button":
             await self._click_button()
+        return True
 
     async def _send_command(self) -> None:
         if not self.cfg.promo_command:

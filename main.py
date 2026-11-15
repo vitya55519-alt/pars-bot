@@ -10,6 +10,7 @@ from pyrogram.errors import SessionExpired, SessionRevoked, Unauthorized
 from ai import AiRewriter
 from config import Config, ConfigError
 from handlers import ParsBot
+from registry import Registry, RegistryError
 
 log = logging.getLogger("pars")
 
@@ -23,15 +24,24 @@ async def amain(cfg: Config) -> None:
         session_string=cfg.session_string,
         workers=4,
     )
-    bot = ParsBot(client, cfg, AiRewriter(cfg, session))
+    registry = Registry(client, cfg)
+    bot = ParsBot(client, cfg, AiRewriter(cfg, session), registry)
 
     try:
         await client.start()
         me = await client.get_me()
         log.info("Вход выполнен: %s (id %s)", me.first_name or me.username or "аккаунт", me.id)
-        await bot.setup()
+
+        while not registry.ready:
+            try:
+                await bot.setup()
+            except RegistryError as exc:
+                log.error("Управление донорами не настроено: %s", exc)
+                log.info("Создай группу с темами и добавь туда этот аккаунт - проверю заново через минуту.")
+                await asyncio.sleep(60)
+
         log.info("Настройки:\n%s", cfg.describe())
-        log.info("Готов - жду новые посты от доноров.")
+        log.info("Готов - жду новые посты от доноров. Команды: /помощь в группе.")
         await client.idle()
     except (Unauthorized, SessionExpired, SessionRevoked) as exc:
         log.error("Сессия недействительна (%s). Нужно создать SESSION_STRING заново: python make_session.py", type(exc).__name__)

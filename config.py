@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass, field
-from typing import List, Union
+from typing import Union
 
 PROMO_MODES = ("forward", "command", "button")
 
@@ -29,10 +29,6 @@ def _chat(raw: str) -> Union[int, str]:
     return value.lstrip("@")
 
 
-def _chats(raw: str) -> List[Union[int, str]]:
-    return [_chat(part) for part in raw.split(",") if part.strip()]
-
-
 def _text(name: str, default: str = "") -> str:
     return (os.environ.get(name) or "").strip() or default
 
@@ -52,8 +48,7 @@ class Config:
     api_id: int
     api_hash: str
     session_string: str
-    source_chats: List[Union[int, str]]
-    target_chat: Union[int, str]
+    management_chat: Union[int, str, None] = None
     promo_bot: Union[int, str, None] = None
     minimax_api_key: str = ""
     ai_url: str = MINIMAX_URL
@@ -70,6 +65,7 @@ class Config:
     promo_delay: int = 3
     album_wait: float = 2.0
     cache_size: int = 500
+    history_limit: int = 200
     caption_limit: int = field(default=1024)
 
     @property
@@ -80,7 +76,7 @@ class Config:
     def load(cls) -> "Config":
         missing = [
             name
-            for name in ("API_ID", "API_HASH", "SESSION_STRING", "SOURCE_CHATS", "TARGET_CHAT")
+            for name in ("API_ID", "API_HASH", "SESSION_STRING")
             if not _text(name)
         ]
         if missing:
@@ -94,8 +90,7 @@ class Config:
             api_id=int(_number("API_ID", 0)),
             api_hash=_text("API_HASH"),
             session_string=_text("SESSION_STRING"),
-            source_chats=_chats(_text("SOURCE_CHATS")),
-            target_chat=_chat(_text("TARGET_CHAT")),
+            management_chat=_chat(_text("MANAGEMENT_CHAT")) or None,
             promo_bot=_chat(_text("PROMO_BOT")) or None,
             minimax_api_key=_text("MINIMAX_API_KEY"),
             ai_url=_text("MINIMAX_API_URL", MINIMAX_URL),
@@ -112,6 +107,7 @@ class Config:
             promo_delay=int(_number("PROMO_DELAY", 3)),
             album_wait=_number("ALBUM_WAIT", 2.0),
             cache_size=int(_number("CACHE_SIZE", 500)),
+            history_limit=int(_number("HISTORY_LIMIT", 200)),
         )
 
     def describe(self) -> str:
@@ -120,10 +116,10 @@ class Config:
             if isinstance(self.promo_bot, str)
             else str(self.promo_bot)
         )
+        group = self.management_chat or "найду сам среди групп с темами"
         return (
-            f"Доноры: {', '.join(map(str, self.source_chats))}\n"
-            f"Целевой канал: {self.target_chat}\n"
+            f"Группа управления донорами: {group}\n"
             f"Промо-бот: {promo or 'выключено'}\n"
             f"Нейросеть: {self.ai_model} (глубина {self.ai_reasoning_effort}), "
-            f"ретраев: {self.ai_retries}, пауза: {self.ai_retry_delay} сек"
+            f"попыток: {self.ai_retries}, пауза: {self.ai_retry_delay} сек"
         )

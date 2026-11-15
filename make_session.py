@@ -17,7 +17,7 @@ import subprocess
 import sys
 
 from dotenv import dotenv_values, set_key
-from pyrogram import Client, raw
+from pyrogram import Client
 from pyrogram.errors import FloodWait, SessionPasswordNeeded
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -125,18 +125,12 @@ def describe_delivery(sent_code) -> str:
 
 
 async def request_sms(client: Client, phone: str, sent):
-    """Telegram сам выбирает доставку, поэтому СМС просим напрямую через raw-запрос."""
+    """Telegram сам выбирает, чем отправить код, поэтому просим выдачу заново."""
     try:
-        return await client.invoke(
-            raw.functions.auth.ResendCode(
-                phone_number=phone,
-                phone_code_hash=sent.phone_code_hash,
-                type=raw.types.CodeRequestTypeSms(),
-            )
-        )
-    except Exception as exc:  # noqa: BLE001
-        step(f"Прямой запрос СМС не прошёл ({type(exc).__name__}) - прошу код обычным способом")
         return await client.resend_code(phone, sent.phone_code_hash)
+    except Exception as exc:  # noqa: BLE001 - отказ повторной выдачи не должен обрывать вход
+        step(f"Новый код запросить не удалось ({type(exc).__name__}) - попробуй тот, что уже приходил")
+        return sent
 
 
 async def authenticate(client: Client) -> None:
@@ -146,7 +140,7 @@ async def authenticate(client: Client) -> None:
     step(f"Код отправлен: {describe_delivery(sent)}")
 
     for try_number in range(1, MAX_CODE_TRIES + 1):
-        code = read_line(f"Код из Telegram (попытка {try_number}/{MAX_CODE_TRIES}, «sms» - запросить СМС): ")
+        code = read_line(f"Код из Telegram (попытка {try_number}/{MAX_CODE_TRIES}, «sms» - запросить новый код): ")
         if code.lower() in {"sms", "смс", "s"}:
             sent = await request_sms(client, phone, sent)
             step(f"Попросил Telegram выдать код СМС: {describe_delivery(sent)}")
