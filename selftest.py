@@ -150,7 +150,12 @@ class FakeClient:
         self.flood_left = 0
         self.handlers = []
         self.admins = {111}
+        self.owned = None
+        self.me = User(111, "Я")
         self.executor = ThreadPoolExecutor(max_workers=2)
+
+    async def get_me(self):
+        return self.me
 
     def add_handler(self, handler, group: int = 0):
         self.handlers.append(handler)
@@ -191,7 +196,12 @@ class FakeClient:
                 yield message
 
     async def get_chat_member(self, chat_id, user_id):
-        status = ChatMemberStatus.OWNER if user_id in self.admins else ChatMemberStatus.MEMBER
+        if user_id not in self.admins:
+            status = ChatMemberStatus.MEMBER
+        elif self.owned is None or chat_id in self.owned:
+            status = ChatMemberStatus.OWNER
+        else:
+            status = ChatMemberStatus.ADMINISTRATOR
         return type("Member", (), {"status": status})()
 
     async def send_photo(self, chat, file_id, caption=None, **kwargs):
@@ -696,6 +706,12 @@ async def check_failures():
         check("две группы без MANAGEMENT_CHAT - ошибка", False)
     except RegistryError as exc:
         check("две группы без MANAGEMENT_CHAT - ошибка", "MANAGEMENT_CHAT" in str(exc), str(exc))
+        check("в ошибке видны id групп", "-10010" in str(exc) and "-10011" in str(exc), str(exc))
+
+    two_groups.owned = {-10011}
+    chosen = Registry(two_groups, make_cfg())
+    await chosen.rebuild()
+    check("своя группа угадывается по владению", chosen.group_id == -10011, str(chosen.group_id))
 
     broken_ref = FakeClient()
     group = broken_ref.add_chat(Chat(-10010, title="Панель", chat_type=ChatType.SUPERGROUP, is_forum=True))

@@ -155,15 +155,23 @@ class Registry:
                     f"Группа {self.group} не открылась ({type(exc).__name__}). "
                     "Проверь, что этот аккаунт состоит в группе."
                 ) from exc
-        elif self._forums:
-            if len(self._forums) > 1:
-                names = ", ".join(chat_name(chat) for chat in self._forums)
-                raise RegistryError(f"Несколько групп с темами: {names}. Укажи MANAGEMENT_CHAT.")
-            chat = self._forums[0]
-        else:
+        elif not self._forums:
             raise RegistryError(
                 "Среди чатов нет группы с темами. Создай группу, включи в ней «Темы» и добавь туда этот аккаунт."
             )
+        elif len(self._forums) == 1:
+            chat = self._forums[0]
+        else:
+            # аккаунт может состоять в чужих группах с темами - своя группа та, где он владелец
+            owned = [forum for forum in self._forums if await self._owns(forum.id)]
+            if len(owned) == 1:
+                chat = owned[0]
+            else:
+                found = ", ".join(f"«{chat_name(forum)}» (id {forum.id})" for forum in self._forums)
+                raise RegistryError(
+                    f"Несколько групп с темами: {found}. Своя группа - та, где ты владелец; "
+                    "или впиши её id в MANAGEMENT_CHAT."
+                )
 
         if not getattr(chat, "is_forum", False):
             raise RegistryError(f"В группе «{chat_name(chat)}» не включены темы: Изменить группу -> Темы.")
@@ -171,6 +179,13 @@ class Registry:
         self.group = chat.id
         self.group_id = chat.id
         self.group_name = chat_name(chat)
+
+    async def _owns(self, chat_id: int) -> bool:
+        try:
+            member = await call(self.client.get_chat_member, chat_id, (await self.client.get_me()).id)
+        except Exception:  # noqa: BLE001 - не смогли проверить права = не считаем своей
+            return False
+        return member.status == ChatMemberStatus.OWNER
 
     async def _read_topic(self, category: Category) -> None:
         # id темы в форуме совпадает с id её верхнего сообщения, поэтому история читаем через GetReplies
