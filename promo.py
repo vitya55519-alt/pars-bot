@@ -1,12 +1,15 @@
 import asyncio
 import logging
+from typing import List, Optional, Tuple
 
-from utils import call
+from utils import call, norm_title
 
 log = logging.getLogger("promo")
 
 
 class Promoter:
+    """Сценарий промо-бота: нажать «Просмотры» -> переслать пост -> отправить число просмотров."""
+
     def __init__(self, client, cfg):
         self.client = client
         self.cfg = cfg
@@ -15,56 +18,94 @@ class Promoter:
         if not self.cfg.promo_enabled:
             return False
 
+        await self._press_button()
+
         try:
             await call(self.client.forward_messages, self.cfg.promo_bot, message.chat.id, message.id)
             log.info("Переслано в промо-бота %s.", self.cfg.promo_bot)
         except Exception as exc:  # noqa: BLE001 - продвижение не должно ронять публикацию
-            log.error("Не удалось переслать в промо-бота: %s: %s", type(exc).__name__, exc)
+            log.error("Не удалось переслать пост промо-боту: %s: %s", type(exc).__name__, exc)
             return False
 
-        if self.cfg.promo_mode == "command":
-            await self._send_command()
-        elif self.cfg.promo_mode == "button":
-            await self._click_button()
+        await self._send_views()
         return True
 
-    async def _send_command(self) -> None:
-        if not self.cfg.promo_command:
-            log.warning("PROMO_MODE=command, но PROMO_COMMAND пуст -> команду не отправлял.")
-            return
-        await asyncio.sleep(self.cfg.promo_delay)
-        try:
-            await call(self.client.send_message, self.cfg.promo_bot, self.cfg.promo_command)
-            log.info("Промо-боту отправлена команда: %s", self.cfg.promo_command)
-        except Exception as exc:  # noqa: BLE001
-            log.error("Команда промо-боту не прошла: %s: %s", type(exc).__name__, exc)
+    async def _dialog(self, limit: int = 12) -> List:
+        messages: List = []
+        async for item in self.client.get_chat_history(self.cfg.promo_bot, limit=limit):
+            messages.append(item)
+        return messages
 
-    async def _click_button(self) -> None:
-        needle = self.cfg.promo_button.lower()
-        if not needle:
-            log.warning("PROMO_MODE=button, но PROMO_BUTTON пуст -> кнопку не нажимал.")
+    async def _press_button(self) -> None:
+        if not self.cfg.promo_button:
             return
 
         await asyncio.sleep(self.cfg.promo_delay)
         try:
-            messages = await self.client.get_messages(self.cfg.promo_bot, limit=10)
-        except Exception as exc:  # noqa: BLE001
-            log.error("Не удалось прочитать диалог с промо-ботом: %s: %s", type(exc).__name__, exc)
+            dialog = await self._dialog()
+        except Exception as exc:  # noqa: BLE001 - без диалога просто перешлём пост
+            log.error("Диалог с промо-ботом не прочитан: %s: %s", type(exc).__name__, exc)
             return
 
-        for message in messages:
-            keyboard = getattr(getattr(message, "reply_markup", None), "inline_keyboard", None)
-            if not keyboard:
+        for message in dialog:
+            found = self._find_button(message)
+            if found is None:
                 continue
-            for row, buttons in enumerate(keyboard):
-                for column, button in enumerate(buttons):
-                    if needle in (button.text or "").lower():
-                        try:
-                            await message.click(x=column, y=row, timeout=self.cfg.promo_delay)
-                            log.info("Нажата кнопка промо-бота: «%s».", button.text)
-                            return
-                        except Exception as exc:  # noqa: BLE001
-                            log.error("Кнопка «%s» не нажалась: %s: %s", button.text, type(exc).__name__, exc)
-                            return
+            index, button = found
+            try:
+                await message.click(index, timeout=self.cfg.promo_delay)
+                log.info("Промо-бот: нажата кнопка «%s».", button.text)
+            except Exception as exc:  # noqa: BLE001 - кнопка могла устареть, дальше пойдёт пересылка
+                log.warning("Промо-бот: кнопка «%s» не нажалась (%s).", button.text, type(exc).__name__)
+            return
 
-        log.warning("Среди последних сообщений промо-бота кнопки со словом «%s» нет.", self.cfg.promo_button)
+        log.warning("Промо-бот: кнопки «%s» среди последних сообщений нет - перешлю пост сразу.", self.cfg.promo_button)
+
+    def _find_button(self, message) -> Optional[Tuple[int, object]]:
+        markup = getattr(message, "reply_markup", None)
+        rows = getattr(markup, "inline_keyboard", None) or getattr(markup, "keyboard", None)
+        if not rows:
+            return None
+
+        flat = [button for row in rows for button in row]
+        needle = norm_title(self.cfg.promo_button)
+        labels = [norm_title(getattr(button, "text", "") or "") for button in flat]
+        for index, label in enumerate(labels):
+            if label == needle:
+                return index, flat[index]
+        for index, label in enumerate(labels):
+            if needle and needle in label:
+                return index, flat[index]
+        return None
+
+    async def _send_views(self) -> None:
+        if not self.cfg.promo_views:
+            log.warning("Промо-бот: PROMO_VIEWS пуст - количество просмотров не отправлял.")
+            return
+
+        await asyncio.sleep(self.cfg.promo_delay)
+        try:
+            await call(self.client.send_message, self.cfg.promo_bot, str(self.cfg.promo_views))
+            log.info("Промо-боту отправлено количество просмотров: %s.", self.cfg.promo_views)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Количество просмотров не отправилось: %s: %s", type(exc).__name__, exc)
+            return
+
+        await self._report_answer()
+
+    async def _report_answer(self) -> None:
+        """В журнал - что ответил бот: «Готово!» или отказ, чтобы видеть, пошли ли просмотры."""
+        await asyncio.sleep(self.cfg.promo_delay)
+        try:
+            dialog = await self._dialog(limit=3)
+        except Exception as exc:  # noqa: BLE001 - ответ только для журнала
+            log.warning("Ответ промо-бота не прочитан: %s", type(exc).__name__)
+            return
+
+        for message in dialog:
+            if getattr(message, "outgoing", False):
+                continue
+            text = (message.text or message.caption or "").strip()
+            if text:
+                log.info("Ответ промо-бота: %s", " ".join(text.split())[:160])
+                return

@@ -2,8 +2,6 @@ import os
 from dataclasses import dataclass, field
 from typing import Union
 
-PROMO_MODES = ("forward", "command", "button")
-
 MINIMAX_URL = "https://api.minimax.io/v1/chat/completions"
 DEFAULT_MODEL = "MiniMax-M3"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -59,9 +57,8 @@ class Config:
     ai_timeout: int = 90
     ai_retries: int = 3
     ai_retry_delay: int = 5
-    promo_mode: str = "forward"
-    promo_command: str = ""
-    promo_button: str = ""
+    promo_button: str = "Просмотры"
+    promo_views: int = 0
     promo_delay: int = 3
     album_wait: float = 2.0
     cache_size: int = 500
@@ -82,10 +79,6 @@ class Config:
         if missing:
             raise ConfigError("Не заданы переменные: " + ", ".join(missing))
 
-        promo_mode = _text("PROMO_MODE", "forward").lower()
-        if promo_mode not in PROMO_MODES:
-            raise ConfigError(f"PROMO_MODE должен быть одним из: {', '.join(PROMO_MODES)}")
-
         return cls(
             api_id=int(_number("API_ID", 0)),
             api_hash=_text("API_HASH"),
@@ -101,9 +94,8 @@ class Config:
             ai_timeout=int(_number("AI_TIMEOUT", 90)),
             ai_retries=int(_number("AI_RETRIES", 3)),
             ai_retry_delay=int(_number("AI_RETRY_DELAY", 5)),
-            promo_mode=promo_mode,
-            promo_command=_text("PROMO_COMMAND"),
-            promo_button=_text("PROMO_BUTTON"),
+            promo_button=_text("PROMO_BUTTON", "Просмотры"),
+            promo_views=int(_number("PROMO_VIEWS", 0)),
             promo_delay=int(_number("PROMO_DELAY", 3)),
             album_wait=_number("ALBUM_WAIT", 2.0),
             cache_size=int(_number("CACHE_SIZE", 500)),
@@ -111,15 +103,19 @@ class Config:
         )
 
     def describe(self) -> str:
-        promo = (
-            f"@{self.promo_bot} (режим {self.promo_mode})"
-            if isinstance(self.promo_bot, str)
-            else str(self.promo_bot)
-        )
+        if self.promo_enabled:
+            steps = []
+            if self.promo_button:
+                steps.append(f"жму «{self.promo_button}»")
+            steps.append("пересылаю пост")
+            steps.append(f"+{self.promo_views} просмотров" if self.promo_views else "число просмотров не задано")
+            promo = f"{self.promo_bot}: " + " -> ".join(steps)
+        else:
+            promo = "выключено"
         group = self.management_chat or "найду сам среди групп с темами"
         return (
             f"Группа управления донорами: {group}\n"
-            f"Промо-бот: {promo or 'выключено'}\n"
+            f"Промо-бот: {promo}\n"
             f"Нейросеть: {self.ai_model} (глубина {self.ai_reasoning_effort}), "
             f"попыток: {self.ai_retries}, пауза: {self.ai_retry_delay} сек"
         )

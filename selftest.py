@@ -67,9 +67,9 @@ class Button:
         self.text = text
 
 
-class Keyboard:
+class ReplyKeyboard:
     def __init__(self, rows):
-        self.inline_keyboard = rows
+        self.keyboard = rows
 
 
 class Message(_PyrogramMessage):
@@ -118,6 +118,7 @@ class FakeClient:
         self.users = {}
         self.topics = {}
         self.group_messages = []
+        self.promo_messages = []
         self.donor_messages = {}
         self.posted = []
         self.albums = []
@@ -211,6 +212,11 @@ class FakeClient:
 
     async def get_messages(self, chat, limit=None):
         return []
+
+    async def get_chat_history(self, chat, limit=None):
+        newest_first = list(reversed(self.promo_messages))
+        for message in newest_first[: (limit or len(newest_first))]:
+            yield message
 
 
 class FakeResponse:
@@ -321,7 +327,7 @@ async def main():
     await check_flood_and_ai()
     await check_commands()
     await check_live_and_delete()
-    await check_promo_modes()
+    await check_promo_flow()
     await check_failures()
 
     print(f"\nПроверок: {len(CHECKS)}, неудач: {len(FAILED)}")
@@ -553,34 +559,37 @@ async def check_live_and_delete():
     check("ссылки в General не добавляем", not added)
 
 
-async def check_promo_modes():
-    print("\n[7] Режимы промо-бота")
-    cfg = make_cfg(promo_mode="command", promo_command="/start promo")
+async def check_promo_flow():
+    print("\n[7] Продвижение: Lucky Up (кнопка -> пересылка -> число)")
+    cfg = make_cfg(promo_button="Просмотры", promo_views=4100, promo_delay=0)
     world = build_world(cfg)
     client = world["client"]
     bot = ParsBot(client, cfg, StubAI(), Registry(client, cfg))
     await bot.setup()
-    await bot.on_message(client, Message(client, 91, world["donor_sport_1"], caption="текст", photo=Photo("m1")))
-    check("command-режим отправил команду", client.sent == [("promo_bot", "/start promo")], str(client.sent))
 
-    cfg2 = make_cfg(promo_mode="button", promo_button="запустить")
+    menu = Clickable(client, 1201, await client.get_chat("promo_bot"), text="Выбери раздел")
+    menu.reply_markup = ReplyKeyboard(
+        [[Button("👀 Просмотры"), Button("🚀 Авто просмотры")], [Button("⚙️ Управление")], [Button("👤 Мой профиль")]]
+    )
+    client.promo_messages = [menu]
+
+    await bot.on_message(client, Message(client, 91, world["donor_sport_1"], caption="текст", photo=Photo("m1")))
+    done = Clickable(client, 1202, await client.get_chat("promo_bot"), text="Готово!")
+    client.promo_messages.append(done)
+    await bot.on_message(client, Message(client, 92, world["donor_sport_1"], caption="текст", photo=Photo("m2")))
+
+    check("нажата «Просмотры», а не «Авто просмотры»", menu.clicks == [(0, None), (0, None)], str(menu.clicks))
+    check("посты пересланы промо-боту", [f[0] for f in client.forwarded] == ["promo_bot", "promo_bot"], str(client.forwarded))
+    check("число просмотров отправлено", client.sent == [("promo_bot", "4100"), ("promo_bot", "4100")], str(client.sent))
+    check("промо засчитано обоим постам", bot.stats["forwarded"] == 2, str(bot.stats))
+
+    cfg2 = make_cfg(promo_button="", promo_views=0, promo_delay=0)
     world2 = build_world(cfg2)
     client2 = world2["client"]
     bot2 = ParsBot(client2, cfg2, StubAI(), Registry(client2, cfg2))
     await bot2.setup()
-
-    made = []
-
-    async def get_messages(chat, limit=None):
-        message = Clickable(client2, 1201, await client2.get_chat(chat), text="Выбери режим")
-        message.reply_markup = Keyboard([[Button("Отмена"), Button("Запустить рекламу")]])
-        made.append(message)
-        return [message]
-
-    client2.get_messages = get_messages
-    await bot2.on_message(client2, Message(client2, 92, world2["donor_sport_1"], caption="текст", photo=Photo("m2")))
-    check("button-режим нажал нужную кнопку", made and made[0].clicks == [(1, 0)], str(made[0].clicks if made else None))
-    check("промо засчитано", bot2.stats["forwarded"] == 1, str(bot2.stats))
+    await bot2.on_message(client2, Message(client2, 93, world2["donor_sport_1"], caption="текст", photo=Photo("m3")))
+    check("без кнопки и числа - только пересылка", client2.sent == [] and len(client2.forwarded) == 1, str(client2.sent))
 
 
 async def check_failures():

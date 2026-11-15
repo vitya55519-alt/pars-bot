@@ -134,7 +134,7 @@ class Controls:
                         f"переслано в промо: {stats['forwarded']}, сбоев: {stats['errors']}"
                     ),
                     f"Нейросеть: {self.cfg.ai_model} ({'ключ задан' if self.cfg.minimax_api_key else 'ключа нет - публикуем оригинал'})",
-                    f"Промо-бот: {self.cfg.promo_bot or 'не задан'}",
+                    f"Промо-бот: {self.cfg.promo_bot or 'не задан'}, просмотров добавляю: {self.cfg.promo_views or 'не задано'}",
                     f"Последняя публикация: {self.bot.last_publish or 'ещё не было'}",
                 ]
             ),
