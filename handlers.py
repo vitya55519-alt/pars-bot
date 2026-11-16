@@ -13,7 +13,7 @@ from pyrogram.types import InputMediaPhoto, Message
 from ai import cut
 from commands import Controls
 from promo import Promoter
-from reactions import Reactor
+from reactions import Reactor, count_reactions
 from registry import Category
 from utils import call, chat_name, strip_source
 
@@ -21,6 +21,7 @@ log = logging.getLogger("pars")
 
 TELEGRAM_ALBUM_LIMIT = 10
 LOOKBACK = 10
+REACTIONS_LOOKBACK = 10
 CATCH_UP_LIMIT = 10
 WRITING_STATUSES = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
 
@@ -194,6 +195,7 @@ class ParsBot:
                 continue
             published = await self._published_ids(category, limit)
             lines.append(f"    канал: {await self._gate(category.target, me.id)}")
+            lines.append(f"    реакции в канале: {await self._channel_reactions(category)}")
             for donor in category.donors.values():
                 lines.append(f"    {donor.name}: {await self._donor_line(donor.chat_id, published, limit)}")
         stats = self.stats
@@ -219,6 +221,17 @@ class ParsBot:
                 return "админ, но писать запрещено - снимешь запрет, начнём"
             return "пишем свободно"
         return f"не админ ({getattr(status, 'name', status)}) - канал не примет пост"
+
+    async def _channel_reactions(self, category: Category, show: int = 3) -> str:
+        """Сколько реакций под свежими постами самого канала - ответ «где реакции» по кнопке."""
+        try:
+            history = await self._history(category.target, REACTIONS_LOOKBACK)
+        except Exception as exc:  # noqa: BLE001 - канал мог закрыться для этого аккаунта
+            return f"канал не открылся ({type(exc).__name__})"
+        posts = [message for message in reversed(history) if message.photo][:show]
+        if not posts:
+            return "постов с фото в канале нет"
+        return " · ".join(f"пост {message.id}: {count_reactions(message)}" for message in posts)
 
     async def _donor_line(self, chat_id: int, published: Set[str], limit: int) -> str:
         try:

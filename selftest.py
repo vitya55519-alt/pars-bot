@@ -573,8 +573,10 @@ async def check_diagnose():
     bot, registry, _ = await make_bot(world)
 
     client.histories[sport.id] = [
-        Message(client, 900, sport, caption="то уже было", photo=Photo("f_old", "u_old"), date=ago(120))
+        Message(client, 900, sport, caption="то уже было", photo=Photo("f_old", "u_old"), date=ago(120)),
+        Message(client, 905, sport, caption="самый свежий", photo=Photo("f_seen", "u_seen"), date=ago(10)),
     ]
+    client.histories[sport.id][0].reactions = Counter(("🔥", 3), ("⭐", 1))
     client.histories[donor.id] = [
         Message(client, 901, donor, caption="уже в канале", photo=Photo("f_dup", "u_old"), date=ago(120)),
         Message(client, 902, donor, caption="пропущенный пост", photo=Photo("f_new", "u_new"), date=ago(20)),
@@ -589,6 +591,11 @@ async def check_diagnose():
     check("проверка меряет свежесть без постов", "последнее сообщение 10 мин назад" in report, report)
     check("проверка отвечает про права", "пишем свободно" in report, report)
     check("проверка видит пустого донора", "постов с фото и текстом 0" in report, report)
+    check(
+        "проверка считает реакции под постами канала",
+        "пост 905: нет · пост 900: 🔥3 ⭐1 (всего 4)" in report,
+        [line for line in report.splitlines() if "реакции" in line],
+    )
     check("счётчики постов не меняются", (bot.stats["caught"], bot.stats["published"]) == (0, 0), str(bot.stats))
 
     answer = await bot.catch_up()
