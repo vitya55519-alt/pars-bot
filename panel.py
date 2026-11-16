@@ -6,22 +6,21 @@
 """
 
 import logging
-from typing import Iterator, List, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 from pyrogram import filters
 from pyrogram.errors import MessageNotModified
 from pyrogram.handlers import CallbackQueryHandler, MessageHandler
-from pyrogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import BotCommand, InlineKeyboardMarkup
 
 from ai import cut
+from cabinet import Cabinet
 from config import VIEWS_LIMIT
-from registry import Donor, RegistryError
-from utils import call
+from registry import RegistryError
+from utils import TEXT_LIMIT, call, chunks, markup
 
 log = logging.getLogger("panel")
 
-TEXT_LIMIT = 3900
-CALLBACK_LIMIT = 64
 NAME_LIMIT = 50
 DONOR_LIMIT = 1000
 MAX_DONOR_BUTTONS = 30
@@ -57,33 +56,13 @@ NO_GROUP = (
     "Если группа уже есть и ты в ней владелец - нажми «🔄 Обновить список»."
 )
 
-Cell = Tuple[str, str]
-
-
-def markup(*rows: Union[Cell, List[Cell]]) -> InlineKeyboardMarkup:
-    built = []
-    for row in rows:
-        cells = [row] if isinstance(row, tuple) else list(row)
-        built.append(
-            [
-                InlineKeyboardButton(text=text[:TEXT_LIMIT], callback_data=data[:CALLBACK_LIMIT])
-                for text, data in cells
-            ]
-        )
-    return InlineKeyboardMarkup(built)
-
-
-def chunks(items: List[Donor], size: int = 2) -> Iterator[List[Donor]]:
-    for start in range(0, len(items), size):
-        yield items[start : start + size]
-
-
 class Panel:
-    def __init__(self, client, cfg, registry, bot):
+    def __init__(self, client, cfg, registry, bot, store=None):
         self.client = client
         self.cfg = cfg
         self.registry = registry
         self.bot = bot
+        self.cabinet = Cabinet(client, cfg, store) if store else None
         self.owner = 0
         self.account = "аккаунт"
         self.awaiting: Tuple[str, int] = ("", 0)
@@ -109,6 +88,9 @@ class Panel:
 
     async def on_message(self, client, message) -> None:
         if message.chat.id not in self.admins:
+            if self.cabinet:
+                await self.cabinet.on_message(message)
+                return
             log.warning("Панель: сообщение не от владельца (chat %s) - игнорирую.", message.chat.id)
             await call(message.reply, "Этот бот управляющий: он слушает только владельца аккаунта.")
             return
@@ -126,6 +108,9 @@ class Panel:
 
     async def on_button(self, client, query) -> None:
         if query.from_user.id not in self.admins:
+            if self.cabinet:
+                await self.cabinet.on_button(query)
+                return
             await call(query.answer, "Доступ только у владельца аккаунта.", show_alert=True)
             return
 

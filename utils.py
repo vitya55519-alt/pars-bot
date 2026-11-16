@@ -1,13 +1,37 @@
 import asyncio
 import logging
 import re
-from typing import List
+from typing import Iterator, List, Tuple, Union
 
 from pyrogram.errors import FloodWait
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 log = logging.getLogger("pars")
 
 EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\U00002190-\U00002BFF\uFE0F\u200D\u20E3]")
+
+TEXT_LIMIT = 3900
+CALLBACK_LIMIT = 64
+
+Cell = Tuple[str, str]
+
+
+def markup(*rows: Union[Cell, List[Cell]]) -> InlineKeyboardMarkup:
+    built = []
+    for row in rows:
+        cells = [row] if isinstance(row, tuple) else list(row)
+        built.append(
+            [
+                InlineKeyboardButton(text=text[:TEXT_LIMIT], callback_data=data[:CALLBACK_LIMIT])
+                for text, data in cells
+            ]
+        )
+    return InlineKeyboardMarkup(built)
+
+
+def chunks(items: List, size: int = 2) -> Iterator[List]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
 def chat_name(chat) -> str:

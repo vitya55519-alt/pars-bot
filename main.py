@@ -12,6 +12,7 @@ from config import Config, ConfigError
 from handlers import ParsBot
 from panel import Panel
 from registry import Registry, RegistryError
+from store import Store
 
 log = logging.getLogger("pars")
 
@@ -49,6 +50,13 @@ async def amain(cfg: Config) -> None:
     registry = Registry(client, cfg)
     bot = ParsBot(client, cfg, AiRewriter(cfg, session), registry, session)
 
+    store = None
+    if cfg.clients_enabled:
+        try:
+            store = await Store.connect(cfg.database_url)
+        except Exception as exc:  # noqa: BLE001 - без базы бот остаётся управляющим панелем
+            log.error("База клиентов не подключилась (%s: %s) - кабинеты выключены, личный режим работает.", type(exc).__name__, exc)
+
     panel_client = None
     panel = None
     if cfg.panel_enabled:
@@ -60,7 +68,7 @@ async def amain(cfg: Config) -> None:
             in_memory=True,
             workers=2,
         )
-        panel = Panel(panel_client, cfg, registry, bot)
+        panel = Panel(panel_client, cfg, registry, bot, store)
         panel.setup()
 
     try:
@@ -88,6 +96,8 @@ async def amain(cfg: Config) -> None:
         log.error("Сессия недействительна (%s). Нужно создать SESSION_STRING заново: python make_session.py", type(exc).__name__)
         raise SystemExit(1)
     finally:
+        if store:
+            await store.close()
         await session.close()
         for app in (client, panel_client):
             if not app:

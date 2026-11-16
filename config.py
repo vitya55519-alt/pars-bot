@@ -96,6 +96,9 @@ class Config:
     caption_limit: int = field(default=1024)
     bot_token: str = ""
     panel_admins: List[int] = field(default_factory=list)
+    database_url: str = ""
+    worker_contact: str = ""
+    payment_details: str = ""
 
     @property
     def promo_enabled(self) -> bool:
@@ -104,6 +107,11 @@ class Config:
     @property
     def panel_enabled(self) -> bool:
         return bool(self.bot_token)
+
+    @property
+    def clients_enabled(self) -> bool:
+        """Кабинеты клиентов включаются сами, как только в Railway появляется база."""
+        return bool(self.database_url)
 
     @classmethod
     def load(cls) -> "Config":
@@ -142,6 +150,9 @@ class Config:
             history_limit=int(_number("HISTORY_LIMIT", 200)),
             bot_token=_text("BOT_TOKEN"),
             panel_admins=_ids("PANEL_ADMINS"),
+            database_url=_text("DATABASE_URL"),
+            worker_contact=_text("WORKER_CONTACT"),
+            payment_details=_text("PAYMENT_DETAILS"),
         )
 
     def describe(self) -> str:
@@ -161,9 +172,15 @@ class Config:
         )
         group = self.management_chat or "найду сам среди групп с темами"
         panel = "ключ задан - управляй кнопками в своём боте" if self.panel_enabled else "нет BOT_TOKEN - команды в группе"
+        clients = (
+            "кабинеты включены (база подключена)"
+            if self.clients_enabled
+            else "кабинетов нет: DATABASE_URL не задан - работает только твоя панель"
+        )
         return (
             f"Группа управления донорами: {group}\n"
             f"Панель кнопок: {panel}\n"
+            f"Клиенты: {clients}\n"
             f"Промо-бот: {promo}\n"
             f"Реакции: {reactions}\n"
             f"Нейросеть: {self.ai_model} (глубина {self.ai_reasoning_effort}), "

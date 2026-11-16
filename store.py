@@ -26,6 +26,8 @@ PLANS = {
 
 MAX_DONORS = 10
 MAX_POSTS_PER_DAY = 50
+MIN_TOPUP = 100
+MAX_TOPUP = 300000
 
 USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{4,31})", re.I)
@@ -65,10 +67,12 @@ class Tenant:
     target: str = ""
     target_id: Optional[int] = None
     target_title: str = ""
+    target_ok: bool = False
     views: int = 0
     reactions: bool = True
     balance: int = 0
     plan_until: Optional[datetime.datetime] = None
+    agreed: bool = False
 
     def active(self, now: Optional[datetime.datetime] = None) -> bool:
         if self.plan_until is None:
@@ -150,16 +154,24 @@ class Store:
         return [_tenant(row) for row in rows]
 
     async def set_target(self, tenant_id: int, target: str, target_id: Optional[int], title: str) -> None:
+        """Канал меняется - отметку проверки сбрасываем: рабочий аккаунт должен убедиться заново."""
         async with self.pool.acquire() as con:
             await con.execute(
                 """
-                UPDATE tenants SET target = $2, target_id = $3, target_title = $4, updated_at = now()
+                UPDATE tenants SET target = $2, target_id = $3, target_title = $4, target_ok = FALSE, updated_at = now()
                 WHERE id = $1
                 """,
                 tenant_id,
                 target,
                 target_id,
                 title,
+            )
+
+    async def set_agreed(self, tenant_id: int) -> None:
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE tenants SET agreed_at = now(), updated_at = now() WHERE id = $1 AND agreed_at IS NULL",
+                tenant_id,
             )
 
     async def set_views(self, tenant_id: int, views: int) -> None:
@@ -218,10 +230,24 @@ class Store:
         log.info("Клиент %s купил «%s»: %s ₽, до %s.", tenant_id, PLANS[kind]["title"], price, tenant.plan_until)
         return tenant
 
+    async def request_topup(self, tenant_id: int, amount: int) -> int:
+        """Заявка на оплату: денег ещё не видели, но очередь на подтверждение уже стоит."""
+        if not MIN_TOPUP <= amount <= MAX_TOPUP:
+            raise StoreError(f"Сумму нужно написать от {MIN_TOPUP} до {MAX_TOPUP} ₽.")
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow(
+                "INSERT INTO payments (tenant_id, kind, amount_rub, status, note) "
+                "VALUES ($1, 'topup', $2, 'pending', '') RETURNING id",
+                tenant_id,
+                amount,
+            )
+        log.info("Клиент %s заявил оплату %s ₽ (заявка %s).", tenant_id, amount, row["id"])
+        return int(row["id"])
+
     async def list_payments(self, tenant_id: int, limit: int = 10) -> List[dict]:
         async with self.pool.acquire() as con:
             rows = await con.fetch(
-                "SELECT kind, amount_rub, days, note, created_at FROM payments WHERE tenant_id = $1 "
+                "SELECT kind, amount_rub, days, status, created_at FROM payments WHERE tenant_id = $1 "
                 "ORDER BY id DESC LIMIT $2",
                 tenant_id,
                 limit,
@@ -267,7 +293,8 @@ class Store:
             rows = await con.fetch(
                 """
                 SELECT t.* FROM tenants t JOIN donors d ON d.tenant_id = t.id
-                WHERE d.chat_id = $1 AND t.plan_until IS NOT NULL AND t.plan_until > now() AND t.target <> ''
+                WHERE d.chat_id = $1 AND t.target_ok AND t.target <> ''
+                  AND t.plan_until IS NOT NULL AND t.plan_until > now()
                 """,
                 chat_id,
             )
@@ -307,10 +334,12 @@ CREATE TABLE IF NOT EXISTS tenants (
     target TEXT NOT NULL DEFAULT '',
     target_id BIGINT,
     target_title TEXT NOT NULL DEFAULT '',
+    target_ok BOOLEAN NOT NULL DEFAULT FALSE,
     views INT NOT NULL DEFAULT 0,
     reactions BOOLEAN NOT NULL DEFAULT TRUE,
     balance_rub INT NOT NULL DEFAULT 0,
     plan_until TIMESTAMPTZ,
+    agreed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -331,6 +360,7 @@ CREATE TABLE IF NOT EXISTS payments (
     kind TEXT NOT NULL,
     amount_rub INT NOT NULL,
     days INT NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'done',
     note TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -350,8 +380,10 @@ def _tenant(row) -> Tenant:
         target=row["target"] or "",
         target_id=row["target_id"],
         target_title=row["target_title"] or "",
+        target_ok=bool(row["target_ok"]),
         views=int(row["views"] or 0),
         reactions=bool(row["reactions"]),
         balance=int(row["balance_rub"] or 0),
         plan_until=row["plan_until"],
+        agreed=row["agreed_at"] is not None,
     )

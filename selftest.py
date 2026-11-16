@@ -437,6 +437,7 @@ async def main():
     await check_views()
     await check_signature()
     await check_store()
+    await check_cabinet()
 
     print(f"\nПроверок: {len(CHECKS)}, неудач: {len(FAILED)}")
     if FAILED:
@@ -1323,22 +1324,162 @@ def _schema_tables():
 SCHEMA_TABLES = _schema_tables()
 
 
-def _tenant_row(tenant_id: int = 777, balance: int = 0, until=None, target: str = "@client_channel"):
+def _tenant_row(tenant_id: int = 777, balance: int = 0, until=None, target: str = "@client_channel", **over):
     import datetime
 
     moment = datetime.datetime(2026, 11, 16, 12, 0, tzinfo=datetime.timezone.utc)
-    return {
+    values = {
         "id": tenant_id,
         "target": target,
         "target_id": -1005554443332,
         "target_title": "Канал клиента",
+        "target_ok": False,
         "views": 0,
         "reactions": True,
         "balance_rub": balance,
         "plan_until": until,
+        "agreed_at": None,
         "created_at": moment,
         "updated_at": moment,
     }
+    # ключи берём из схемы: добавишь столбец - фейк подставит сам
+    row = {name: values[name] for name in SCHEMA_TABLES["tenants"]}
+    row.update(over)
+    return row
+
+
+class MemoryStore:
+    """Та же база, только в памяти: кабинеты проверяются без Postgres, по тем же правилам."""
+
+    def __init__(self):
+        from store import Donor, Tenant
+
+        self.donor_class = Donor
+        self.tenant_class = Tenant
+        self.tenants = {}
+        self.donors = {}
+        self.payments = []
+        self.usage = {}
+        self.next_request = 1
+
+    async def get_tenant(self, tenant_id):
+        return self.tenants.get(tenant_id)
+
+    async def ensure_tenant(self, tenant_id):
+        import datetime
+
+        return self.tenants.setdefault(tenant_id, self.tenant_class(id=tenant_id))
+
+    async def list_donors(self, tenant_id):
+        return sorted(
+            [donor for (owner, _), donor in self.donors.items() if owner == tenant_id],
+            key=lambda donor: donor.ref,
+        )
+
+    async def add_donor(self, tenant_id, ref):
+        from store import MAX_DONORS, StoreError, ref_key
+
+        key = ref_key(ref)
+        if (tenant_id, key) not in self.donors:
+            if len(await self.list_donors(tenant_id)) >= MAX_DONORS:
+                raise StoreError(f"Больше {MAX_DONORS} доноров на одного клиента нельзя - убери старый.")
+            self.donors[(tenant_id, key)] = self.donor_class(key)
+        return self.donors[(tenant_id, key)]
+
+    async def remove_donor(self, tenant_id, ref):
+        from store import ref_key
+
+        self.donors.pop((tenant_id, ref_key(ref)), None)
+
+    async def bind_donor(self, ref, chat_id, title=""):
+        from store import ref_key
+
+        key = ref_key(ref)
+        bound = 0
+        for (owner, donor_ref), donor in self.donors.items():
+            if donor_ref == key:
+                donor.chat_id, donor.title = chat_id, title
+                bound += 1
+        return bound
+
+    async def set_target(self, tenant_id, target, target_id, title):
+        tenant = await self.ensure_tenant(tenant_id)
+        tenant.target, tenant.target_id, tenant.target_title, tenant.target_ok = target, target_id, title or "", False
+
+    async def set_views(self, tenant_id, views):
+        (await self.ensure_tenant(tenant_id)).views = views
+
+    async def set_reactions(self, tenant_id, enabled):
+        (await self.ensure_tenant(tenant_id)).reactions = enabled
+
+    async def set_agreed(self, tenant_id):
+        (await self.ensure_tenant(tenant_id)).agreed = True
+
+    async def add_balance(self, tenant_id, amount, note=""):
+        tenant = await self.ensure_tenant(tenant_id)
+        tenant.balance += amount
+        self.payments.append({"tenant_id": tenant_id, "kind": "topup", "amount_rub": amount, "days": 0, "status": "done",
+                              "created_at": _utcnow()})
+        return tenant
+
+    async def request_topup(self, tenant_id, amount):
+        from store import MAX_TOPUP, MIN_TOPUP, StoreError
+
+        if not MIN_TOPUP <= amount <= MAX_TOPUP:
+            raise StoreError(f"Сумму нужно написать от {MIN_TOPUP} до {MAX_TOPUP} ₽.")
+        await self.ensure_tenant(tenant_id)
+        request_id = self.next_request
+        self.next_request += 1
+        self.payments.append({"tenant_id": tenant_id, "kind": "topup", "amount_rub": amount, "days": 0, "status": "pending",
+                              "created_at": _utcnow()})
+        return request_id
+
+    async def buy(self, tenant_id, kind):
+        from store import PLANS, StoreError
+
+        if kind not in PLANS:
+            raise StoreError(f"Нет такого тарифа: {kind}")
+        tenant = await self.ensure_tenant(tenant_id)
+        price = PLANS[kind]["price"]
+        if tenant.balance < price:
+            raise StoreError(f"На балансе {tenant.balance} ₽, а {PLANS[kind]['title']} стоит {price} ₽.")
+        tenant.balance -= price
+        tenant.renew(kind)
+        self.payments.append({"tenant_id": tenant_id, "kind": kind, "amount_rub": price, "days": PLANS[kind]["days"],
+                              "status": "done", "created_at": _utcnow()})
+        return tenant
+
+    async def list_payments(self, tenant_id, limit=10):
+        return [row for row in reversed(self.payments) if row["tenant_id"] == tenant_id][:limit]
+
+    async def posts_today(self, tenant_id):
+        return self.usage.get(tenant_id, 0)
+
+    async def count_post(self, tenant_id):
+        self.usage[tenant_id] = self.usage.get(tenant_id, 0) + 1
+        return self.usage[tenant_id]
+
+    async def quota_left(self, tenant_id):
+        from store import MAX_POSTS_PER_DAY
+
+        return await self.posts_today(tenant_id) < MAX_POSTS_PER_DAY
+
+    async def donors_by_chat(self, chat_id):
+        now = _utcnow()
+        found = []
+        for (tenant_id, _), donor in self.donors.items():
+            if donor.chat_id != chat_id:
+                continue
+            tenant = self.tenants.get(tenant_id)
+            if tenant and tenant.active(now) and tenant.target_ok and tenant.target:
+                found.append(tenant)
+        return found
+
+
+def _utcnow():
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc)
 
 
 class FakeConn:
@@ -1477,6 +1618,122 @@ async def check_store():
     pool.answers = [{"posts": 4}]
     check("пост учтён", await store.count_post(777) == 4)
     check("обращение к таблице дня", any("day_usage" in call[0] for call in pool.queries))
+
+
+async def check_cabinet():
+    print("\n[16] Кабинет клиента в том же боте")
+    cfg = make_cfg(bot_token="900:AAstub", worker_contact="@worker_acc", payment_details="карта 2202 0000 0000 0000")
+    world = build_world(cfg)
+    client = world["client"]
+    bot, registry, _ = await make_bot(world)
+    store = MemoryStore()
+    panel = Panel(client, cfg, registry, bot, store)
+    panel.setup()
+    await panel.start(777, "Фогель")
+
+    owner = client.add_user(User(777, "Витя"))
+    petr = client.add_user(User(5001, "Пётр"))
+    ivan = client.add_user(User(5002, "Иван"))
+
+    def tap(data, user=petr):
+        return Query(client, data, user.id, Message(client, 6000, user, text="x"))
+
+    def text():
+        return client.edits[-1][2]
+
+    def cells():
+        keyboard = client.edits[-1][3]
+        return [] if keyboard is None else [button.callback_data for row in keyboard.inline_keyboard for button in row]
+
+    def reply():
+        return client.replies[-1]
+
+    def reply_cells():
+        keyboard = reply()[2]
+        return [] if keyboard is None else [button.callback_data for row in keyboard.inline_keyboard for button in row]
+
+    await panel.on_message(client, Message(client, 6001, petr, text="/start"))
+    check("клиент получает кабинет", "Твой кабинет" in reply()[1], reply()[1][:80])
+    check("кабинет знает про канал и доноров", "Канал:" in reply()[1] and "Доноры:" in reply()[1], reply()[1][:150])
+    check("без тарифа честно сказано", "не подключён" in reply()[1], reply()[1][:200])
+    check("в кабинете свои кнопки", "cchannel" in reply_cells() and "cplans" in reply_cells(), str(reply_cells()))
+    check("клиент не видит панель владельца", "АвтоПост" not in reply()[1])
+
+    await panel.on_message(client, Message(client, 6002, owner, text="/start"))
+    check("владелец по-прежнему в панели склада", "АвтоПост" in reply()[1], reply()[1][:60])
+
+    await panel.on_button(client, tap("cchannel"))
+    check("канал объясняет про админа", "Добавь в администраторы" in text() and "@worker_acc" in text(), text()[:140])
+    await panel.on_message(client, Message(client, 6003, petr, text="https://t.me/petr_ch"))
+    check("канал записан в базу", store.tenants[petr.id].target == "petr_ch", store.tenants[petr.id].target)
+    check("канал ждёт проверки", "ждёт проверки" in reply()[1], reply()[1][:120])
+    await panel.on_button(client, tap("cchannel"))
+    await panel.on_message(client, Message(client, 6004, petr, text="куда-то туда"))
+    check("текст без ссылки отклонён", "Не понимаю ссылку" in reply()[1], reply()[1][:120])
+
+    await panel.on_button(client, tap("cadd"))
+    check("донор просит ссылку", "Пришли ссылку" in text(), text()[:80])
+    await panel.on_message(client, Message(client, 6005, petr, text="@bankrollo"))
+    check("донор записан", (petr.id, "bankrollo") in store.donors, str(list(store.donors)))
+    check("донор ждёт подписки", "ждёт подписки" in reply()[1], reply()[1][:140])
+    store.donors[(petr.id, "bankrollo")].chat_id = -100900
+    await panel.on_button(client, tap("cdonors"))
+    check("подписанный донор отмечен галочкой", "✅" in text() and "bankrollo" in text(), text()[:140])
+    check("донора можно убрать кнопкой", cells()[0].startswith("cdel|"), str(cells()))
+    await panel.on_button(client, tap("cdel|1"))
+    check("донор убран", (petr.id, "bankrollo") not in store.donors, str(list(store.donors)))
+    await panel.on_button(client, tap("cdel|7"))
+    check("уже убранный не ломает экран", "уже убран" in text(), text()[:80])
+
+    await panel.on_button(client, tap("cviews|1000"))
+    check("просмотры с готовой кнопки", store.tenants[petr.id].views == 1000, str(store.tenants[petr.id].views))
+    check("экран просмотров показывает число", "Сейчас: 1000" in text(), text()[:80])
+    await panel.on_button(client, tap("cviews|999999"))
+    check("просмотры выше потолка отклонены", store.tenants[petr.id].views == 1000 and "Просмотров должно быть" in text(), text()[:100])
+    await panel.on_button(client, tap("cviews"))
+    await panel.on_message(client, Message(client, 6006, petr, text="2500"))
+    check("просмотры введены текстом", store.tenants[petr.id].views == 2500, str(store.tenants[petr.id].views))
+
+    await panel.on_button(client, tap("creactions"))
+    check("реакции выключаются", store.tenants[petr.id].reactions is False and "выключены" in text(), text()[:160])
+
+    await panel.on_button(client, tap("cplans"))
+    check("цены названы", "Неделя - 600 ₽" in text() and "Месяц - 2000 ₽" in text(), text()[:180])
+    await panel.on_button(client, tap("cbuy|week"))
+    check("без согласия покупка не идёт", store.tenants[petr.id].plan_until is None and "cagree" in cells(), str(cells()))
+    await panel.on_button(client, tap("ctopup"))
+    check("пополнение тоже просит согласие", "cagree" in cells(), str(cells()))
+    check("в согласии есть оба документа", "Polzovatelskoe-soglashenie" in text() and "konfidencialnosti" in text(), text()[:250])
+    await panel.on_button(client, tap("cagree"))
+    check("согласие записано", store.tenants[petr.id].agreed is True, str(store.tenants[petr.id].agreed))
+    await panel.on_button(client, tap("cbuy|week"))
+    check("без денег покупка отклонена", store.tenants[petr.id].plan_until is None and "На балансе 0" in text(), text()[:140])
+    await panel.on_button(client, tap("ctopup"))
+    await panel.on_message(client, Message(client, 6007, petr, text="600"))
+    check("заявка на оплату создана", any(row["status"] == "pending" and row["amount_rub"] == 600 for row in store.payments),
+          str(store.payments))
+    check("кабинет подтвердил заявку", "Заявка №1" in reply()[1] and "Начислю" in reply()[1], reply()[1][:160])
+    await panel.on_button(client, tap("ctopup"))
+    await panel.on_message(client, Message(client, 6008, petr, text="50"))
+    check("меньшая сумма отклонена", "от 100" in reply()[1], reply()[1][:140])
+    await store.add_balance(petr.id, 600)
+    await panel.on_button(client, tap("cbuy|week"))
+    tenant = store.tenants[petr.id]
+    check("неделя списана с баланса", tenant.active() and tenant.balance == 0, f"{tenant.plan_until} / {tenant.balance}")
+    check("кабинет показывает срок", "активен ещё" in text(), text()[:180])
+    check("покупка попала в историю", "Последнее по оплате" in text(), text()[-200:])
+    await panel.on_button(client, tap("chome"))
+    check("заявка без подтверждения помечена", "ждёт проверки" in text(), text()[-220:])
+
+    await panel.on_button(client, tap("cdocs"))
+    check("документы всегда под рукой", "Пользовательское соглашение" in text(), text()[:120])
+    await panel.on_button(client, tap("cdonors", ivan))
+    check("у второго клиента свой пустой список", "Пока никого" in text(), text()[:120])
+    await panel.on_button(client, tap("chome", ivan))
+    check("чужие просмотры не видны", "не заданы" in text(), text()[:180])
+    wrong = tap("neknopka")
+    await panel.on_button(client, wrong)
+    check("несуществующая кнопка отвечает подсказкой", "Такой кнопки нет" in wrong.answers[-1][0], str(wrong.answers))
 
 
 async def _raises_store(action, *args):
