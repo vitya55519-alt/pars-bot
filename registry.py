@@ -338,6 +338,38 @@ class Registry:
             self._reindex()
         return category
 
+    async def remove_category(self, topic_id: int) -> Category:
+        """Убирает канал целиком: тема удаляется, её доноры перестают ловиться."""
+        category = self._category(topic_id)
+        async with self.lock:
+            self.suppressed.update(donor.message_id for donor in category.donors.values())
+            try:
+                await call(self.client.delete_forum_topic, self.group_id, topic_id)
+            except Exception as exc:  # noqa: BLE001 - тему мог удалить и руками, список чистим в любом случае
+                log.warning("Тему «%s» удалить не удалось (%s) - убираю её из списка.", category.name, type(exc).__name__)
+            del self.categories[topic_id]
+            for chat_id in list(category.donors):
+                self.routes.pop(chat_id, None)
+            if category.target and category.target not in {other.target for other in self.categories.values()}:
+                self.target_ids.discard(category.target)
+            log.info("Канал «%s» убран из списка.", category.name)
+        return category
+
+    async def rename_storage_group(self, title: str) -> str:
+        """Переименовывает группу-хранилище - она создаётся с названием, которое путают с каналом."""
+        clean = " ".join((title or "").split())[:GROUP_TITLE_LIMIT]
+        if not clean:
+            raise RegistryError("Нужно название группы, например «АвтоПост».")
+        self._need_group()
+        async with self.lock:
+            try:
+                await call(self.client.set_chat_title, self.group_id, clean)
+            except Exception as exc:  # noqa: BLE001 - без прав владельца не переименовать
+                raise RegistryError(f"Группа не переименовалась ({type(exc).__name__}).") from exc
+            self.group_name = clean
+            log.info("Группа-хранилище теперь называется «%s».", clean)
+        return self.group_name
+
     async def add_donor(self, topic_id: int, text: str) -> List[Donor]:
         """Пишем ссылку в тему - и она сразу становится донором."""
         category = self._category(topic_id)

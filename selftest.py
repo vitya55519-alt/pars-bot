@@ -158,6 +158,8 @@ class FakeClient:
         self.edits = []
         self.commands = []
         self.topic_edits = []
+        self.topic_deletes = []
+        self.titled = []
         self.next_topic = 90
         self.delete_fails = False
         self.flood_left = 0
@@ -286,6 +288,17 @@ class FakeClient:
                 topic.name = name
         self.topic_edits.append((message_thread_id, name))
         return True
+
+    async def delete_forum_topic(self, chat_id, message_thread_id, *args, **kwargs):
+        self.topics[chat_id] = [topic for topic in self.topics.get(chat_id, []) if topic.id != message_thread_id]
+        self.topic_deletes.append(message_thread_id)
+        return True
+
+    async def set_chat_title(self, chat_id, title, *args, **kwargs):
+        chat = self.chats[chat_id]
+        chat.title = title
+        self.titled.append((chat_id, title))
+        return Message(self, 7000 + len(self.titled), chat, text="группа переименована")
 
     async def edit_message_text(self, chat, message_id, text, reply_markup=None, **kwargs):
         self.edits.append((chat, message_id, text, reply_markup))
@@ -809,6 +822,10 @@ async def check_panel():
     def last_edit():
         return client.edits[-1][2]
 
+    def last_buttons():
+        buttons = client.edits[-1][3]
+        return [] if buttons is None else [b.callback_data for row in buttons.inline_keyboard for b in row]
+
     def last_reply():
         return client.replies[-1]
 
@@ -888,6 +905,26 @@ async def check_panel():
     check("после обновления виден результат", "Список обновлён" in last_edit(), last_edit()[:90])
     check("добавленный из бота донор пережил перечитку", new_donor.id in registry.categories[21].donors)
     registry.rebuild = original_rebuild
+
+    await panel.on_button(client, press("drop|21"))
+    check("убрать канал - сначала спрашивает", "Убрать его целиком" in last_edit() and client.topic_deletes == [], last_edit()[:90])
+    await panel.on_button(client, press("cat|21"))
+    check("отмена ничего не удалила", client.topic_deletes == [] and 21 in registry.categories, str(client.topic_deletes))
+    await panel.on_button(client, press("drop_yes|21"))
+    check("канал убран кнопкой", 21 not in registry.categories, str(list(registry.categories)))
+    check("тема удалена в группе", client.topic_deletes == [21], str(client.topic_deletes))
+    check("доноры убранного канала больше не ловятся",
+          registry.route(world["donor_sport_2"].id) is None and registry.route(new_donor.id) is None,
+          str(registry.routes))
+    check("в списке остался только второй канал", "cat|22" in last_buttons() and "cat|21" not in last_buttons(), str(last_buttons()))
+
+    await panel.on_button(client, press("group_rename"))
+    check("кнопка склада просит название", "Напиши новое название склада" in last_edit(), last_edit()[:90])
+    await panel.on_message(client, Message(client, 5013, owner, text="АвтоПост"))
+    check("склад переименован кнопкой", registry.group_name == "АвтоПост" and group.title == "АвтоПост", registry.group_name)
+    check("название записано в Telegram", client.titled[-1] == (group.id, "АвтоПост"), str(client.titled))
+    check("переименование подтверждено", "Склад теперь называется" in last_reply()[1], last_reply()[1][:90])
+    check("переименование склада не трогает темы", client.topic_edits and client.topic_deletes == [21], str(client.topic_deletes))
 
     lonely = FakeClient()
     boss = lonely.add_user(User(777, "Витя"))

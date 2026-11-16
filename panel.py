@@ -37,8 +37,10 @@ HELP = (
     "Сколько ссылок в одном сообщении, столько доноров и добавится.\n"
     "3) Кнопка 🗑 под донором - убрать его из списка.\n"
     "4) «✏️ Переименовать» - если название темы должно отличаться от названия канала.\n"
-    "5) «🔄 Обновить список» - перечитать группу заново.\n"
-    "6) «⏸ Пауза» - посты ловим, но не публикуем. «▶ Пуск» - снова работаем.\n\n"
+    "5) «🗑 Убрать канал целиком» - удалить тему и всех её доноров (спросит подтверждение).\n"
+    "6) «✏️ Переименовать склад» - сменить название группы, где живёт список.\n"
+    "7) «🔄 Обновить список» - перечитать группу заново.\n"
+    "8) «⏸ Пауза» - посты ловим, но не публикуем. «▶ Пуск» - снова работаем.\n\n"
     "Список хранится в группе с темами (тема = канал, ссылки в теме = доноры), "
     "поэтому после перезапуска всё восстанавливается само."
 )
@@ -142,8 +144,18 @@ class Panel:
             await self._show(query, key)
         elif key == "cat":
             await self._show(query, "cat", arg)
-        elif key in ("add", "channel", "rename", "group"):
-            self.awaiting = {"add": ("donor", arg), "channel": ("channel", 0), "rename": ("rename", arg), "group": ("group", 0)}[key]
+        elif key == "drop":
+            await self._show(query, "drop", arg)
+        elif key == "drop_yes":
+            await self._remove_category(query, arg)
+        elif key in ("add", "channel", "rename", "group", "group_rename"):
+            self.awaiting = {
+                "add": ("donor", arg),
+                "channel": ("channel", 0),
+                "rename": ("rename", arg),
+                "group": ("group", 0),
+                "group_rename": ("group_rename", 0),
+            }[key]
             await self._show(query, key, arg)
         elif key == "del":
             message_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
@@ -162,6 +174,11 @@ class Panel:
         names = ", ".join(donor.name for donor in removed)
         self.notice = f"Убрал донора: {names}."
         await self._show(query, "cat", topic_id, flash=self.notice)
+
+    async def _remove_category(self, query, topic_id: int) -> None:
+        category = await self.registry.remove_category(topic_id)
+        self.notice = f"✅ Убрал канал «{category.name}» и его тему - его доноры больше не ловятся."
+        await self._show(query, "topics", flash=self.notice)
 
     async def _rebuild(self, query) -> None:
         await call(query.answer, "Перечитываю группу...")
@@ -186,13 +203,17 @@ class Panel:
                 name = await registry.create_storage_group(text[:NAME_LIMIT])
                 self.notice = f"✅ Создал группу-хранилище «{name}». Её владелец - {self.account}. Жми «➕ Новый канал»."
                 screen = ("main", 0)
+            elif kind == "group_rename":
+                name = await registry.rename_storage_group(text)
+                self.notice = f"✅ Склад теперь называется «{name}». Доноры и темы не изменились."
+                screen = ("main", 0)
             else:
                 category = await registry.rename_category(topic_id, text[:NAME_LIMIT])
                 self.notice = self._category_notice(category, f"Переименовал в «{category.name}»")
                 screen = ("cat", topic_id)
         except RegistryError as exc:
             self.notice = f"⚠ {exc}"
-            screen = ("main", 0) if kind in ("channel", "group") else ("cat", topic_id)
+            screen = ("main", 0) if kind in ("channel", "group", "group_rename") else ("cat", topic_id)
         except Exception as exc:  # noqa: BLE001 - действие всегда должно заканчиваться ответом
             log.error("Действие из панели упало: %s: %s", type(exc).__name__, exc)
             self.notice = f"⚠ Ошибка: {type(exc).__name__}"
@@ -224,6 +245,10 @@ class Panel:
             return self._new_group_view()
         if kind == "rename":
             return self._rename_view(topic_id)
+        if kind == "drop":
+            return self._drop_view(topic_id)
+        if kind == "group_rename":
+            return self._rename_group_view()
         return self._main_view()
 
     def _main_view(self) -> Tuple[str, InlineKeyboardMarkup]:
@@ -255,6 +280,7 @@ class Panel:
                 [("📂 Каналы и доноры", "topics"), ("➕ Новый канал", "channel")],
                 [("🔄 Обновить список", "update"), ("ℹ️ Статус", "status")],
                 [toggle, ("❓ Как это работает", "help")],
+                [("✏️ Переименовать склад", "group_rename")],
             ),
         )
 
@@ -303,6 +329,7 @@ class Panel:
             markup(
                 *rows,
                 [("➕ Донор", f"add|{topic_id}"), ("✏️ Переименовать", f"rename|{topic_id}")],
+                [("🗑 Убрать канал целиком", f"drop|{topic_id}")],
                 [("📂 Все каналы", "topics"), ("⬅️ Меню", "main")],
             ),
         )
@@ -365,6 +392,33 @@ class Panel:
                 TEXT_LIMIT,
             ),
             markup([("⬅️ Отмена", f"cat|{topic_id}")]),
+        )
+
+    def _drop_view(self, topic_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+        category = self.registry.categories.get(topic_id)
+        donors = len(category.donors) if category else 0
+        return (
+            cut(
+                f"Канал: «{self._name(topic_id)}»\n\nУбрать его целиком? Тема и {donors} донор(ов) "
+                "исчезнут из списка, посты оттуда ловиться не будут. Отменить нельзя.\n\n"
+                "Посты, уже опубликованные в канале, остаются.",
+                TEXT_LIMIT,
+            ),
+            markup(
+                [("✅ Да, убрать", f"drop_yes|{topic_id}")],
+                [("⬅️ Отмена", f"cat|{topic_id}")],
+            ),
+        )
+
+    def _rename_group_view(self) -> Tuple[str, InlineKeyboardMarkup]:
+        return (
+            cut(
+                f"Сейчас склад называется «{self.registry.group_name}». Внутри него живут темы с донорами - "
+                "это не канал, поэтому название лучше дать служебное, например «АвтоПост».\n\n"
+                "Напиши новое название склада.",
+                TEXT_LIMIT,
+            ),
+            markup([("⬅️ Отмена", "main")]),
         )
 
     def _name(self, topic_id: int) -> str:
