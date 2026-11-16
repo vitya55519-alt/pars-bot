@@ -283,12 +283,24 @@ class Registry:
         return None
 
     def _reindex(self) -> None:
+        """Ловим донора только той темой, у которой есть канал: тема без канала публикует в пустоту."""
         routes: Dict[int, int] = {}
+        homes: Dict[int, List[str]] = {}
         for category in self.categories.values():
-            for chat_id in category.donors:
+            if not category.target:
+                continue
+            for chat_id, donor in category.donors.items():
                 if chat_id == self.group_id or chat_id in self.target_ids:
                     continue
                 routes[chat_id] = category.topic_id
+                homes.setdefault(chat_id, []).append(category.name)
+                if len(homes[chat_id]) > 1:
+                    log.warning(
+                        "Донор %s стоит в нескольких темах (%s) - пост уходит в «%s».",
+                        donor.name,
+                        ", ".join(f"«{name}»" for name in homes[chat_id]),
+                        category.name,
+                    )
         self.routes = routes
 
     # ==== живые изменения ====
@@ -309,8 +321,15 @@ class Registry:
 
         async with self.lock:
             added = await self._absorb(text, message.id, category)
-            for donor in added:
-                self.routes[donor.chat_id] = category.topic_id
+            if category.target:
+                for donor in added:
+                    self.routes[donor.chat_id] = category.topic_id
+            elif added:
+                log.warning(
+                    "Доноры %s добавлены в тему «%s», но канала у темы нет - посты не публикуем.",
+                    ", ".join(donor.name for donor in added),
+                    category.name,
+                )
         return added
 
     async def forget(self, message) -> List[Donor]:
@@ -432,6 +451,11 @@ class Registry:
         refs = extract_refs(text or "")
         if not refs:
             raise RegistryError("Это не ссылка на канал. Нужен @юзернейм или https://t.me/...")
+        if not category.target:
+            raise RegistryError(
+                f"У темы «{category.name}» нет целевого канала - постить некуда. "
+                "Переименуй тему в название или ссылку канала, куда постить."
+            )
 
         posted = await call(self.client.send_message, self.group_id, text, message_thread_id=topic_id)
         async with self.lock:

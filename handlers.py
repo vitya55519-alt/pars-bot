@@ -55,6 +55,13 @@ class ParsBot:
         category = self.registry.route(message.chat.id)
         if category is None:
             return
+        if not category.target:
+            log.warning(
+                "Тема «%s» без целевого канала - пост %s пропущен: переименуй тему в канал, куда постить.",
+                category.name,
+                message.id,
+            )
+            return
 
         self.stats["caught"] += 1
         try:
@@ -66,7 +73,7 @@ class ParsBot:
             log.warning("Донор %s запрещает пересылку/копирование - пост пропущен.", chat_name(message.chat))
         except Exception as exc:  # noqa: BLE001 - скрипт не должен падать на одном посте
             self.stats["errors"] += 1
-            log.error("Сбой на посте %s: %s: %s", message.id, type(exc).__name__, exc)
+            log.error("Сбой на посте %s: %s: %s", message.id, type(exc).__name__, exc, exc_info=True)
 
     def _drop_source(self, text: str, chat) -> str:
         """Подпись донора - его @юзернейм и ссылки на его канал - в наш канал попадать не должна."""

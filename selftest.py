@@ -438,6 +438,7 @@ async def main():
     await check_signature()
     await check_store()
     await check_cabinet()
+    await check_dead_topic()
 
     print(f"\nПроверок: {len(CHECKS)}, неудач: {len(FAILED)}")
     if FAILED:
@@ -471,6 +472,50 @@ async def check_registry():
     check("числовой -100 id распознаётся", extract_refs("@Abc -1001234567890")[-1] == -1001234567890)
     check("t.me/c превращается в -100", extract_refs("https://t.me/c/1234567890/5")[0] == -1001234567890)
     check("юзернейм из t.me/s берётся", extract_refs("https://t.me/s/donor_sport_1") == ["donor_sport_1"])
+
+
+async def check_dead_topic():
+    print("\n[17] Тема без целевого канала не глотает чужие посты")
+    from registry import RegistryError
+
+    world = build_world()
+    client, group = world["client"], world["group"]
+    client.topics[group.id].append(Topic(23, "Банк"))
+    client.group_messages.append(Message(client, 6, group, text="@donor_sport_1", thread=23))
+    client.group_messages.append(Message(client, 7, group, text="@stranger", thread=23))
+    bot, registry, _ = await make_bot(world)
+
+    dead = registry.categories[23]
+    check("тема без канала помечена", dead.target is None and bool(dead.problem), dead.describe())
+    check(
+        "общий донор остался в валидной теме",
+        registry.routes.get(world["donor_sport_1"].id) == 21,
+        str(registry.routes),
+    )
+    check("донор только битой темы не ловится", world["stranger"].id not in registry.routes, str(registry.routes))
+
+    await bot.on_message(client, Message(client, 41, world["donor_sport_1"], caption="текст", photo=Photo("f41")))
+    check(
+        "пост ушёл в канал валидной темы",
+        len(client.posted) == 1 and client.posted[0].chat.id == world["sport"].id,
+        str([(m.chat.id, m.photo.file_id) for m in client.posted]),
+    )
+    check("сбоев при публикации нет", bot.stats["errors"] == 0, str(bot.stats))
+
+    donor_filter = client.handlers[0].filters
+    check(
+        "фильтр не берёт пост битой темы",
+        not await donor_filter(client, Message(client, 42, world["stranger"], caption="текст", photo=Photo("f42"))),
+    )
+    check("в канале не появилось мусора", len(client.posted) == 1)
+
+    blocked = False
+    try:
+        await registry.add_donor(23, "@donor_other")
+    except RegistryError:
+        blocked = True
+    check("донора в тему без канала не добавить", blocked)
+    check("кнопка ничего не записала в склад", 8 not in [m.id for m in client.group_messages])
 
 
 async def check_routing():
