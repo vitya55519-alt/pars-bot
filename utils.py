@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+from typing import List
 
 from pyrogram.errors import FloodWait
 
@@ -21,6 +22,24 @@ def chat_name(chat) -> str:
 def norm_title(text: str) -> str:
     """Название канала и название темы сверяются без учёта регистра, эмодзи и лишних пробелов."""
     return " ".join(EMOJI_RE.sub(" ", text or "").split()).casefold()
+
+
+def strip_source(text: str, chat) -> str:
+    """Убирает подпись донора из текста: его @юзернейм и ссылки на его канал, только его."""
+    username = (getattr(chat, "username", "") or "").strip()
+    if not username or not text:
+        return text
+
+    name = re.escape(username)
+    mention = re.compile(rf"(?<![\w.])@{name}\b(/[0-9]+)?", re.IGNORECASE)
+    link = re.compile(rf"(?:https?://)?(?:t|telegram)\.me/(?:s/)?{name}\b(/[0-9]+)?", re.IGNORECASE)
+    cleaned = mention.sub(" ", link.sub(" ", text))
+    kept: List[str] = []
+    for line in (re.sub(r"\s+", " ", item).strip() for item in cleaned.splitlines()):
+        if not line and (not kept or not kept[-1]):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 async def call(func, *args, **kwargs):

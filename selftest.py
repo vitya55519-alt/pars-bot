@@ -435,6 +435,7 @@ async def main():
     await check_panel_login_flood()
     await check_reactions()
     await check_views()
+    await check_signature()
 
     print(f"\nПроверок: {len(CHECKS)}, неудач: {len(FAILED)}")
     if FAILED:
@@ -1260,6 +1261,43 @@ async def _raises(action, *args):
     except ValueError:
         return True
     return False
+
+
+async def check_signature():
+    print("\n[14] Подпись донора не попадает в наш канал")
+    from ai import AiRewriter
+    from utils import strip_source
+
+    client = FakeClient()
+    donor = client.add_chat(Chat(-10080, title="Банки, деньги, два офшора", username="bankrollo", chat_type=ChatType.CHANNEL))
+    private = client.add_chat(Chat(-10081, title="Приват без юзернейма", chat_type=ChatType.CHANNEL))
+
+    post = "Офисы в Абу-Даби подешевели.\n\nСтавка $1026 за кв. м.\n@bankrollo"
+    out = strip_source(post, donor)
+    check("строка с @юзернеймом убрана", "@bankrollo" not in out and "Офисы" in out, out)
+    check("текст поста цел", "Ставка $1026 за кв. м." in out and out.endswith("кв. м."), out)
+    check("абзац не схлопнулся", "подешевели.\n\nСтавка" in out, repr(out))
+    check("регистр не важен", "@BankRollo" not in strip_source("См. @BankRollo сегодня", donor))
+    check("ссылка на донора убрана", "bankrollo" not in strip_source("Подробнее https://t.me/bankrollo/512", donor))
+    check("чужой юзернейм остаётся", "@partner_ch" in strip_source("Партнёр @partner_ch и @bankrollo", donor))
+    check("у приватного донора чистить нечего", strip_source("текст @bankrollo", private) == "текст @bankrollo")
+
+    world = build_world(make_cfg(reactions_enabled=False, promo_delay=0))
+    bot, registry, _ = await make_bot(world, ai=AiRewriter(world["cfg"], FakeSession([])))
+    await bot.on_message(
+        world["client"], Message(world["client"], 71, world["donor_other"], caption="Мемы дня.\n@donor_other", photo=Photo("s1"))
+    )
+    caption = world["client"].posted[-1].caption
+    check("без нейросети публикуется чистый оригинал", caption == "Мемы дня.", repr(caption))
+
+    cards = [
+        Message(world["client"], 81, world["donor_sport_1"], photo=Photo("s2"), group="gs1"),
+        Message(world["client"], 82, world["donor_sport_1"], photo=Photo("s3"), group="gs1", caption="Хоккей завтра.\n@donor_sport_1"),
+    ]
+    world["client"].donor_messages[world["donor_sport_1"].id] = cards
+    await bot.on_message(world["client"], cards[0])
+    album = world["client"].albums[-1]
+    check("альбом тоже без подписи", album[0].caption == "Хоккей завтра." and not album[1].caption, repr(album[0].caption))
 
 
 if __name__ == "__main__":

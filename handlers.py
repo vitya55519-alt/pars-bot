@@ -13,7 +13,7 @@ from ai import cut
 from commands import Controls
 from promo import Promoter
 from reactions import Reactor
-from utils import call, chat_name
+from utils import call, chat_name, strip_source
 
 log = logging.getLogger("pars")
 
@@ -68,6 +68,13 @@ class ParsBot:
             self.stats["errors"] += 1
             log.error("Сбой на посте %s: %s: %s", message.id, type(exc).__name__, exc)
 
+    def _drop_source(self, text: str, chat) -> str:
+        """Подпись донора - его @юзернейм и ссылки на его канал - в наш канал попадать не должна."""
+        cleaned = strip_source(text, chat)
+        if cleaned != text:
+            log.info("Убрал подпись донора %s из текста поста.", chat_name(chat))
+        return cleaned
+
     async def _single(self, message: Message, category) -> None:
         log.info("Пойман пост из %s (тема «%s», id %s).", chat_name(message.chat), category.name, message.id)
 
@@ -76,7 +83,7 @@ class ParsBot:
             log.info("В посте нет текста - пропуск (нечего рерайтить).")
             return
 
-        text = await self.ai.rewrite(original)
+        text = self._drop_source(await self.ai.rewrite(original), message.chat)
         log.info("Рерайт завершён (%s символов).", len(text))
 
         posted = await call(
@@ -109,7 +116,7 @@ class ParsBot:
             log.info("В альбоме %s нет текста - пропуск.", group_id)
             return
 
-        text = await self.ai.rewrite(original)
+        text = self._drop_source(await self.ai.rewrite(original), message.chat)
         log.info("Рерайт альбома завершён (%s символов, карточек %s).", len(text), len(photos[:TELEGRAM_ALBUM_LIMIT]))
 
         caption = cut(text, self.cfg.caption_limit)
