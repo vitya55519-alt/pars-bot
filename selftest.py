@@ -436,6 +436,7 @@ async def main():
     await check_reactions()
     await check_views()
     await check_signature()
+    await check_store()
 
     print(f"\nПроверок: {len(CHECKS)}, неудач: {len(FAILED)}")
     if FAILED:
@@ -1298,6 +1299,196 @@ async def check_signature():
     await bot.on_message(world["client"], cards[0])
     album = world["client"].albums[-1]
     check("альбом тоже без подписи", album[0].caption == "Хоккей завтра." and not album[1].caption, repr(album[0].caption))
+
+
+def _schema_tables():
+    """Колонки из SCHEMA модуля store: фейк базы сверяет запросы с настоящим описанием таблиц."""
+    import re
+
+    from store import SCHEMA
+
+    tables = {}
+    for name, body in re.findall(r"CREATE TABLE IF NOT EXISTS (\w+) \((.*?)\n\);", SCHEMA, re.S):
+        columns = set()
+        for line in body.splitlines():
+            first = line.strip().split(" ")[0].rstrip(",")
+            if first.upper() in ("PRIMARY", "CONSTRAINT", "UNIQUE", "FOREIGN", ""):
+                continue
+            if re.match(r"^[a-z_][a-z0-9_]*$", first):
+                columns.add(first)
+        tables[name] = columns
+    return tables
+
+
+SCHEMA_TABLES = _schema_tables()
+
+
+def _tenant_row(tenant_id: int = 777, balance: int = 0, until=None, target: str = "@client_channel"):
+    import datetime
+
+    moment = datetime.datetime(2026, 11, 16, 12, 0, tzinfo=datetime.timezone.utc)
+    return {
+        "id": tenant_id,
+        "target": target,
+        "target_id": -1005554443332,
+        "target_title": "Канал клиента",
+        "views": 0,
+        "reactions": True,
+        "balance_rub": balance,
+        "plan_until": until,
+        "created_at": moment,
+        "updated_at": moment,
+    }
+
+
+class FakeConn:
+    """Проверяет таблицы и колонки запросов и отдаёт заготовленные строки."""
+
+    def __init__(self, pool):
+        self.pool = pool
+
+    def _validate(self, query: str) -> None:
+        import re
+
+        sql = " ".join(query.split())
+        for table in re.findall(r"(?:FROM|UPDATE|INTO|JOIN)\s+(?!SET\b)(\w+)", sql, re.I):
+            if table not in SCHEMA_TABLES:
+                raise AssertionError(f"запрос к несуществующей таблице {table}: {sql[:90]}")
+        for table, assignments in re.findall(r"UPDATE (\w+) SET (.*?) WHERE", sql, re.I):
+            for item in assignments.split(","):
+                column = item.split("=")[0].strip().split(".")[-1]
+                if column and column not in SCHEMA_TABLES[table]:
+                    raise AssertionError(f"у таблицы {table} нет колонки {column}: {sql[:90]}")
+        for table, columns in re.findall(r"INSERT INTO (\w+) \(([^)]*)\)", sql, re.I):
+            for column in (part.strip() for part in columns.split(",")):
+                if column and column not in SCHEMA_TABLES[table]:
+                    raise AssertionError(f"у таблицы {table} нет колонки {column}: {sql[:90]}")
+
+    async def execute(self, query, *args):
+        self._validate(query)
+        self.pool.queries.append((" ".join(query.split()), args))
+        return "UPDATE 1"
+
+    async def fetchrow(self, query, *args):
+        self._validate(query)
+        self.pool.queries.append((" ".join(query.split()), args))
+        answer = self.pool.pop()
+        if answer is not None:
+            return answer
+        return _tenant_row() if "FROM tenants" in query else None
+
+    async def fetch(self, query, *args):
+        self._validate(query)
+        self.pool.queries.append((" ".join(query.split()), args))
+        answer = self.pool.pop()
+        return answer if answer is not None else []
+
+    async def fetchval(self, query, *args):
+        self._validate(query)
+        self.pool.queries.append((" ".join(query.split()), args))
+        answer = self.pool.pop()
+        if isinstance(answer, dict):
+            return next(iter(answer.values()))
+        return answer if answer is not None else 0
+
+
+class FakePool:
+    def __init__(self):
+        self.conn = FakeConn(self)
+        self.answers: List[dict] = []
+        self.queries: List[tuple] = []
+
+    def pop(self):
+        return self.answers.pop(0) if self.answers else None
+
+    def acquire(self):
+        pool = self
+
+        class _Ctx:
+            async def __aenter__(self):
+                return pool.conn
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+
+async def check_store():
+    print("\n[15] База клиентов: ссылки, тариф, баланс")
+    import datetime as dt
+
+    from store import MAX_DONORS, MONTH_RUB, PLANS, WEEK_RUB, Store, StoreError, Tenant, parse_ref, ref_key
+
+    check("неделя 600, месяц 2000", WEEK_RUB == 600 and MONTH_RUB == 2000 and PLANS["month"]["days"] == 30,
+          f"{WEEK_RUB}/{MONTH_RUB}")
+    check("ссылка t.me", parse_ref("https://t.me/bankrollo") == "bankrollo", str(parse_ref("https://t.me/bankrollo")))
+    check("собачка и голое имя", parse_ref("@BankRollo") == "bankrollo" and parse_ref("bankrollo") == "bankrollo")
+    check("ссылка просмотра t.me/s", parse_ref("t.me/s/bankrollo") == "bankrollo")
+    check("числовой id канала", parse_ref("-1002345678901") == -1002345678901, str(parse_ref("-1002345678901")))
+    bad = ""
+    try:
+        parse_ref("ну возьми отсюда")
+    except ValueError as exc:
+        bad = str(exc)
+    check("бессмыслица отклонена", "Не понимаю ссылку" in bad, bad)
+    check("ключ не зависит от собачки", ref_key("@BankRollo") == ref_key("bankrollo") == "bankrollo", ref_key("@BankRollo"))
+    check("числовой ключ строковый", ref_key(-1002345678901) == "-1002345678901", ref_key(-1002345678901))
+
+    now = dt.datetime(2026, 11, 16, 12, 0, tzinfo=dt.timezone.utc)
+    fresh = Tenant(id=1)
+    check("без тарифа клиент не активен", not fresh.active(now) and fresh.days_left(now) == 0)
+    cost = fresh.renew("week", now)
+    check("первая неделя: цена и срок", cost == 600 and fresh.plan_until == now + dt.timedelta(days=7), str(fresh.plan_until))
+    check("активен до конца срока", fresh.active(now + dt.timedelta(days=6)) and not fresh.active(now + dt.timedelta(days=8)))
+    fresh.renew("week", now + dt.timedelta(days=6))
+    check("продление до конца срока сохраняет остаток", fresh.plan_until == now + dt.timedelta(days=14), str(fresh.plan_until))
+    month = Tenant(id=2, plan_until=now + dt.timedelta(days=20))
+    month.renew("month", now)
+    check("месяц добавляется к остатку", month.plan_until == now + dt.timedelta(days=50) and month.price("month") == 2000,
+          str(month.plan_until))
+    check("лимит доноров объявлен", MAX_DONORS == 10, str(MAX_DONORS))
+
+    pool = FakePool()
+    store = Store(pool)
+    poor = await store.ensure_tenant(777)
+    check("новый клиент: нулевой баланс", poor.balance == 0 and poor.plan_until is None, str(poor))
+    short = ""
+    try:
+        await store.buy(777, "week")
+    except StoreError as exc:
+        short = str(exc)
+    check("без денег покупка отклонена", "На балансе 0" in short, short)
+    check("чужого тарифа нет", isinstance(await _raises_store(store.buy, 777, "god"), StoreError))
+
+    pool.answers = [_tenant_row(balance=1000)]
+    paid = await store.buy(777, "week")
+    check("покупка продлевает срок", paid.days_left(dt.datetime.now(dt.timezone.utc)) >= 6, str(paid.plan_until))
+    update = [call for call in pool.queries if "UPDATE tenants SET balance_rub" in call[0]]
+    check("со списка списано 600", update and update[-1][1][1] == 600, str(update[-1][1] if update else ""))
+    check("покупка записана в журнал", any("INSERT INTO payments" in call[0] and call[1][1] == "week" for call in pool.queries))
+
+    pool.answers = [{"count": MAX_DONORS}]
+    full = await _raises_store(store.add_donor, 777, "some_channel")
+    check("сверх лимита доноров отказ", isinstance(full, StoreError) and "Больше 10" in str(full), str(full))
+
+    pool.answers = [{"posts": 3}]
+    check("счётчик дня читается", await store.posts_today(777) == 3)
+    pool.answers = [{"posts": 4}]
+    check("пост учтён", await store.count_post(777) == 4)
+    check("обращение к таблице дня", any("day_usage" in call[0] for call in pool.queries))
+
+
+async def _raises_store(action, *args):
+    from store import StoreError
+
+    try:
+        await action(*args)
+    except StoreError as exc:
+        return exc
+    except Exception as exc:  # noqa: BLE001 - нужен сам факт отказа
+        return exc
+    return None
 
 
 if __name__ == "__main__":

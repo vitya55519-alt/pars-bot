@@ -1,0 +1,357 @@
+"""База клиентов: кто платит, кого читаем и куда постим.
+
+Склад-группа в Telegram остаётся только для личного режима. Когда клиентов
+несколько, источник истины - Postgres: там баланс, срок тарифа, свой канал и
+свой список доноров на каждого.
+"""
+
+import datetime
+import logging
+import re
+from dataclasses import dataclass
+from typing import List, Optional, Union
+
+import asyncpg
+
+log = logging.getLogger("store")
+
+ChatRef = Union[int, str]
+
+WEEK_RUB = 600
+MONTH_RUB = 2000
+PLANS = {
+    "week": {"title": "Неделя", "days": 7, "price": WEEK_RUB},
+    "month": {"title": "Месяц", "days": 30, "price": MONTH_RUB},
+}
+
+MAX_DONORS = 10
+MAX_POSTS_PER_DAY = 50
+
+USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
+LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{4,31})", re.I)
+MENTION_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_]{4,31})")
+NUMERIC_ID_RE = re.compile(r"-100\d{8,16}")
+
+
+def today(now: Optional[datetime.datetime] = None) -> datetime.date:
+    return (now or datetime.datetime.now(datetime.timezone.utc)).date()
+
+
+def ref_key(ref: ChatRef) -> str:
+    """Одинаковый ключ для «@bankrollo», «bankrollo» и числа: база не хранит одно и то же дважды."""
+    if isinstance(ref, int):
+        return str(ref)
+    return str(ref or "").strip().lstrip("@").lower()
+
+
+def parse_ref(text: str) -> ChatRef:
+    """Ссылка на канал из сообщения клиента: @юзернейм, t.me/... или числовой -100..."""
+    raw = " ".join((text or "").split())
+    for pattern in (LINK_RE, MENTION_RE):
+        match = pattern.search(raw)
+        if match:
+            return match.group(1).lower()
+    numeric = NUMERIC_ID_RE.search(raw)
+    if numeric:
+        return int(numeric.group(0))
+    if USERNAME_RE.match(raw):
+        return raw.lower()
+    raise ValueError(f"Не понимаю ссылку «{raw}». Нужно @юзернейм канала или ссылка вида https://t.me/channel.")
+
+
+@dataclass
+class Tenant:
+    id: int
+    target: str = ""
+    target_id: Optional[int] = None
+    target_title: str = ""
+    views: int = 0
+    reactions: bool = True
+    balance: int = 0
+    plan_until: Optional[datetime.datetime] = None
+
+    def active(self, now: Optional[datetime.datetime] = None) -> bool:
+        if self.plan_until is None:
+            return False
+        return self.plan_until > (now or datetime.datetime.now(datetime.timezone.utc))
+
+    def days_left(self, now: Optional[datetime.datetime] = None) -> int:
+        if self.plan_until is None:
+            return 0
+        delta = self.plan_until - (now or datetime.datetime.now(datetime.timezone.utc))
+        return max(0, delta.days)
+
+    def price(self, kind: str) -> int:
+        return PLANS[kind]["price"]
+
+    def renew(self, kind: str, now: Optional[datetime.datetime] = None) -> int:
+        """Сколько стоит продление и на какую дату отодвигается тариф.
+
+        Если срок ещё не вышел, дни добавляются к нему, а не к сегодняшнему дню:
+        человек, купивший месяц за две недели до конца, не теряет эти две недели.
+        """
+        moment = now or datetime.datetime.now(datetime.timezone.utc)
+        start = self.plan_until if (self.plan_until and self.plan_until > moment) else moment
+        self.plan_until = start + datetime.timedelta(days=PLANS[kind]["days"])
+        return PLANS[kind]["price"]
+
+
+@dataclass
+class Donor:
+    ref: str
+    chat_id: Optional[int] = None
+    title: str = ""
+
+
+class StoreError(Exception):
+    pass
+
+
+class Store:
+    def __init__(self, pool):
+        self.pool = pool
+
+    @classmethod
+    async def connect(cls, dsn: str) -> "Store":
+        if not dsn:
+            raise StoreError("DATABASE_URL пуст - в Railway нужно подключить PostgreSQL.")
+        pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=5)
+        store = cls(pool)
+        await store._migrate()
+        log.info("База клиентов подключена.")
+        return store
+
+    async def close(self) -> None:
+        await self.pool.close()
+
+    async def _migrate(self) -> None:
+        async with self.pool.acquire() as con:
+            await con.execute(SCHEMA)
+
+    # ==== клиенты ====
+
+    async def get_tenant(self, tenant_id: int) -> Optional[Tenant]:
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow("SELECT * FROM tenants WHERE id = $1", tenant_id)
+        return _tenant(row) if row else None
+
+    async def ensure_tenant(self, tenant_id: int) -> Tenant:
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "INSERT INTO tenants (id) VALUES ($1) ON CONFLICT (id) DO NOTHING",
+                tenant_id,
+            )
+            row = await con.fetchrow("SELECT * FROM tenants WHERE id = $1", tenant_id)
+        return _tenant(row)
+
+    async def list_tenants(self) -> List[Tenant]:
+        async with self.pool.acquire() as con:
+            rows = await con.fetch("SELECT * FROM tenants ORDER BY id")
+        return [_tenant(row) for row in rows]
+
+    async def set_target(self, tenant_id: int, target: str, target_id: Optional[int], title: str) -> None:
+        async with self.pool.acquire() as con:
+            await con.execute(
+                """
+                UPDATE tenants SET target = $2, target_id = $3, target_title = $4, updated_at = now()
+                WHERE id = $1
+                """,
+                tenant_id,
+                target,
+                target_id,
+                title,
+            )
+
+    async def set_views(self, tenant_id: int, views: int) -> None:
+        async with self.pool.acquire() as con:
+            await con.execute("UPDATE tenants SET views = $2, updated_at = now() WHERE id = $1", tenant_id, views)
+
+    async def set_reactions(self, tenant_id: int, enabled: bool) -> None:
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE tenants SET reactions = $2, updated_at = now() WHERE id = $1",
+                tenant_id,
+                enabled,
+            )
+
+    # ==== деньги и тариф ====
+
+    async def add_balance(self, tenant_id: int, amount: int, note: str = "") -> Tenant:
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE tenants SET balance_rub = balance_rub + $2, updated_at = now() WHERE id = $1",
+                tenant_id,
+                amount,
+            )
+            await con.execute(
+                "INSERT INTO payments (tenant_id, kind, amount_rub, days, note) VALUES ($1, 'topup', $2, 0, $3)",
+                tenant_id,
+                amount,
+                note,
+            )
+            row = await con.fetchrow("SELECT * FROM tenants WHERE id = $1", tenant_id)
+        return _tenant(row)
+
+    async def buy(self, tenant_id: int, kind: str) -> Tenant:
+        """Списывает стоимость тарифа с баланса и продлевает срок. Баланса не хватило - StoreError."""
+        if kind not in PLANS:
+            raise StoreError(f"Нет такого тарифа: {kind}")
+        price = PLANS[kind]["price"]
+        tenant = await self.ensure_tenant(tenant_id)
+        if tenant.balance < price:
+            raise StoreError(f"На балансе {tenant.balance} ₽, а {PLANS[kind]['title']} стоит {price} ₽.")
+        tenant.renew(kind)
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE tenants SET balance_rub = balance_rub - $2, plan_until = $3, updated_at = now() WHERE id = $1",
+                tenant_id,
+                price,
+                tenant.plan_until,
+            )
+            await con.execute(
+                "INSERT INTO payments (tenant_id, kind, amount_rub, days, note) VALUES ($1, $2, $3, $4, '')",
+                tenant_id,
+                kind,
+                price,
+                PLANS[kind]["days"],
+            )
+        log.info("Клиент %s купил «%s»: %s ₽, до %s.", tenant_id, PLANS[kind]["title"], price, tenant.plan_until)
+        return tenant
+
+    async def list_payments(self, tenant_id: int, limit: int = 10) -> List[dict]:
+        async with self.pool.acquire() as con:
+            rows = await con.fetch(
+                "SELECT kind, amount_rub, days, note, created_at FROM payments WHERE tenant_id = $1 "
+                "ORDER BY id DESC LIMIT $2",
+                tenant_id,
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    # ==== доноры ====
+
+    async def list_donors(self, tenant_id: int) -> List[Donor]:
+        async with self.pool.acquire() as con:
+            rows = await con.fetch("SELECT ref, chat_id, title FROM donors WHERE tenant_id = $1 ORDER BY ref", tenant_id)
+        return [Donor(row["ref"], row["chat_id"], row["title"] or "") for row in rows]
+
+    async def add_donor(self, tenant_id: int, ref: ChatRef) -> Donor:
+        key = ref_key(ref)
+        if not key:
+            raise StoreError("Пустая ссылка.")
+        async with self.pool.acquire() as con:
+            count = await con.fetchval("SELECT count(*) FROM donors WHERE tenant_id = $1", tenant_id)
+            if count >= MAX_DONORS:
+                raise StoreError(f"Больше {MAX_DONORS} доноров на одного клиента нельзя - убери старый.")
+            await con.execute(
+                "INSERT INTO donors (tenant_id, ref) VALUES ($1, $2) ON CONFLICT (tenant_id, ref) DO NOTHING",
+                tenant_id,
+                key,
+            )
+            row = await con.fetchrow("SELECT ref, chat_id, title FROM donors WHERE tenant_id = $1 AND ref = $2", tenant_id, key)
+        return Donor(row["ref"], row["chat_id"], row["title"] or "")
+
+    async def remove_donor(self, tenant_id: int, ref: ChatRef) -> None:
+        async with self.pool.acquire() as con:
+            await con.execute("DELETE FROM donors WHERE tenant_id = $1 AND ref = $2", tenant_id, ref_key(ref))
+
+    async def bind_donor(self, ref: ChatRef, chat_id: int, title: str) -> int:
+        """Рабочий аккаунт открыл канал по ссылке: запоминаем числовой id для всех, кто на него подписан."""
+        async with self.pool.acquire() as con:
+            result = await con.execute("UPDATE donors SET chat_id = $2, title = $3 WHERE ref = $1", ref_key(ref), chat_id, title)
+        return int(result.split()[-1])
+
+    async def donors_by_chat(self, chat_id: int) -> List[Tenant]:
+        """Маршрут горячего пути: в каком канале мы донор и чьи настройки применять."""
+        async with self.pool.acquire() as con:
+            rows = await con.fetch(
+                """
+                SELECT t.* FROM tenants t JOIN donors d ON d.tenant_id = t.id
+                WHERE d.chat_id = $1 AND t.plan_until IS NOT NULL AND t.plan_until > now() AND t.target <> ''
+                """,
+                chat_id,
+            )
+        return [_tenant(row) for row in rows]
+
+    # ==== лимит дня ====
+
+    async def posts_today(self, tenant_id: int) -> int:
+        async with self.pool.acquire() as con:
+            value = await con.fetchval(
+                "SELECT posts FROM day_usage WHERE tenant_id = $1 AND day = $2",
+                tenant_id,
+                today(),
+            )
+        return int(value or 0)
+
+    async def count_post(self, tenant_id: int) -> int:
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow(
+                """
+                INSERT INTO day_usage (tenant_id, day, posts) VALUES ($1, $2, 1)
+                ON CONFLICT (tenant_id, day) DO UPDATE SET posts = day_usage.posts + 1
+                RETURNING posts
+                """,
+                tenant_id,
+                today(),
+            )
+        return int(row["posts"])
+
+    async def quota_left(self, tenant_id: int) -> bool:
+        return await self.posts_today(tenant_id) < MAX_POSTS_PER_DAY
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS tenants (
+    id BIGINT PRIMARY KEY,
+    target TEXT NOT NULL DEFAULT '',
+    target_id BIGINT,
+    target_title TEXT NOT NULL DEFAULT '',
+    views INT NOT NULL DEFAULT 0,
+    reactions BOOLEAN NOT NULL DEFAULT TRUE,
+    balance_rub INT NOT NULL DEFAULT 0,
+    plan_until TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS donors (
+    tenant_id BIGINT NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+    ref TEXT NOT NULL,
+    chat_id BIGINT,
+    title TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, ref)
+);
+CREATE INDEX IF NOT EXISTS donors_chat_id_idx ON donors (chat_id);
+
+CREATE TABLE IF NOT EXISTS payments (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id BIGINT NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    amount_rub INT NOT NULL,
+    days INT NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS day_usage (
+    tenant_id BIGINT NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+    day DATE NOT NULL,
+    posts INT NOT NULL DEFAULT 0,
+    PRIMARY KEY (tenant_id, day)
+);
+"""
+
+
+def _tenant(row) -> Tenant:
+    return Tenant(
+        id=int(row["id"]),
+        target=row["target"] or "",
+        target_id=row["target_id"],
+        target_title=row["target_title"] or "",
+        views=int(row["views"] or 0),
+        reactions=bool(row["reactions"]),
+        balance=int(row["balance_rub"] or 0),
+        plan_until=row["plan_until"],
+    )
