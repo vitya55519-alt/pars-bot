@@ -53,13 +53,23 @@ class Promoter:
                 continue
             index, button = found
             try:
-                await message.click(index, timeout=self.cfg.promo_delay)
-                log.info("Промо-бот: нажата кнопка «%s».", button.text)
+                await self._press(message, index, button)
+                log.info("Промо-бот: нажата кнопка «%s».", getattr(button, "text", ""))
             except Exception as exc:  # noqa: BLE001 - кнопка могла устареть, дальше пойдёт пересылка
-                log.warning("Промо-бот: кнопка «%s» не нажалась (%s).", button.text, type(exc).__name__)
+                log.warning("Промо-бот: кнопка «%s» не нажалась (%s).", getattr(button, "text", ""), type(exc).__name__)
             return
 
         log.warning("Промо-бот: кнопки «%s» среди последних сообщений нет - перешлю пост сразу.", self.cfg.promo_button)
+
+    async def _press(self, message, index: int, button) -> None:
+        """Kurigram у обычной кнопки отправляет в чат объект кнопки - в диалоге появляется JSON. Надпись шлём сами."""
+        if getattr(button, "callback_data", None):
+            await message.click(index, timeout=self.cfg.promo_delay)
+            return
+        label = getattr(button, "text", "") or ""
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError("у кнопки нет надписи")
+        await call(self.client.send_message, self.cfg.promo_bot, label)
 
     def _find_button(self, message) -> Optional[Tuple[int, object]]:
         markup = getattr(message, "reply_markup", None)

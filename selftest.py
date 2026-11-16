@@ -75,6 +75,17 @@ class ReplyKeyboard:
         self.keyboard = rows
 
 
+class InlineKeyboard:
+    def __init__(self, rows):
+        self.inline_keyboard = rows
+
+
+class CallbackButton(Button):
+    def __init__(self, text, data):
+        super().__init__(text)
+        self.callback_data = data
+
+
 class Message(_PyrogramMessage):
     """Настоящий класс Message, но без тяжёлого __init__: тогда фильтры куриграма видят тип."""
 
@@ -668,10 +679,25 @@ async def check_promo_flow():
     client.promo_messages.append(done)
     await bot.on_message(client, Message(client, 92, world["donor_sport_1"], caption="текст", photo=Photo("m2")))
 
-    check("нажата «Просмотры», а не «Авто просмотры»", menu.clicks == [(0, None), (0, None)], str(menu.clicks))
+    check("обычную кнопку не кликает вслепую", menu.clicks == [], str(menu.clicks))
+    check("нажата «Просмотры», а не «Авто просмотры»",
+          client.sent == [("promo_bot", "👀 Просмотры"), ("promo_bot", "4100"),
+                          ("promo_bot", "👀 Просмотры"), ("promo_bot", "4100")], str(client.sent))
+    check("объект кнопки в чат не уходит", not any("KeyboardButton" in text for _, text in client.sent), str(client.sent))
     check("посты пересланы промо-боту", [f[0] for f in client.forwarded] == ["promo_bot", "promo_bot"], str(client.forwarded))
-    check("число просмотров отправлено", client.sent == [("promo_bot", "4100"), ("promo_bot", "4100")], str(client.sent))
     check("промо засчитано обоим постам", bot.stats["forwarded"] == 2, str(bot.stats))
+
+    cfg3 = make_cfg(promo_button="Просмотры", promo_views=700, promo_delay=0)
+    world3 = build_world(cfg3)
+    client3 = world3["client"]
+    bot3 = ParsBot(client3, cfg3, StubAI(), Registry(client3, cfg3))
+    await bot3.setup()
+    menu3 = Clickable(client3, 1301, await client3.get_chat("promo_bot"), text="Выбери раздел")
+    menu3.reply_markup = InlineKeyboard([[CallbackButton("👀 Просмотры", "views")], [Button("⚙️ Настройки")]])
+    client3.promo_messages = [menu3]
+    await bot3.on_message(client3, Message(client3, 94, world3["donor_sport_1"], caption="текст", photo=Photo("m4")))
+    check("callback-кнопку жмёт как есть", menu3.clicks == [(0, None)], str(menu3.clicks))
+    check("после callback отправлено только число", client3.sent == [("promo_bot", "700")], str(client3.sent))
 
     cfg2 = make_cfg(promo_button="", promo_views=0, promo_delay=0)
     world2 = build_world(cfg2)
