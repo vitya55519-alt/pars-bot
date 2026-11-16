@@ -12,6 +12,7 @@ from pyrogram.types import InputMediaPhoto, Message
 from ai import cut
 from commands import Controls
 from promo import Promoter
+from reactions import Reactor
 from utils import call, chat_name
 
 log = logging.getLogger("pars")
@@ -24,12 +25,13 @@ def now() -> str:
 
 
 class ParsBot:
-    def __init__(self, client, cfg, ai, registry):
+    def __init__(self, client, cfg, ai, registry, session):
         self.client = client
         self.cfg = cfg
         self.ai = ai
         self.registry = registry
         self.promo = Promoter(client, cfg)
+        self.reactions = Reactor(cfg, session)
         self.controls = Controls(client, cfg, registry, self)
         self._seen_groups: "OrderedDict[str, None]" = OrderedDict()
         self.stats = {"caught": 0, "published": 0, "forwarded": 0, "errors": 0}
@@ -84,7 +86,7 @@ class ParsBot:
             caption=cut(text, self.cfg.caption_limit),
         )
         self._published(category, posted)
-        await self._promote(posted)
+        await self._boost(posted)
 
     async def _album(self, message: Message, category) -> None:
         group_id = message.media_group_id
@@ -119,13 +121,14 @@ class ParsBot:
         posted = await call(self.client.send_media_group, category.target, media)
         main_message = next((item for item in posted if (item.caption or "").strip()), posted[0])
         self._published(category, main_message)
-        await self._promote(main_message)
+        await self._boost(main_message)
 
     def _published(self, category, posted: Message) -> None:
         self.stats["published"] += 1
         self.last_publish = now()
         log.info("Опубликовано в %s (тема «%s», id %s).", category.target_name, category.name, posted.id)
 
-    async def _promote(self, message: Message) -> None:
+    async def _boost(self, message: Message) -> None:
         if await self.promo.push(message):
             self.stats["forwarded"] += 1
+        self.reactions.schedule(message)

@@ -45,6 +45,13 @@ def _ids(name: str) -> list:
     return [int(part) for part in _text(name).replace(";", ",").split(",") if part.strip().lstrip("-").isdigit()]
 
 
+def _flag(name: str, default: bool = True) -> bool:
+    raw = _text(name).casefold()
+    if not raw:
+        return default
+    return raw not in ("0", "off", "no", "false", "нет", "выкл", "выключено")
+
+
 @dataclass
 class Config:
     api_id: int
@@ -64,6 +71,10 @@ class Config:
     promo_button: str = "Просмотры"
     promo_views: int = 0
     promo_delay: int = 3
+    reactions_enabled: bool = True
+    reactions_interval: int = 3600
+    reactions_timeout: int = 30
+    reactions_email: str = ""
     album_wait: float = 2.0
     cache_size: int = 500
     history_limit: int = 200
@@ -107,6 +118,10 @@ class Config:
             promo_button=_text("PROMO_BUTTON", "Просмотры"),
             promo_views=int(_number("PROMO_VIEWS", 0)),
             promo_delay=int(_number("PROMO_DELAY", 3)),
+            reactions_enabled=_flag("REACTIONS", True),
+            reactions_interval=max(60, int(_number("REACTIONS_INTERVAL", 3600))),
+            reactions_timeout=int(_number("REACTIONS_TIMEOUT", 30)),
+            reactions_email=_text("REACTIONS_EMAIL"),
             album_wait=_number("ALBUM_WAIT", 2.0),
             cache_size=int(_number("CACHE_SIZE", 500)),
             history_limit=int(_number("HISTORY_LIMIT", 200)),
@@ -124,12 +139,18 @@ class Config:
             promo = f"{self.promo_bot}: " + " -> ".join(steps)
         else:
             promo = "выключено"
+        reactions = (
+            f"включены бесплатно на smmnakrutka.ru (не чаще раза в {self.reactions_interval // 60} мин)"
+            if self.reactions_enabled
+            else "выключены (REACTIONS=0)"
+        )
         group = self.management_chat or "найду сам среди групп с темами"
         panel = "ключ задан - управляй кнопками в своём боте" if self.panel_enabled else "нет BOT_TOKEN - команды в группе"
         return (
             f"Группа управления донорами: {group}\n"
             f"Панель кнопок: {panel}\n"
             f"Промо-бот: {promo}\n"
+            f"Реакции: {reactions}\n"
             f"Нейросеть: {self.ai_model} (глубина {self.ai_reasoning_effort}), "
             f"попыток: {self.ai_retries}, пауза: {self.ai_retry_delay} сек"
         )

@@ -40,7 +40,9 @@ HELP = (
     "5) «🗑 Убрать канал целиком» - удалить тему и всех её доноров (спросит подтверждение).\n"
     "6) «✏️ Переименовать склад» - сменить название группы, где живёт список.\n"
     "7) «🔄 Обновить список» - перечитать группу заново.\n"
-    "8) «⏸ Пауза» - посты ловим, но не публикуем. «▶ Пуск» - снова работаем.\n\n"
+    "8) «⏸ Пауза» - посты ловим, но не публикуем. «▶ Пуск» - снова работаем.\n"
+    "9) «🎭 Реакции» - включаются и выключаются бесплатно накручивать реакции "
+    "на свежие посты (сервис даёт один заказ в час, поэтому заказы стоят в очереди).\n\n"
     "Список хранится в группе с темами (тема = канал, ссылки в теме = доноры), "
     "поэтому после перезапуска всё восстанавливается само."
 )
@@ -164,6 +166,15 @@ class Panel:
             self.registry.paused = key == "pause"
             self.notice = "Пауза: посты ловлю, но не публикую." if self.registry.paused else "Работаю дальше."
             await self._show(query, "main", flash=self.notice)
+        elif key == "reactions":
+            reactor = self.bot.reactions
+            reactor.enabled = not reactor.enabled
+            self.notice = (
+                "Реакции включил: каждый новый пост ставлю в очередь на бесплатный заказ."
+                if reactor.enabled
+                else "Реакции выключил - заказы не отправляю, посты публикуются как раньше."
+            )
+            await self._show(query, "main", flash=self.notice[:TEXT_LIMIT])
         elif key == "update":
             await self._rebuild(query)
         else:
@@ -264,6 +275,7 @@ class Panel:
             f"Группа: «{registry.group_name}»",
             f"Каналов: {len(registry.categories)} · доноров: {registry.donor_count}",
             f"Состояние: {'⏸ пауза - не публикую' if registry.paused else '▶ работаю'}",
+            self.bot.reactions.describe(),
             (
                 f"Поймано {stats['caught']} · опубликовано {stats['published']} · "
                 f"в промо {stats['forwarded']} · сбоев {stats['errors']}"
@@ -274,12 +286,18 @@ class Panel:
             lines.append("Замечания:\n- " + "\n- ".join(problems[:5]))
 
         toggle = ("▶ Пуск", "start") if registry.paused else ("⏸ Пауза", "pause")
+        reactions_toggle = (
+            ("🎭 Реакции: выключить", "reactions")
+            if self.bot.reactions.enabled
+            else ("🎭 Реакции: включить", "reactions")
+        )
         return (
             cut(self._with_notice("🤖 АвтоПост\n" + "\n".join(lines)), TEXT_LIMIT),
             markup(
                 [("📂 Каналы и доноры", "topics"), ("➕ Новый канал", "channel")],
                 [("🔄 Обновить список", "update"), ("ℹ️ Статус", "status")],
                 [toggle, ("❓ Как это работает", "help")],
+                [reactions_toggle],
                 [("✏️ Переименовать склад", "group_rename")],
             ),
         )
@@ -341,6 +359,8 @@ class Panel:
                 f"{self.cfg.describe()}\n"
                 f"Группа: {self.registry.group_name or 'не найдена'}\n"
                 f"Последняя публикация: {self.bot.last_publish or 'ещё не было'}\n"
+                f"{self.bot.reactions.describe()}\n"
+                f"Последний заказ реакций: {self.bot.reactions.last_link or 'ещё не уходил'}\n"
                 f"Поймано: {stats['caught']} · опубликовано: {stats['published']} · "
                 f"в промо: {stats['forwarded']} · сбоев: {stats['errors']}"
             )

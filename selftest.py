@@ -341,8 +341,8 @@ class FakeSession:
         self.responses = list(responses)
         self.calls = []
 
-    def post(self, url, json=None, headers=None, timeout=None):
-        self.calls.append((url, json, headers))
+    def post(self, url, json=None, data=None, headers=None, timeout=None):
+        self.calls.append((url, json, data, headers))
         return self.responses.pop(0) if self.responses else FakeResponse(500, text="нет ответа")
 
 
@@ -369,6 +369,9 @@ def make_cfg(**kwargs):
         album_wait=0,
         cache_size=50,
         history_limit=50,
+        reactions_enabled=False,
+        reactions_interval=0,
+        reactions_timeout=5,
     )
     base.update(kwargs)
     return Config(**base)
@@ -409,11 +412,11 @@ def build_world(cfg=None):
     }
 
 
-async def make_bot(world, ai=None):
+async def make_bot(world, ai=None, session=None):
     cfg, client = world["cfg"], world["client"]
     registry = Registry(client, cfg)
     ai = ai or StubAI()
-    bot = ParsBot(client, cfg, ai, registry)
+    bot = ParsBot(client, cfg, ai, registry, session or FakeSession([]))
     await bot.setup()
     return bot, registry, ai
 
@@ -430,6 +433,7 @@ async def main():
     await check_panel()
     check_startup_wiring()
     await check_panel_login_flood()
+    await check_reactions()
 
     print(f"\nПроверок: {len(CHECKS)}, неудач: {len(FAILED)}")
     if FAILED:
@@ -554,7 +558,7 @@ async def check_flood_and_ai():
     ])
     cfg = make_cfg(minimax_api_key="key")
     world2 = build_world(cfg)
-    bot2 = ParsBot(world2["client"], cfg, AiRewriter(cfg, session), Registry(world2["client"], cfg))
+    bot2 = ParsBot(world2["client"], cfg, AiRewriter(cfg, session), Registry(world2["client"], cfg), session)
     await bot2.setup()
     await bot2.on_message(world2["client"], Message(world2["client"], 52, world2["donor_sport_1"], caption="про спорт", photo=Photo("k1")))
     check("нейросеть повторила до успеха", len(session.calls) == 3, str(len(session.calls)))
@@ -563,7 +567,7 @@ async def check_flood_and_ai():
     dead = FakeSession([FakeResponse(502, text="") for _ in range(5)])
     cfg3 = make_cfg(minimax_api_key="key")
     world3 = build_world(cfg3)
-    bot3 = ParsBot(world3["client"], cfg3, AiRewriter(cfg3, dead), Registry(world3["client"], cfg3))
+    bot3 = ParsBot(world3["client"], cfg3, AiRewriter(cfg3, dead), Registry(world3["client"], cfg3), dead)
     await bot3.setup()
     long_text = "слово " * 400
     await bot3.on_message(world3["client"], Message(world3["client"], 53, world3["donor_sport_1"], caption=long_text, photo=Photo("k2")))
@@ -579,7 +583,7 @@ async def check_flood_and_ai():
     broke = FakeSession([FakeResponse(402, text="insufficient balance (1008)") for _ in range(5)])
     cfg4 = make_cfg(minimax_api_key="key")
     world4 = build_world(cfg4)
-    bot4 = ParsBot(world4["client"], cfg4, AiRewriter(cfg4, broke), Registry(world4["client"], cfg4))
+    bot4 = ParsBot(world4["client"], cfg4, AiRewriter(cfg4, broke), Registry(world4["client"], cfg4), broke)
     await bot4.setup()
     await bot4.on_message(world4["client"], Message(world4["client"], 54, world4["donor_sport_1"], caption="исходный текст", photo=Photo("k3")))
     check(
@@ -678,7 +682,7 @@ async def check_promo_flow():
     cfg = make_cfg(promo_button="Просмотры", promo_views=4100, promo_delay=0)
     world = build_world(cfg)
     client = world["client"]
-    bot = ParsBot(client, cfg, StubAI(), Registry(client, cfg))
+    bot = ParsBot(client, cfg, StubAI(), Registry(client, cfg), FakeSession([]))
     await bot.setup()
 
     menu = Clickable(client, 1201, await client.get_chat("promo_bot"), text="Выбери раздел")
@@ -703,7 +707,7 @@ async def check_promo_flow():
     cfg3 = make_cfg(promo_button="Просмотры", promo_views=700, promo_delay=0)
     world3 = build_world(cfg3)
     client3 = world3["client"]
-    bot3 = ParsBot(client3, cfg3, StubAI(), Registry(client3, cfg3))
+    bot3 = ParsBot(client3, cfg3, StubAI(), Registry(client3, cfg3), FakeSession([]))
     await bot3.setup()
     menu3 = Clickable(client3, 1301, await client3.get_chat("promo_bot"), text="Выбери раздел")
     menu3.reply_markup = InlineKeyboard([[CallbackButton("👀 Просмотры", "views")], [Button("⚙️ Настройки")]])
@@ -715,7 +719,7 @@ async def check_promo_flow():
     cfg2 = make_cfg(promo_button="", promo_views=0, promo_delay=0)
     world2 = build_world(cfg2)
     client2 = world2["client"]
-    bot2 = ParsBot(client2, cfg2, StubAI(), Registry(client2, cfg2))
+    bot2 = ParsBot(client2, cfg2, StubAI(), Registry(client2, cfg2), FakeSession([]))
     await bot2.setup()
     await bot2.on_message(client2, Message(client2, 93, world2["donor_sport_1"], caption="текст", photo=Photo("m3")))
     check("без кнопки и числа - только пересылка", client2.sent == [] and len(client2.forwarded) == 1, str(client2.sent))
@@ -930,7 +934,7 @@ async def check_panel():
     boss = lonely.add_user(User(777, "Витя"))
     lonely_cfg = make_cfg(bot_token="900:AAstub")
     lonely_registry = Registry(lonely, lonely_cfg)
-    lonely_bot = ParsBot(lonely, lonely_cfg, StubAI(), lonely_registry)
+    lonely_bot = ParsBot(lonely, lonely_cfg, StubAI(), lonely_registry, FakeSession([]))
     try:
         await lonely_bot.setup()
     except RegistryError:
@@ -1010,6 +1014,157 @@ async def check_panel_login_flood():
         )
     finally:
         asyncio.sleep = real_sleep
+
+
+async def check_reactions():
+    print("\n[12] Бесплатные реакции на посты")
+    from reactions import MAX_PENDING, FORM_URL, PERMIT_URL, Reactor, post_link
+
+    client = FakeClient()
+    yumor = client.add_chat(Chat(-10030, title="Юмор канала", username="yumor_ch", chat_type=ChatType.CHANNEL))
+    secret = client.add_chat(Chat(-10031, title="Закрытый", chat_type=ChatType.CHANNEL))
+    published = Message(client, 77, yumor, caption="текст", photo=Photo("r1"))
+
+    def permit(key="kluch123"):
+        return FakeResponse(200, text='{"data": "%s"}' % key)
+
+    def reactor(responses, **kwargs):
+        cfg = make_cfg(reactions_enabled=True, **kwargs)
+        instance = Reactor(cfg, FakeSession(responses))
+        instance.wait = 0
+        instance.poll = 0
+        instance.permit_limit = 0.01
+        return instance
+
+    check("ссылка на пост публичного канала", post_link(published) == "https://t.me/yumor_ch/77?single", post_link(published))
+    check("у закрытого канала ссылки нет", post_link(Message(client, 78, secret)) == "")
+
+    session = FakeSession([permit(), FakeResponse(200, text="OK")])
+    reactor_ = Reactor(make_cfg(reactions_enabled=True), session)
+    reactor_.wait = 0
+    reactor_.poll = 0
+    reactor_.permit_limit = 0.01
+    reactor_.schedule(published)
+    await asyncio.sleep(0.05)
+    check("заказ уходит только через разрешение", reactor_.ordered == 1 and reactor_.failed == 0, reactor_.last_error)
+    check(
+        "сначала просьба о разрешении, потом форма",
+        [call[0] for call in session.calls] == [PERMIT_URL, FORM_URL],
+        str([call[0] for call in session.calls]),
+    )
+    token = session.calls[0][1]["sessionToken"]
+    check("сессия случайная, как на сайте", len(token) >= 16 and token.isalnum(), token)
+    data = session.calls[1][2]
+    check("форма уходит с ключом разрешения", data["permissionKey"] == "kluch123" and data["sessionToken"] == token, str(data["permissionKey"]))
+    check("в заказе есть ссылка поста", data["link"] == "https://t.me/yumor_ch/77?single", str(data["link"]))
+    check("заказаны именно реакции", data["quantity-text"] == "Реакции Телеграм" and data["service"] == "680", str(data["service"]))
+    check(
+        "набор полей как в браузере",
+        data["formservices[]"] and data["tildaspec-formid"] == "form510249937" and data["tildaspec-projectid"] == "4412478",
+        str(sorted(data)[:5]),
+    )
+    check("просьба выглядит браузерной", session.calls[1][3]["Referer"].startswith("https://smmnakrutka.ru"), str(session.calls[1][3].get("Referer")))
+
+    patient = reactor([permit(""), permit("kluch2"), FakeResponse(200, text="OK")])
+    patient.poll = 0
+    patient.permit_limit = 5
+    patient.schedule(published)
+    await asyncio.sleep(0.1)
+    check("пока разрешения нет - ждём и спрашиваем снова", patient.ordered == 1 and len(patient.session.calls) == 3, str(len(patient.session.calls)))
+
+    silent = reactor([permit(""), permit("")])
+    silent.permit_limit = 0
+    silent.schedule(published)
+    await asyncio.sleep(0.05)
+    check(
+        "без разрешения заказа не будет",
+        silent.failed == 1 and silent.ordered == 0 and "не дал разрешение" in silent.last_error,
+        silent.last_error,
+    )
+
+    broken = reactor([permit(), FakeResponse(502, text="Bad Gateway")])
+    broken.schedule(published)
+    await asyncio.sleep(0.05)
+    check("сбой сервиса - только журнал", broken.failed == 1 and "Bad Gateway" in broken.last_error, broken.last_error)
+
+    off_session = FakeSession([permit(), FakeResponse(200, text="OK")])
+    off = Reactor(make_cfg(reactions_enabled=False), off_session)
+    off.schedule(published)
+    await asyncio.sleep(0.05)
+    check("выключенные реакции не заказывают", off_session.calls == [] and off.ordered == 0, str(off_session.calls))
+
+    private = reactor([])
+    private.schedule(Message(client, 80, secret))
+    await asyncio.sleep(0.05)
+    check("пост без публичной ссылки пропущен", private.skipped == 1 and private.session.calls == [], str(private.session.calls))
+
+    queued = FakeSession([permit(), FakeResponse(200, text="OK")])
+    hour = Reactor(make_cfg(reactions_enabled=True, reactions_interval=3600), queued)
+    hour.wait = 0
+    hour.poll = 0
+    hour.permit_limit = 0.01
+    hour.schedule(published)
+    hour.schedule(Message(client, 79, yumor, caption="текст", photo=Photo("r2")))
+    await asyncio.sleep(0.05)
+    check("первый пост заказал сразу", len(queued.calls) == 2, str(len(queued.calls)))
+    check("второй ждёт своего часа", len(hour._tasks) == 1, str(len(hour._tasks)))
+    for task in list(hour._tasks):
+        task.cancel()
+    await asyncio.sleep(0.05)
+    check("отменённая очередь не успела заказать", len(queued.calls) == 2, str(len(queued.calls)))
+
+    pile = reactor([], reactions_interval=3600)
+    for index in range(MAX_PENDING + 3):
+        pile.schedule(Message(client, 100 + index, yumor, caption="текст", photo=Photo(f"p{index}")))
+    check(
+        "очередь не растёт бесконечно",
+        len(pile._tasks) == MAX_PENDING and pile.skipped == 3,
+        f"{len(pile._tasks)} задач, пропущено {pile.skipped}",
+    )
+    for task in list(pile._tasks):
+        task.cancel()
+    await asyncio.sleep(0.05)
+
+    live_cfg = make_cfg(reactions_enabled=True)
+    world = build_world(live_cfg)
+    live_session = FakeSession([permit(), FakeResponse(200, text="OK")])
+    bot, _, _ = await make_bot(world, session=live_session)
+    bot.reactions.wait = 0
+    bot.reactions.poll = 0
+    bot.reactions.permit_limit = 0.01
+    await bot.on_message(
+        world["client"], Message(world["client"], 61, world["donor_other"], caption="пост про мемы", photo=Photo("live1"))
+    )
+    await asyncio.sleep(0.1)
+    link = live_session.calls[1][2]["link"] if len(live_session.calls) > 1 else ""
+    check("после публикации заказ встаёт в очередь", link.startswith("https://t.me/yumor_ch/"), str(link))
+
+    panel_cfg = make_cfg(bot_token="900:AAstub", reactions_enabled=True)
+    panel_world = build_world(panel_cfg)
+    panel_bot, panel_registry, _ = await make_bot(panel_world)
+    pclient = panel_world["client"]
+    owner = pclient.add_user(User(777, "Витя"))
+    panel = Panel(pclient, panel_cfg, panel_registry, panel_bot)
+    panel.setup()
+    await panel.start(owner.id, "Витя")
+    await panel.on_message(pclient, Message(pclient, 9001, owner, text="/start"))
+
+    def press(data):
+        return Query(pclient, data, owner.id, Message(pclient, 9002, owner, text="меню"))
+
+    body = pclient.replies[-1][1]
+    rows = pclient.replies[-1][2].inline_keyboard
+    cells = [button.callback_data for row in rows for button in row]
+    check("меню рассказывает про реакции", "Реакции: включены" in body, body[:120])
+    check("в меню есть кнопка реакций", "reactions" in cells, str(cells))
+
+    await panel.on_button(pclient, press("reactions"))
+    body = pclient.edits[-1][2]
+    check("кнопка выключает реакции", panel_bot.reactions.enabled is False and "Реакции: выключены" in body, body[:120])
+    await panel.on_button(pclient, press("reactions"))
+    check("кнопка снова включает реакции", panel_bot.reactions.enabled is True and "Реакции: включены" in pclient.edits[-1][2], pclient.edits[-1][2][:120])
+    await panel.on_button(pclient, press("status"))
+    check("статус показывает очередь реакций", "Реакции:" in pclient.edits[-1][2] and "smmnakrutka" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
 
 
 if __name__ == "__main__":

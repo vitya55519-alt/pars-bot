@@ -47,7 +47,7 @@ async def amain(cfg: Config) -> None:
         workers=4,
     )
     registry = Registry(client, cfg)
-    bot = ParsBot(client, cfg, AiRewriter(cfg, session), registry)
+    bot = ParsBot(client, cfg, AiRewriter(cfg, session), registry, session)
 
     panel_client = None
     panel = None
