@@ -166,7 +166,8 @@ class Reactor:
         done = f", отправлено {self.ordered}" if self.ordered else ""
         queue = f", в очереди {len(self._tasks)}" if self._tasks else ""
         fails = f", сбоев {self.failed}" if self.failed else ""
-        return f"Реакции: {state}{done}{queue}{fails}"
+        skipped = f", пропущено {self.skipped}" if self.skipped else ""
+        return f"Реакции: {state}{done}{queue}{fails}{skipped}"
 
 
 def payload(link: str, cfg, token: str, key: str) -> dict:

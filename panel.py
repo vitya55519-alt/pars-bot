@@ -14,6 +14,7 @@ from pyrogram.handlers import CallbackQueryHandler, MessageHandler
 from pyrogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 
 from ai import cut
+from config import VIEWS_LIMIT
 from registry import Donor, RegistryError
 from utils import call
 
@@ -42,7 +43,9 @@ HELP = (
     "7) «🔄 Обновить список» - перечитать группу заново.\n"
     "8) «⏸ Пауза» - посты ловим, но не публикуем. «▶ Пуск» - снова работаем.\n"
     "9) «🎭 Реакции» - включаются и выключаются бесплатно накручивать реакции "
-    "на свежие посты (сервис даёт один заказ в час, поэтому заказы стоят в очереди).\n\n"
+    "на свежие посты (сервис даёт один заказ в час, поэтому заказы стоят в очереди).\n"
+    "10) «👁 Просмотров» - напиши число от 1 до 10000: столько просмотров бот отправит "
+    "промо-боту после каждой новой публикации. Сохраняется в склад, перезапуск не сбрасывает.\n\n"
     "Список хранится в группе с темами (тема = канал, ссылки в теме = доноры), "
     "поэтому после перезапуска всё восстанавливается само."
 )
@@ -159,6 +162,12 @@ class Panel:
                 "group_rename": ("group_rename", 0),
             }[key]
             await self._show(query, key, arg)
+        elif key == "views":
+            if arg:
+                await self._apply_views(query, str(arg))
+            else:
+                self.awaiting = ("views", 0)
+                await self._show(query, "views")
         elif key == "del":
             message_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
             await self._remove(query, arg, message_id)
@@ -191,6 +200,20 @@ class Panel:
         self.notice = f"✅ Убрал канал «{category.name}» и его тему - его доноры больше не ловятся."
         await self._show(query, "topics", flash=self.notice)
 
+    async def _apply_views(self, query, raw: str) -> None:
+        try:
+            number = await self.registry.save_views(raw)
+        except ValueError as exc:
+            self.notice = f"⚠ {exc}"
+            await self._show(query, "views")
+            return
+        except RegistryError as exc:
+            self.notice = f"⚠ {exc}"
+            await self._show(query, "main")
+            return
+        self.notice = f"✅ Просмотры: {number}. Такое число бот отправит промо-боту после каждой публикации."
+        await self._show(query, "main", flash=str(number)[:TEXT_LIMIT])
+
     async def _rebuild(self, query) -> None:
         await call(query.answer, "Перечитываю группу...")
         await self._edit(query, "⏳ Перечитываю темы группы и ссылки в них...")
@@ -218,10 +241,17 @@ class Panel:
                 name = await registry.rename_storage_group(text)
                 self.notice = f"✅ Склад теперь называется «{name}». Доноры и темы не изменились."
                 screen = ("main", 0)
+            elif kind == "views":
+                number = await registry.save_views(text)
+                self.notice = f"✅ Просмотры: {number}. Такое число бот отправит промо-боту после каждой публикации."
+                screen = ("main", 0)
             else:
                 category = await registry.rename_category(topic_id, text[:NAME_LIMIT])
                 self.notice = self._category_notice(category, f"Переименовал в «{category.name}»")
                 screen = ("cat", topic_id)
+        except ValueError as exc:
+            self.notice = f"⚠ {exc}"
+            screen = ("views", 0)
         except RegistryError as exc:
             self.notice = f"⚠ {exc}"
             screen = ("main", 0) if kind in ("channel", "group", "group_rename") else ("cat", topic_id)
@@ -260,6 +290,8 @@ class Panel:
             return self._drop_view(topic_id)
         if kind == "group_rename":
             return self._rename_group_view()
+        if kind == "views":
+            return self._views_view()
         return self._main_view()
 
     def _main_view(self) -> Tuple[str, InlineKeyboardMarkup]:
@@ -291,13 +323,14 @@ class Panel:
             if self.bot.reactions.enabled
             else ("🎭 Реакции: включить", "reactions")
         )
+        views = f"{self.cfg.promo_views}" if self.cfg.promo_views else "не задано"
         return (
             cut(self._with_notice("🤖 АвтоПост\n" + "\n".join(lines)), TEXT_LIMIT),
             markup(
                 [("📂 Каналы и доноры", "topics"), ("➕ Новый канал", "channel")],
                 [("🔄 Обновить список", "update"), ("ℹ️ Статус", "status")],
                 [toggle, ("❓ Как это работает", "help")],
-                [reactions_toggle],
+                [reactions_toggle, (f"👁 Просмотров: {views}", "views")],
                 [("✏️ Переименовать склад", "group_rename")],
             ),
         )
@@ -354,10 +387,12 @@ class Panel:
 
     def _status_view(self) -> Tuple[str, InlineKeyboardMarkup]:
         stats = self.bot.stats
+        stored = self.registry.views
         text = (
             self._with_notice(
                 f"{self.cfg.describe()}\n"
                 f"Группа: {self.registry.group_name or 'не найдена'}\n"
+                f"Просмотры в складе: {stored if stored else 'не записаны - беру из переменной PROMO_VIEWS'}\n"
                 f"Последняя публикация: {self.bot.last_publish or 'ещё не было'}\n"
                 f"{self.bot.reactions.describe()}\n"
                 f"Последний заказ реакций: {self.bot.reactions.last_link or 'ещё не уходил'}\n"
@@ -367,7 +402,7 @@ class Panel:
         )
         return (
             cut(text, TEXT_LIMIT),
-            markup([("🔄 Обновить список", "update")], [("⬅️ Меню", "main")]),
+            markup([("👁 Просмотров", "views")], [("🔄 Обновить список", "update")], [("⬅️ Меню", "main")]),
         )
 
     def _add_view(self, topic_id: int) -> Tuple[str, InlineKeyboardMarkup]:
@@ -439,6 +474,22 @@ class Panel:
                 TEXT_LIMIT,
             ),
             markup([("⬅️ Отмена", "main")]),
+        )
+
+    def _views_view(self) -> Tuple[str, InlineKeyboardMarkup]:
+        current = self.cfg.promo_views
+        lines = [
+            f"Сейчас: {current if current else 'не задано'} просмотров на каждый пост.",
+            "",
+            f"Напиши одно число от 1 до {VIEWS_LIMIT} - столько просмотров бот будет отправлять промо-боту "
+            "сразу после публикации поста. Или выбери готовое кнопкой.",
+            "",
+            "Число сохраняется в склад, поэтому остаётся таким же после перезапуска.",
+        ]
+        presets = [(f"{count}", f"views|{count}") for count in (500, 1000, 2000, 5000)]
+        return (
+            cut(self._with_notice("\n".join(lines)), TEXT_LIMIT),
+            markup(presets[:2], presets[2:], [("⬅️ Отмена", "main")]),
         )
 
     def _name(self, topic_id: int) -> str:

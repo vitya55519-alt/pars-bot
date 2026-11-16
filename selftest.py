@@ -434,6 +434,7 @@ async def main():
     check_startup_wiring()
     await check_panel_login_flood()
     await check_reactions()
+    await check_views()
 
     print(f"\nПроверок: {len(CHECKS)}, неудач: {len(FAILED)}")
     if FAILED:
@@ -1165,6 +1166,100 @@ async def check_reactions():
     check("кнопка снова включает реакции", panel_bot.reactions.enabled is True and "Реакции: включены" in pclient.edits[-1][2], pclient.edits[-1][2][:120])
     await panel.on_button(pclient, press("status"))
     check("статус показывает очередь реакций", "Реакции:" in pclient.edits[-1][2] and "smmnakrutka" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
+
+
+async def check_views():
+    print("\n[13] 👁 Число просмотров из кнопки панели")
+    from config import VIEWS_LIMIT, parse_views
+
+    def rejects(raw):
+        try:
+            parse_views(raw)
+        except ValueError as exc:
+            return str(exc)
+        return ""
+
+    check("число берётся из строки", parse_views("1000") == 1000, str(parse_views("1000")))
+    check("пробелы и точки не мешают", parse_views(" 1 500 ") == 1500 and parse_views("2.000") == 2000, str(parse_views(" 1 500 ")))
+    check("потолок сервиса разрешён", parse_views(str(VIEWS_LIMIT)) == VIEWS_LIMIT, str(VIEWS_LIMIT))
+    check("ноль отклонён", rejects("0").startswith("Просмотров должно быть"), rejects("0"))
+    check("больше потолка отклонено", rejects(str(VIEWS_LIMIT + 1)) != "", rejects(str(VIEWS_LIMIT + 1)))
+    check("не число отклонено", rejects("много").startswith("Напиши одно число"), rejects("много"))
+
+    cfg = make_cfg(promo_views=1000)
+    world = build_world(cfg)
+    client, group = world["client"], world["group"]
+    registry = Registry(client, cfg)
+    await registry.rebuild()
+    check("в складе числа нет - остаётся переменная", registry.views == 0 and cfg.promo_views == 1000, str(registry.views))
+
+    number = await registry.save_views("3000")
+    check("число применено сразу", number == 3000 and cfg.promo_views == 3000, str(cfg.promo_views))
+    check("записано в общую тему склада", client.topic_posts[-1] == (group.id, "Просмотры: 3000", 1), str(client.topic_posts[-1]))
+    check("служебная строка не стала донором", registry.donor_count == 3, str(registry.donor_count))
+
+    await registry.rebuild()
+    check("перезапуск берёт число из склада", registry.views == 3000 and cfg.promo_views == 3000, str(registry.views))
+    await registry.save_views("2000")
+    check("второй раз то же сообщение правится", client.edits[-1][2] == "Просмотры: 2000", str(client.edits[-1][2]))
+    check("служебных сообщений не плодится", sum(1 for _, text, _ in client.topic_posts if "Просмотры" in text) == 1,
+          str([post for post in client.topic_posts if "Просмотры" in post[1]]))
+    check("плохое число не меняет настройку", (await _raises(registry.save_views, "0")) and cfg.promo_views == 2000, str(cfg.promo_views))
+
+    live_cfg = make_cfg(promo_views=1000, promo_delay=0, reactions_enabled=False)
+    live = build_world(live_cfg)
+    bot, live_registry, _ = await make_bot(live)
+    await live_registry.save_views("4500")
+    await bot.on_message(live["client"], Message(live["client"], 61, live["donor_other"], caption="пост", photo=Photo("v1")))
+    check("промо-бот получает число из панели", ("promo_bot", "4500") in live["client"].sent, str(live["client"].sent[-1]))
+
+    panel_cfg = make_cfg(bot_token="900:AAstub", promo_views=1000, promo_delay=0, reactions_enabled=False)
+    panel_world = build_world(panel_cfg)
+    panel_bot, panel_registry, _ = await make_bot(panel_world)
+    pclient = panel_world["client"]
+    owner = pclient.add_user(User(777, "Витя"))
+    panel = Panel(pclient, panel_cfg, panel_registry, panel_bot)
+    panel.setup()
+    await panel.start(owner.id, "Витя")
+
+    def press(data):
+        return Query(pclient, data, owner.id, Message(pclient, 9002, owner, text="меню"))
+
+    await panel.on_message(pclient, Message(pclient, 9001, owner, text="/start"))
+    cells = [button.callback_data for row in pclient.replies[-1][2].inline_keyboard for button in row]
+    check("в меню есть кнопка просмотров", "views" in cells, str(cells))
+    check("меню показывает текущее число", "👁 Просмотров: 1000" in str(pclient.replies[-1][2]), str(pclient.replies[-1][2])[:120])
+
+    await panel.on_button(pclient, press("views"))
+    body = pclient.edits[-1][2]
+    check("экран объясняет диапазон", f"от 1 до {VIEWS_LIMIT}" in body, body[:160])
+    check("экран показывает текущее число", "Сейчас: 1000 просмотров" in body, body[:80])
+
+    await panel.on_message(pclient, Message(pclient, 9003, owner, text="3500"))
+    check("введённое число применено", panel_cfg.promo_views == 3500 and panel_registry.views == 3500, str(panel_cfg.promo_views))
+    check("панель это подтверждает", "Просмотры: 3500" in pclient.replies[-1][1], str(pclient.replies[-1][1][:80]))
+
+    await panel.on_button(pclient, press("views"))
+    await panel.on_message(pclient, Message(pclient, 9004, owner, text="много"))
+    check("не число - подсказка, старое значение целое", "Напиши одно число" in pclient.replies[-1][1] and panel_cfg.promo_views == 3500,
+          str(pclient.replies[-1][1][:80]))
+
+    await panel.on_button(pclient, press("views|2000"))
+    check("готовая кнопка ставит число", panel_cfg.promo_views == 2000 and panel_registry.views == 2000, str(panel_cfg.promo_views))
+    await panel.on_button(pclient, press(f"views|{VIEWS_LIMIT + 1}"))
+    check("кнопка выше потолка отклонена", panel_cfg.promo_views == 2000 and "Просмотров должно быть" in pclient.edits[-1][2],
+          pclient.edits[-1][2][:80])
+
+    await panel.on_button(pclient, press("status"))
+    check("статус показывает число склада", "Просмотры в складе: 2000" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
+
+
+async def _raises(action, *args):
+    try:
+        await action(*args)
+    except ValueError:
+        return True
+    return False
 
 
 if __name__ == "__main__":

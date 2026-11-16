@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set, Union
 
 from pyrogram.enums import ChatMemberStatus, ChatType
 
+from config import VIEWS_LIMIT, parse_views
 from utils import call, chat_name, norm_title
 
 log = logging.getLogger("registry")
@@ -22,6 +23,8 @@ GENERAL_TOPIC_ID = 1
 TOPIC_NAME_LIMIT = 50
 GROUP_TITLE_LIMIT = 42
 MANAGER_STATUSES = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
+VIEWS_RE = re.compile(r"просмотры\s*[:=]\s*(\d{1,5})", re.I)
+VIEWS_TEXT = "Просмотры: {}"
 PUBLIC_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{4,31})", re.I)
 PRIVATE_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/c/(\d{4,20})", re.I)
 INVITE_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:\+|joinchat/)\S+", re.I)
@@ -93,6 +96,8 @@ class Registry:
         self.paused = False
         self.ready = False
         self.last_error = ""
+        self.views = 0
+        self.views_message: Optional[int] = None
         self.unreadable: List[str] = []
         self.suppressed: Set[int] = set()
         self._titles: Dict[str, ChatRef] = {}
@@ -108,6 +113,7 @@ class Registry:
             self.target_ids.clear()
             self.unreadable.clear()
             self.suppressed.clear()
+            await self._read_views()
 
             categories: Dict[int, Category] = {}
             async for topic in self.client.get_forum_topics(self.group_id):
@@ -209,6 +215,32 @@ class Registry:
             category.donors[donor.chat_id] = donor
             added.append(donor)
         return added
+
+    async def _read_views(self) -> None:
+        """Служебное сообщение в общей теме склада хранит число просмотров: переменная Railway его не переживает."""
+        self.views = 0
+        self.views_message = None
+        found_id = 0
+        found_value = 0
+        try:
+            async for message in self.client.get_discussion_replies(
+                self.group_id, GENERAL_TOPIC_ID, limit=self.cfg.history_limit
+            ):
+                if getattr(message, "service", False):
+                    continue
+                match = VIEWS_RE.search(message.text or "")
+                if match and message.id > found_id:
+                    found_id, found_value = message.id, int(match.group(1))
+        except Exception as exc:  # noqa: BLE001 - без служебного сообщения живём как раньше, по PROMO_VIEWS
+            log.warning("Служебное сообщение склада не прочитано (%s) - беру просмотры из переменной.", type(exc).__name__)
+            return
+
+        if 1 <= found_value <= VIEWS_LIMIT:
+            self.views = found_value
+            self.views_message = found_id
+            if self.cfg.promo_views != found_value:
+                log.info("Просмотры из склада: %s (в переменной было %s).", found_value, self.cfg.promo_views)
+                self.cfg.promo_views = found_value
 
     async def _open(self, ref: ChatRef, message_id: int) -> Optional[Donor]:
         try:
@@ -369,6 +401,30 @@ class Registry:
             self.group_name = clean
             log.info("Группа-хранилище теперь называется «%s».", clean)
         return self.group_name
+
+    async def save_views(self, raw: str) -> int:
+        """Записывает число просмотров в служебное сообщение склада - оно переживёт перезапуск Railway."""
+        number = parse_views(raw)
+        self._need_group()
+        text = VIEWS_TEXT.format(number)
+        async with self.lock:
+            self.views = number
+            self.cfg.promo_views = number
+            try:
+                if self.views_message:
+                    await call(self.client.edit_message_text, self.group_id, self.views_message, text)
+                else:
+                    posted = await call(
+                        self.client.send_message, self.group_id, text, message_thread_id=GENERAL_TOPIC_ID
+                    )
+                    self.views_message = int(getattr(posted, "id", 0) or 0)
+            except Exception as exc:  # noqa: BLE001 - общая тема склада могла быть скрыта
+                raise RegistryError(
+                    f"Применил {number}, но в склад записать не вышло ({type(exc).__name__}) - "
+                    "после перезапуска возьмётся число из переменной PROMO_VIEWS."
+                ) from exc
+            log.info("Просмотры для промо-бота: %s (записано в склад).", number)
+        return number
 
     async def add_donor(self, topic_id: int, text: str) -> List[Donor]:
         """Пишем ссылку в тему - и она сразу становится донором."""

@@ -1,10 +1,14 @@
 import os
+import re
 from dataclasses import dataclass, field
 from typing import List, Union
 
 MINIMAX_URL = "https://api.minimax.io/v1/chat/completions"
 DEFAULT_MODEL = "MiniMax-M3"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+# потолок сервиса накрутки: больше десяти тысяч просмотров за заказ он не даёт
+VIEWS_LIMIT = 10000
 
 DEFAULT_PROMPT = (
     "Ты — редактор Telegram-канала. Перепиши присланный рекламный или бизнес-пост своими словами. "
@@ -50,6 +54,17 @@ def _flag(name: str, default: bool = True) -> bool:
     if not raw:
         return default
     return raw not in ("0", "off", "no", "false", "нет", "выкл", "выключено")
+
+
+def parse_views(raw: str) -> int:
+    """Число просмотров из строки пользователя: пробелы и точки не мешают, ноль и потолок - нет."""
+    digits = re.sub(r"\D", "", str(raw or ""))
+    if not digits:
+        raise ValueError("Напиши одно число - сколько просмотров добавлять, например 1000.")
+    value = int(digits)
+    if not 1 <= value <= VIEWS_LIMIT:
+        raise ValueError(f"Просмотров должно быть от 1 до {VIEWS_LIMIT} - больше не даёт сервис.")
+    return value
 
 
 @dataclass
