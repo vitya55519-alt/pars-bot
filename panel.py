@@ -44,7 +44,9 @@ HELP = (
     "9) «🎭 Реакции» - включаются и выключаются бесплатно накручивать реакции "
     "на свежие посты (сервис даёт один заказ в час, поэтому заказы стоят в очереди).\n"
     "10) «👁 Просмотров» - напиши число от 1 до 10000: столько просмотров бот отправит "
-    "промо-боту после каждой новой публикации. Сохраняется в склад, перезапуск не сбрасывает.\n\n"
+    "промо-боту после каждой новой публикации. Сохраняется в склад, перезапуск не сбрасывает.\n"
+    "11) «🩺 Проверка» - бот смотрит последние сообщения у доноров, пускает ли его в канал "
+    "и сколько постов не дошло. «⤵️ Догнать пропущенное» публикует их тем же маршрутом.\n\n"
     "Список хранится в группе с темами (тема = канал, ссылки в теме = доноры), "
     "поэтому после перезапуска всё восстанавливается само."
 )
@@ -171,6 +173,10 @@ class Panel:
             await self._show(query, "main", flash=self.notice[:TEXT_LIMIT])
         elif key == "update":
             await self._rebuild(query)
+        elif key == "check":
+            await self._diagnose(query)
+        elif key == "catchup":
+            await self._catch_up(query)
         else:
             await call(query.answer, "Такой кнопки нет - нажми «Меню».")
 
@@ -205,6 +211,26 @@ class Panel:
         await self.registry.rebuild()
         problems = self.registry.problems()
         self.notice = "Список обновлён." + ("\n⚠ " + "; ".join(problems[:5]) if problems else "")
+        await self._show(query, "main", flash="Готово")
+
+    async def _diagnose(self, query) -> None:
+        """Отвечает на «почему не публикует» цифрами: что у доноров и пускает ли канал."""
+        await call(query.answer, "Проверяю доноров и каналы...")
+        await self._edit(query, "⏳ Смотрю последние сообщения доноров и права в каналах...")
+        report = await self.bot.diagnose()
+        await self._edit(query, cut(f"🩺 Проверка\n{report}", TEXT_LIMIT), self._check_buttons())
+
+    def _check_buttons(self) -> InlineKeyboardMarkup:
+        return markup(
+            [("⤵️ Догнать пропущенное", "catchup"), ("🩺 Ещё раз", "check")],
+            [("🔄 Обновить список", "update"), ("⬅️ Меню", "main")],
+        )
+
+    async def _catch_up(self, query) -> None:
+        await call(query.answer, "Догоняю пропущенные посты...")
+        await self._edit(query, "⏳ Публикую то, что не дошло само...")
+        result = await self.bot.catch_up()
+        self.notice = result
         await self._show(query, "main", flash="Готово")
 
     async def _apply_text(self, message, kind: str, topic_id: int, text: str) -> None:
@@ -316,7 +342,7 @@ class Panel:
                 [("🔄 Обновить список", "update"), ("ℹ️ Статус", "status")],
                 [toggle, ("❓ Как это работает", "help")],
                 [reactions_toggle, (f"👁 Просмотров: {views}", "views")],
-                [("✏️ Переименовать склад", "group_rename")],
+                [("🩺 Проверка", "check"), ("✏️ Переименовать склад", "group_rename")],
             ),
         )
 
@@ -387,7 +413,11 @@ class Panel:
         )
         return (
             cut(text, TEXT_LIMIT),
-            markup([("👁 Просмотров", "views")], [("🔄 Обновить список", "update")], [("⬅️ Меню", "main")]),
+            markup(
+                [("👁 Просмотров", "views")],
+                [("🩺 Проверка", "check"), ("🔄 Обновить список", "update")],
+                [("⬅️ Меню", "main")],
+            ),
         )
 
     def _add_view(self, topic_id: int) -> Tuple[str, InlineKeyboardMarkup]:

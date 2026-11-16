@@ -5,6 +5,7 @@ Telegram и нейросеть не трогаем: подменяем клие�
 """
 
 import asyncio
+import datetime
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -35,8 +36,9 @@ def check(name, condition, detail=""):
 
 
 class Photo:
-    def __init__(self, file_id):
+    def __init__(self, file_id, file_unique_id=None):
         self.file_id = file_id
+        self.file_unique_id = file_unique_id or file_id
 
 
 class Chat:
@@ -90,7 +92,7 @@ class Message(_PyrogramMessage):
     """Настоящий класс Message, но без тяжёлого __init__: тогда фильтры куриграма видят тип."""
 
     def __init__(self, client, message_id, chat, text=None, caption=None, photo=None,
-                 group=None, thread=None, service=False, reply_to=None, author=None):
+                 group=None, thread=None, service=False, reply_to=None, author=None, date=None):
         self.id = message_id
         self.chat = chat
         self.text = text
@@ -103,6 +105,7 @@ class Message(_PyrogramMessage):
         self.from_user = author or User(111)
         self.reply_markup = None
         self.outgoing = False
+        self.date = date if date is not None else datetime.datetime.now(datetime.timezone.utc)
         self.client = client
 
     async def reply(self, text, *args, **kwargs):
@@ -147,6 +150,8 @@ class FakeClient:
         self.topics = {}
         self.group_messages = []
         self.promo_messages = []
+        self.histories = {}
+        self.members = {}
         self.donor_messages = {}
         self.posted = []
         self.albums = []
@@ -211,6 +216,10 @@ class FakeClient:
                 yield message
 
     async def get_chat_member(self, chat_id, user_id):
+        forced = self.members.get(chat_id)
+        if forced:
+            status, can_send = forced
+            return type("Member", (), {"status": status, "can_send_messages": can_send})()
         if user_id not in self.admins:
             status = ChatMemberStatus.MEMBER
         elif self.owned is None or chat_id in self.owned:
@@ -219,15 +228,36 @@ class FakeClient:
             status = ChatMemberStatus.ADMINISTRATOR
         return type("Member", (), {"status": status})()
 
+    async def get_chat_history(self, chat, limit=None):
+        chat_id = getattr(chat, "id", chat)
+        if chat_id in self.histories:
+            newest_first = list(reversed(self.histories[chat_id]))
+        else:
+            newest_first = list(reversed(self.promo_messages))
+        for message in newest_first[: (limit or len(newest_first))]:
+            yield message
+
     async def send_photo(self, chat, file_id, caption=None, **kwargs):
         if self.flood_left > 0:
             self.flood_left -= 1
             raise FloodWait(1)
         if not isinstance(file_id, str):
             raise AssertionError("send_photo получил объект фото - значит файл скачивается с Telegram")
-        posted = Message(self, 500 + len(self.posted), await self.get_chat(chat), caption=caption, photo=Photo(file_id))
+        posted = Message(
+            self, 500 + len(self.posted), await self.get_chat(chat), caption=caption, photo=Photo(file_id, self.unique_of(file_id))
+        )
         self.posted.append(posted)
+        if posted.chat.id in self.histories:
+            self.histories[posted.chat.id].append(posted)
         return posted
+
+    def unique_of(self, file_id: str) -> str:
+        """Telegram для одного и того же файла отдаёт один file_unique_id - воспроизводим это."""
+        for messages in self.histories.values():
+            for message in messages:
+                if message.photo and message.photo.file_id == file_id:
+                    return message.photo.file_unique_id
+        return file_id
 
     async def send_media_group(self, chat, media):
         if not all(isinstance(item, InputMediaPhoto) and isinstance(item.media, str) for item in media):
@@ -310,11 +340,6 @@ class FakeClient:
 
     async def get_messages(self, chat, limit=None):
         return []
-
-    async def get_chat_history(self, chat, limit=None):
-        newest_first = list(reversed(self.promo_messages))
-        for message in newest_first[: (limit or len(newest_first))]:
-            yield message
 
 
 class FakeResponse:
@@ -439,6 +464,7 @@ async def main():
     await check_store()
     await check_cabinet()
     await check_dead_topic()
+    await check_diagnose()
 
     print(f"\nПроверок: {len(CHECKS)}, неудач: {len(FAILED)}")
     if FAILED:
@@ -516,6 +542,81 @@ async def check_dead_topic():
         blocked = True
     check("донора в тему без канала не добавить", blocked)
     check("кнопка ничего не записала в склад", 8 not in [m.id for m in client.group_messages])
+
+
+def ago(minutes: int):
+    return datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=minutes)
+
+
+async def check_diagnose():
+    print("\n[18] 🩺 Проверка доноров и догон пропущенных постов")
+    world = build_world()
+    client, sport, donor = world["client"], world["sport"], world["donor_sport_1"]
+    bot, registry, _ = await make_bot(world)
+
+    client.histories[sport.id] = [
+        Message(client, 900, sport, caption="то уже было", photo=Photo("f_old", "u_old"), date=ago(120))
+    ]
+    client.histories[donor.id] = [
+        Message(client, 901, donor, caption="уже в канале", photo=Photo("f_dup", "u_old"), date=ago(120)),
+        Message(client, 902, donor, caption="пропущенный пост", photo=Photo("f_new", "u_new"), date=ago(20)),
+        Message(client, 903, donor, text="просто текст без картинки", date=ago(5)),
+    ]
+    client.histories[world["donor_sport_2"].id] = [Message(client, 904, world["donor_sport_2"], caption="без фото", date=ago(10))]
+
+    report = await bot.diagnose()
+    check("проверка называет канал темы", "-> Спорт" in report, report)
+    check("проверка считает посты донора", "постов с фото и текстом 2, не дошло 1" in report, report)
+    check("проверка меряет свежесть поста", "последний пост 20 мин назад" in report, report)
+    check("проверка меряет свежесть без постов", "последнее сообщение 10 мин назад" in report, report)
+    check("проверка отвечает про права", "пишем свободно" in report, report)
+    check("проверка видит пустого донора", "постов с фото и текстом 0" in report, report)
+    check("счётчики постов не меняются", (bot.stats["caught"], bot.stats["published"]) == (0, 0), str(bot.stats))
+
+    answer = await bot.catch_up()
+    check("догнал ровно пропущенный", "Догнал 1" in answer and len(client.posted) == 1, f"{answer} / {len(client.posted)}")
+    check("догнанный пост ушёл в канал темы", client.posted[0].chat.id == sport.id)
+    check("догон публикует по file_id", client.posted[0].photo.file_id == "f_new", client.posted[0].photo.file_id)
+    check("догнанный уходит в промо", len(client.forwarded) == 1, str(client.forwarded))
+    check("второй раз догонять нечего", "Пропущенного нет" in await bot.catch_up())
+    check("сбой не появился", bot.stats["errors"] == 0, str(bot.stats))
+
+    client.members[sport.id] = (ChatMemberStatus.MEMBER, True)
+    check("не админ - так и пишет", "не админ" in await bot.diagnose())
+    client.members[sport.id] = (ChatMemberStatus.ADMINISTRATOR, False)
+    check("запрет писать виден", "писать запрещено" in await bot.diagnose())
+    client.members[sport.id] = (ChatMemberStatus.BANNED, True)
+    check("выгнанного аккаунта видно", "не подписан" in await bot.diagnose())
+    del client.members[sport.id]
+
+    broken = build_world()
+    broken["client"].topics[broken["group"].id].append(Topic(23, "Банк"))
+    broken["client"].group_messages.append(Message(broken["client"], 6, broken["group"], text="@donor_sport_1", thread=23))
+    bot_broken, _, _ = await make_bot(broken)
+    check("тема без канала названа и в проверке", "ловить нечего" in await bot_broken.diagnose())
+
+    cfg = make_cfg(bot_token="900:AAstub")
+    desk = build_world(cfg)
+    panel_client, panel_group = desk["client"], desk["group"]
+    owner = panel_client.add_user(User(777, "Витя"))
+    panel_bot, panel_registry, _ = await make_bot(desk)
+    panel = Panel(panel_client, cfg, panel_registry, panel_bot)
+    panel.setup()
+    await panel.start(owner.id, "Фогель")
+    panel_client.histories[desk["sport"].id] = []
+    panel_client.histories[desk["donor_sport_1"].id] = [
+        Message(panel_client, 950, desk["donor_sport_1"], caption="пост", photo=Photo("pf", "pu"), date=ago(3))
+    ]
+
+    await panel.on_button(panel_client, Query(panel_client, "check", owner.id, Message(panel_client, 5001, owner, text="x")))
+    cells = [button.callback_data for row in panel_client.edits[-1][3].inline_keyboard for button in row]
+    check("кнопка «Проверка» отвечает текстом", "🩺 Проверка" in panel_client.edits[-1][2], panel_client.edits[-1][2][:80])
+    check("из проверки есть кнопка догона", "catchup" in cells, str(cells))
+    await panel.on_button(panel_client, Query(panel_client, "catchup", owner.id, Message(panel_client, 5002, owner, text="x")))
+    check("догон из панели публикует", len(panel_client.posted) == 1, str(panel_client.posted))
+    check("панель отчиталась о догоне", "Догнал 1" in panel_client.edits[-1][2], panel_client.edits[-1][2][:120])
+    main_cells = [button.callback_data for row in panel_client.edits[-1][3].inline_keyboard for button in row]
+    check("в меню появилась проверка", "check" in main_cells, str(main_cells))
 
 
 async def check_routing():
