@@ -338,8 +338,25 @@ class FakeClient:
         self.commands += list(commands)
         return True
 
-    async def get_messages(self, chat, limit=None):
-        return []
+    async def get_messages(self, chat, message_id=None):
+        if message_id is None:
+            return []
+        target = await self.get_chat(chat)
+        for stored in self.histories.get(target.id, []) + self.donor_messages.get(target.id, []):
+            if stored.id == message_id:
+                return stored
+        return None
+
+
+class Counter:
+    """Как pyrogram.ReactionCount: список «эмодзи + сколько человек» и общий счётчик."""
+
+    def __init__(self, *pairs):
+        self.results = [
+            type("Item", (), {"reaction": type("Emoji", (), {"emoji": emoji})(), "total_count": count})()
+            for emoji, count in pairs
+        ]
+        self.total_count = sum(count for _, count in pairs)
 
 
 class FakeResponse:
@@ -459,6 +476,7 @@ async def main():
     check_startup_wiring()
     await check_panel_login_flood()
     await check_reactions()
+    await check_reaction_measure()
     await check_views()
     await check_signature()
     await check_store()
@@ -1282,6 +1300,7 @@ async def check_reactions():
     bot.reactions.wait = 0
     bot.reactions.poll = 0
     bot.reactions.permit_limit = 0.01
+    bot.reactions.check_delays = ()
     await bot.on_message(
         world["client"], Message(world["client"], 61, world["donor_other"], caption="пост про мемы", photo=Photo("live1"))
     )
@@ -1315,6 +1334,65 @@ async def check_reactions():
     check("кнопка снова включает реакции", panel_bot.reactions.enabled is True and "Реакции: включены" in pclient.edits[-1][2], pclient.edits[-1][2][:120])
     await panel.on_button(pclient, press("status"))
     check("статус показывает очередь реакций", "Реакции:" in pclient.edits[-1][2] and "smmnakrutka" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
+
+
+async def check_reaction_measure():
+    print("\n[19] Замер: сколько реакций реально встало под постом")
+    from reactions import MEASURE_KEEP, Reactor, count_reactions, parse_link, short
+
+    cfg = make_cfg(reactions_enabled=True)
+    client = FakeClient()
+    channel = client.add_chat(Chat(-10040, title="ПРАЙМ СПОРТ", username="proprime_chan", chat_type=ChatType.CHANNEL))
+    arrived = Message(client, 895, channel, caption="текст", photo=Photo("f1"))
+    arrived.reactions = Counter(("🔥", 3), ("⭐", 1))
+    silent = Message(client, 896, channel, caption="текст", photo=Photo("f2"))
+    client.histories[channel.id] = [arrived, silent]
+
+    check("ссылка разворачивается обратно", parse_link("https://t.me/proprime_chan/895?single") == ("proprime_chan", 895))
+    check("в журнале ссылка короткая", short("https://t.me/proprime_chan/895?single") == "proprime_chan/895", short("x"))
+    check("реакции считаются по эмодзи", count_reactions(arrived) == "🔥3 ⭐1 (всего 4)", count_reactions(arrived))
+    check("без реакций честно пишем «нет»", count_reactions(silent) == "нет", count_reactions(silent))
+
+    def permit(key="kluch"):
+        return FakeResponse(200, text='{"data": "%s"}' % key)
+
+    link = "https://t.me/proprime_chan/895?single"
+    reactor = Reactor(cfg, FakeSession([permit(), FakeResponse(200, text="OK")]), client)
+    reactor.wait = reactor.poll = 0
+    reactor.permit_limit = 0.01
+    reactor.check_delays = (0.01, 0.03)
+    check("пока заказов не было - панель это говорит", "не измерено" in reactor.report(), reactor.report())
+
+    await reactor.order(link)
+    await asyncio.sleep(0.1)
+    check("после заказа начинается замер", len(reactor.measures) == 2, str(reactor.measures))
+    check(
+        "замер пишет конкретные числа",
+        "proprime_chan/895" in reactor.measures[0] and "🔥3 ⭐1 (всего 4)" in reactor.measures[0],
+        str(reactor.measures),
+    )
+    check("замер помнит, через сколько смотрел", "через" in reactor.measures[0], str(reactor.measures))
+    check("замер виден в панели", "🔥3 ⭐1" in reactor.report(), reactor.report()[:120])
+    check("сервис не начал - замер говорит «нет»", await reactor.count("https://t.me/proprime_chan/896?single") == "нет")
+    check("поста нет - так и пишем", await reactor.count("https://t.me/proprime_chan/9999?single") == "поста там нет")
+
+    for index in range(MEASURE_KEEP + 4):
+        reactor.measures.insert(0, f"канал/{index}")
+        del reactor.measures[MEASURE_KEEP:]
+    check("замеров не копить", len(reactor.measures) == MEASURE_KEEP, str(len(reactor.measures)))
+
+    broken = Reactor(cfg, FakeSession([permit(), FakeResponse(200, text="OK")]), client)
+    broken.wait = broken.poll = 0
+    broken.permit_limit = 0.01
+    broken.check_delays = (0.01,)
+    await broken.order("https://t.me/no_such_chan/12?single")
+    await asyncio.sleep(0.1)
+    check("не открытый пост - только журнал", broken.measures and "не измерить" in broken.measures[0], str(broken.measures))
+
+    world = build_world(make_cfg(reactions_enabled=True))
+    bot, _, _ = await make_bot(world)
+    bot.reactions.measures = ["proprime_chan/895 через 20 мин: 🔥3 ⭐1 (всего 4)"]
+    check("кнопка «🩺 Проверка» показывает замеры", "🔥3 ⭐1" in await bot.diagnose(), (await bot.diagnose())[-160:])
 
 
 async def check_views():

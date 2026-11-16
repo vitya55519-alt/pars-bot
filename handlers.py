@@ -36,7 +36,7 @@ class ParsBot:
         self.ai = ai
         self.registry = registry
         self.promo = Promoter(client, cfg)
-        self.reactions = Reactor(cfg, session)
+        self.reactions = Reactor(cfg, session, client)
         self.controls = Controls(client, cfg, registry, self)
         self._seen_groups: "OrderedDict[str, None]" = OrderedDict()
         self.stats = {"caught": 0, "published": 0, "forwarded": 0, "errors": 0}
@@ -201,6 +201,7 @@ class ParsBot:
             f"Итого: поймано {stats['caught']} · опубликовано {stats['published']} · сбоев {stats['errors']}"
             f" · последняя публикация {self.last_publish or 'ещё не было'}"
         )
+        lines.append(self.reactions.report())
         return "\n".join(lines)
 
     async def _gate(self, chat, user_id: int) -> str:

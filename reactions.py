@@ -6,17 +6,24 @@
 Мы делаем те же два шага и держим паузу, которую просит сам сервис: заказ не
 чаще одного в час. Идентификаторы формы взяты из разметки страницы - если их
 поменяют, в журнале станет видно ответ сервиса.
+
+После заказа бот сам читает реакции под постом (через 20 минут и через два
+часа) и пишет в журнал конкретное число: только так видно, отвечает сервис или
+заказ ушёл в пустоту.
 """
 
 import asyncio
 import json
 import logging
 import random
+import re
 import string
 import time
-from typing import Set
+from typing import List, Set, Tuple
 
 import aiohttp
+
+from utils import call
 
 log = logging.getLogger("reactions")
 
@@ -36,6 +43,9 @@ MAX_PENDING = 6
 PERMIT_WAIT = 330
 PERMIT_POLL = 10
 PERMIT_LIMIT = 900
+CHECK_DELAYS = (1200, 7200)
+MEASURE_KEEP = 8
+LINK_RE = re.compile(r"t\.me/([^/?#]+)/(\d+)", re.IGNORECASE)
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
     "Origin": "https://smmnakrutka.ru",
@@ -60,6 +70,36 @@ def post_link(message) -> str:
     return f"https://t.me/{username}/{message_id}?single"
 
 
+def parse_link(link: str) -> Tuple[str, int]:
+    """Обратный ход: из ссылки, отданной сервису, достаём канал и номер поста."""
+    match = LINK_RE.search(link or "")
+    if not match:
+        return "", 0
+    return match.group(1), int(match.group(2))
+
+
+def short(link: str) -> str:
+    username, message_id = parse_link(link)
+    return f"{username}/{message_id}" if message_id else (link or "?")
+
+
+def count_reactions(message) -> str:
+    """Что реально стоит под постом: «нет» означает, что сервис не начал накрутку."""
+    reactions = getattr(message, "reactions", None)
+    results = list(getattr(reactions, "results", None) or [])
+    if not results:
+        return "нет"
+    total = getattr(reactions, "total_count", None)
+    parts = []
+    for item in results:
+        emoji = getattr(getattr(item, "reaction", None), "emoji", None) or "?"
+        parts.append(f"{emoji}{getattr(item, 'total_count', 0)}")
+    head = " ".join(parts)
+    if total is not None and len(parts) > 1:
+        head += f" (всего {total})"
+    return head
+
+
 class ReactionsError(Exception):
     pass
 
@@ -67,20 +107,25 @@ class ReactionsError(Exception):
 class Reactor:
     """Заказы уходят по одному в час, как требует сервис: каждому посту достаётся своя очередь."""
 
-    def __init__(self, cfg, session):
+    def __init__(self, cfg, session, client=None):
         self.cfg = cfg
         self.session = session
+        self.client = client
         self.enabled = cfg.reactions_enabled
         self.ordered = 0
         self.failed = 0
         self.skipped = 0
         self.last_link = ""
         self.last_error = ""
+        self.last_reply = ""
+        self.measures: List[str] = []
+        self.check_delays = CHECK_DELAYS
         self.wait = PERMIT_WAIT
         self.poll = PERMIT_POLL
         self.permit_limit = PERMIT_LIMIT
         self._next_slot = 0.0
         self._tasks: Set[asyncio.Task] = set()
+        self._checks: Set[asyncio.Task] = set()
 
     def schedule(self, message) -> None:
         if not self.enabled:
@@ -134,7 +179,39 @@ class Reactor:
         self.ordered += 1
         self.last_link = link
         self.last_error = ""
-        log.info("Реакции: заказ на %s отправлен (старт 0-15 минут).", link)
+        self.last_reply = body
+        log.info("Реакции: заказ на %s отправлен (старт 0-15 минут), сервис ответил «%s».", link, body or "пусто")
+        self._watch(link)
+
+    def _watch(self, link: str) -> None:
+        """Замер вместо гаданий: читаем реакции под этим же постом позже."""
+        if self.client is None:
+            return
+        for delay in self.check_delays:
+            task = asyncio.create_task(self._measure(link, delay))
+            self._checks.add(task)
+            task.add_done_callback(self._checks.discard)
+
+    async def _measure(self, link: str, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            line = f"{short(link)} через {human(delay)}: {await self.count(link)}"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - замер не должен влиять на заказы
+            line = f"{short(link)} через {human(delay)}: не измерить ({type(exc).__name__})"
+        self.measures.insert(0, line)
+        del self.measures[MEASURE_KEEP:]
+        log.info("Реакции: замер - %s.", line)
+
+    async def count(self, link: str) -> str:
+        username, message_id = parse_link(link)
+        if not message_id:
+            return "ссылка непонятна"
+        message = await call(self.client.get_messages, username, message_id)
+        if message is None:
+            return "поста там нет"
+        return count_reactions(message)
 
     async def _permission(self):
         """Пять минут ждём честно - сервис выдаёт ключ сам, когда время выйдет."""
@@ -168,6 +245,12 @@ class Reactor:
         fails = f", сбоев {self.failed}" if self.failed else ""
         skipped = f", пропущено {self.skipped}" if self.skipped else ""
         return f"Реакции: {state}{done}{queue}{fails}{skipped}"
+
+    def report(self) -> str:
+        """Показывает замеры в панели: без журнала видно, дошли ли реакции до поста."""
+        if not self.measures:
+            return "Реакции: после заказа ещё ничего не измерено - замеры появятся через 20 мин."
+        return "Реакции под постами после заказа:\n" + "\n".join(f"    {line}" for line in self.measures)
 
 
 def payload(link: str, cfg, token: str, key: str) -> dict:
