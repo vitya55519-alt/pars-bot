@@ -19,6 +19,7 @@ import random
 import re
 import string
 import time
+from collections import OrderedDict
 from typing import List, Set, Tuple
 
 import aiohttp
@@ -39,10 +40,10 @@ SERVICE_KEY = "c8d6dc745fa5773025b1d741ce72f2ca"
 PRODUCT = "Реакции Телеграм"
 QUANTITY = "50"
 
-MAX_PENDING = 6
 PERMIT_WAIT = 330
 PERMIT_POLL = 10
 PERMIT_LIMIT = 900
+FORM_ATTEMPTS = 2
 CHECK_DELAYS = (1200, 7200)
 MEASURE_KEEP = 8
 LINK_RE = re.compile(r"t\.me/([^/?#]+)/(\d+)", re.IGNORECASE)
@@ -85,19 +86,18 @@ def short(link: str) -> str:
 
 def count_reactions(message) -> str:
     """Что реально стоит под постом: «нет» означает, что сервис не начал накрутку."""
-    reactions = getattr(message, "reactions", None)
-    results = list(getattr(reactions, "results", None) or [])
-    if not results:
+    info = getattr(message, "reactions", None)
+    items = list(getattr(info, "reactions", None) or [])
+    if not items:
         return "нет"
-    total = getattr(reactions, "total_count", None)
     parts = []
-    for item in results:
-        emoji = getattr(getattr(item, "reaction", None), "emoji", None) or "?"
-        parts.append(f"{emoji}{getattr(item, 'total_count', 0)}")
-    head = " ".join(parts)
-    if total is not None and len(parts) > 1:
-        head += f" (всего {total})"
-    return head
+    total = 0
+    for item in items:
+        emoji = getattr(item, "emoji", None) or getattr(item, "emoticon", None) or "?"
+        count = int(getattr(item, "count", 0) or 0)
+        total += count
+        parts.append(f"{emoji}{count}")
+    return " ".join(parts) + (f" (всего {total})" if len(parts) > 1 else "")
 
 
 class ReactionsError(Exception):
@@ -105,7 +105,7 @@ class ReactionsError(Exception):
 
 
 class Reactor:
-    """Заказы уходят по одному в час, как требует сервис: каждому посту достаётся своя очередь."""
+    """Один заказ в час на всех, как требует сервис: каналу достаётся заказ на его самый свежий пост."""
 
     def __init__(self, cfg, session, client=None):
         self.cfg = cfg
@@ -124,7 +124,8 @@ class Reactor:
         self.poll = PERMIT_POLL
         self.permit_limit = PERMIT_LIMIT
         self._next_slot = 0.0
-        self._tasks: Set[asyncio.Task] = set()
+        self._queue: "OrderedDict[str, str]" = OrderedDict()
+        self._worker: asyncio.Task | None = None
         self._checks: Set[asyncio.Task] = set()
 
     def schedule(self, message) -> None:
@@ -137,15 +138,13 @@ class Reactor:
             log.info("Реакции: у канала нет публичной ссылки - сервис не увидит пост, пропускаю.")
             return
 
-        if len(self._tasks) >= MAX_PENDING:
-            self.skipped += 1
-            log.warning("Реакции: очередь из %s заказов уже ждёт своей минуты - этот пост пропускаю.", MAX_PENDING)
-            return
-
-        wait = self._reserve()
-        task = asyncio.create_task(self._later(link, wait))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        username, _ = parse_link(link)
+        if self._queue.get(username):
+            log.info("Реакции: %s уже ждёт заказа - ставлю вместо него %s.", short(self._queue[username]), short(link))
+        self._queue[username] = link
+        self._queue.move_to_end(username)
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._run())
 
     def _reserve(self) -> float:
         now = time.monotonic()
@@ -153,35 +152,53 @@ class Reactor:
         self._next_slot = slot + self.cfg.reactions_interval
         return slot - now
 
-    async def _later(self, link: str, wait: float) -> None:
-        if wait > 1:
-            log.info("Реакции: жду %s перед заказом %s.", human(wait), link)
-            await asyncio.sleep(wait)
-        try:
-            await self.order(link)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - реакции не должны влиять на публикацию
-            self.failed += 1
-            self.last_error = f"{type(exc).__name__}: {exc}"
-            log.warning("Реакции: заказ для %s не отправился (%s).", link, self.last_error)
+    async def _run(self) -> None:
+        """Ждём своей минуты, не вынимая пост из очереди: за ожидание мог выйти новый."""
+        while self._queue:
+            username = next(iter(self._queue))
+            wait = self._reserve()
+            if wait > 1:
+                log.info("Реакции: жду %s перед заказом %s.", human(wait), short(self._queue[username]))
+                await asyncio.sleep(wait)
+            link = self._queue.pop(username, None)
+            if not link:
+                continue
+            try:
+                await self.order(link)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - реакции не должны влиять на публикацию
+                self.failed += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                log.warning("Реакции: заказ для %s не отправился (%s).", link, self.last_error)
 
     async def order(self, link: str) -> None:
         token, key = await self._permission()
-        timeout = aiohttp.ClientTimeout(total=self.cfg.reactions_timeout)
-        async with self.session.post(
-            FORM_URL, data=payload(link, self.cfg, token, key), headers=HEADERS, timeout=timeout
-        ) as resp:
-            body = " ".join((await resp.text()).split())[:200]
-            if resp.status != 200 or not body.upper().startswith("OK"):
-                raise ReactionsError(f"HTTP {resp.status}: {body or 'пустой ответ'}")
-
+        body = await self._send(link, token, key)
         self.ordered += 1
         self.last_link = link
         self.last_error = ""
         self.last_reply = body
         log.info("Реакции: заказ на %s отправлен (старт 0-15 минут), сервис ответил «%s».", link, body or "пусто")
         self._watch(link)
+
+    async def _send(self, link: str, token: str, key: str) -> str:
+        """Обрыв соединения у сервиса бывает часто - без повтора пост терял заказ молча."""
+        last: Exception | None = None
+        for attempt in range(1, FORM_ATTEMPTS + 1):
+            try:
+                timeout = aiohttp.ClientTimeout(total=self.cfg.reactions_timeout)
+                async with self.session.post(
+                    FORM_URL, data=payload(link, self.cfg, token, key), headers=HEADERS, timeout=timeout
+                ) as resp:
+                    body = " ".join((await resp.text()).split())[:200]
+                    if resp.status != 200 or not body.upper().startswith("OK"):
+                        raise ReactionsError(f"HTTP {resp.status}: {body or 'пустой ответ'}")
+                    return body
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last = exc
+                log.warning("Реакции: форма не дошла, попытка %s из %s (%s).", attempt, FORM_ATTEMPTS, type(exc).__name__)
+        raise ReactionsError(f"сервис не принял форму ({type(last).__name__})")
 
     def _watch(self, link: str) -> None:
         """Замер вместо гаданий: читаем реакции под этим же постом позже."""
@@ -241,7 +258,7 @@ class Reactor:
     def describe(self) -> str:
         state = f"включены, заказ раз в {human(self.cfg.reactions_interval)}" if self.enabled else "выключены"
         done = f", отправлено {self.ordered}" if self.ordered else ""
-        queue = f", в очереди {len(self._tasks)}" if self._tasks else ""
+        queue = f", в очереди {len(self._queue)}" if self._queue else ""
         fails = f", сбоев {self.failed}" if self.failed else ""
         skipped = f", пропущено {self.skipped}" if self.skipped else ""
         return f"Реакции: {state}{done}{queue}{fails}{skipped}"

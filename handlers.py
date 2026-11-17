@@ -195,6 +195,7 @@ class ParsBot:
                 continue
             published = await self._published_ids(category, limit)
             lines.append(f"    канал: {await self._gate(category.target, me.id)}")
+            lines.append(f"    настройки канала: {await self._reaction_settings(category.target)}")
             lines.append(f"    реакции в канале: {await self._channel_reactions(category)}")
             for donor in category.donors.values():
                 lines.append(f"    {donor.name}: {await self._donor_line(donor.chat_id, published, limit)}")
@@ -221,6 +222,24 @@ class ParsBot:
                 return "админ, но писать запрещено - снимешь запрет, начнём"
             return "пишем свободно"
         return f"не админ ({getattr(status, 'name', status)}) - канал не примет пост"
+
+    async def _reaction_settings(self, chat) -> str:
+        """Сервис ставит условие: в канале должны быть разрешены ВСЕ реакции - проверяем это."""
+        try:
+            info = await call(self.client.get_chat, chat)
+        except Exception as exc:  # noqa: BLE001 - канал мог закрыться
+            return f"настройки не открыть ({type(exc).__name__})"
+        allowed = getattr(info, "available_reactions", None)
+        if allowed is None:
+            return "ограничений по реакциям Telegram не показывает"
+        if getattr(allowed, "all_are_enabled", False):
+            return "разрешены все реакции"
+        emoji = [(getattr(item, "emoji", None) or "?") for item in (allowed.reactions or [])]
+        if not emoji:
+            return "в канале не разрешена ни одна реакция - накрутке не встать"
+        shown = " ".join(emoji[:10])
+        extra = f"… и ещё {len(emoji) - 10}" if len(emoji) > 10 else ""
+        return f"разрешено только {len(emoji)} эмодзи ({shown}{extra}) - по условию сервиса нужно все"
 
     async def _channel_reactions(self, category: Category, show: int = 3) -> str:
         """Сколько реакций под свежими постами самого канала - ответ «где реакции» по кнопке."""

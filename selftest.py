@@ -4,6 +4,7 @@ Telegram и нейросеть не трогаем: подменяем клие�
 сборку списка из тем, маршрутизацию, публикацию по file_id, промо и команды.
 """
 
+import aiohttp
 import asyncio
 import datetime
 import sys
@@ -349,14 +350,27 @@ class FakeClient:
 
 
 class Counter:
-    """Как pyrogram.ReactionCount: список «эмодзи + сколько человек» и общий счётчик."""
+    """Как pyrogram.MessageReactions: список реакций с эмодзи и числом."""
 
     def __init__(self, *pairs):
-        self.results = [
-            type("Item", (), {"reaction": type("Emoji", (), {"emoji": emoji})(), "total_count": count})()
+        self.reactions = [
+            type("Reaction", (), {"emoji": emoji, "count": count, "are_tags": False})()
             for emoji, count in pairs
         ]
-        self.total_count = sum(count for _, count in pairs)
+
+
+class Emoji:
+    def __init__(self, sign):
+        self.emoji = sign
+
+
+class Allowed:
+    """Как pyrogram.ChatReactions: либо «разрешены все», либо список конкретных эмодзи."""
+
+    def __init__(self, all_are_enabled=False, reactions=None):
+        self.all_are_enabled = all_are_enabled
+        self.allow_custom_emoji = False
+        self.reactions = reactions
 
 
 class FakeResponse:
@@ -385,7 +399,10 @@ class FakeSession:
 
     def post(self, url, json=None, data=None, headers=None, timeout=None):
         self.calls.append((url, json, data, headers))
-        return self.responses.pop(0) if self.responses else FakeResponse(500, text="нет ответа")
+        item = self.responses.pop(0) if self.responses else FakeResponse(500, text="нет ответа")
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
 
 class StubAI:
@@ -577,6 +594,7 @@ async def check_diagnose():
         Message(client, 905, sport, caption="самый свежий", photo=Photo("f_seen", "u_seen"), date=ago(10)),
     ]
     client.histories[sport.id][0].reactions = Counter(("🔥", 3), ("⭐", 1))
+    sport.available_reactions = Allowed(all_are_enabled=True)
     client.histories[donor.id] = [
         Message(client, 901, donor, caption="уже в канале", photo=Photo("f_dup", "u_old"), date=ago(120)),
         Message(client, 902, donor, caption="пропущенный пост", photo=Photo("f_new", "u_new"), date=ago(20)),
@@ -613,6 +631,16 @@ async def check_diagnose():
     client.members[sport.id] = (ChatMemberStatus.BANNED, True)
     check("выгнанного аккаунта видно", "не подписан" in await bot.diagnose())
     del client.members[sport.id]
+
+    check("условие сервиса про реакции видно", "разрешены все реакции" in report, report)
+    sport.available_reactions = Allowed(reactions=[Emoji("👍"), Emoji("❤️")])
+    check(
+        "канал с запретом реакций назван",
+        "разрешено только 2 эмодзи (👍 ❤️) - по условию сервиса нужно все" in await bot.diagnose(),
+        [line for line in (await bot.diagnose()).splitlines() if "настройки канала" in line],
+    )
+    del sport.available_reactions
+    check("канал без настроек назван честно", "ограничений по реакциям" in await bot.diagnose())
 
     broken = build_world()
     broken["client"].topics[broken["group"].id].append(Topic(23, "Банк"))
@@ -1193,7 +1221,7 @@ async def check_panel_login_flood():
 
 async def check_reactions():
     print("\n[12] Бесплатные реакции на посты")
-    from reactions import MAX_PENDING, FORM_URL, PERMIT_URL, Reactor, post_link
+    from reactions import FORM_URL, PERMIT_URL, Reactor, post_link, short
 
     client = FakeClient()
     yumor = client.add_chat(Chat(-10030, title="Юмор канала", username="yumor_ch", chat_type=ChatType.CHANNEL))
@@ -1262,6 +1290,20 @@ async def check_reactions():
     await asyncio.sleep(0.05)
     check("сбой сервиса - только журнал", broken.failed == 1 and "Bad Gateway" in broken.last_error, broken.last_error)
 
+    drop = aiohttp.ClientError("обрыв соединения")
+    again = reactor([permit(), drop, FakeResponse(200, text="OK")])
+    again.schedule(published)
+    await asyncio.sleep(0.05)
+    check(
+        "обрыв формы повторяется, а не теряет заказ",
+        again.ordered == 1 and again.failed == 0 and len(again.session.calls) == 3,
+        f"{again.ordered}/{again.failed} {again.last_error}",
+    )
+    never = reactor([permit(), drop, drop])
+    never.schedule(published)
+    await asyncio.sleep(0.05)
+    check("два обрыва - заказ отпадает с объяснением", never.failed == 1 and "ClientError" in never.last_error, never.last_error)
+
     off_session = FakeSession([permit(), FakeResponse(200, text="OK")])
     off = Reactor(make_cfg(reactions_enabled=False), off_session)
     off.schedule(published)
@@ -1273,31 +1315,38 @@ async def check_reactions():
     await asyncio.sleep(0.05)
     check("пост без публичной ссылки пропущен", private.skipped == 1 and private.session.calls == [], str(private.session.calls))
 
-    queued = FakeSession([permit(), FakeResponse(200, text="OK")])
+    bank = client.add_chat(Chat(-10032, title="Банк", username="bank_ch", chat_type=ChatType.CHANNEL))
+    queued = FakeSession([permit(), FakeResponse(200, text="OK"), permit(), FakeResponse(200, text="OK")])
     hour = Reactor(make_cfg(reactions_enabled=True, reactions_interval=3600), queued)
     hour.wait = 0
     hour.poll = 0
     hour.permit_limit = 0.01
+    hour.check_delays = ()
     hour.schedule(published)
     hour.schedule(Message(client, 79, yumor, caption="текст", photo=Photo("r2")))
+    hour.schedule(Message(client, 81, bank, caption="текст", photo=Photo("b1")))
     await asyncio.sleep(0.05)
     check("первый пост заказал сразу", len(queued.calls) == 2, str(len(queued.calls)))
-    check("второй ждёт своего часа", len(hour._tasks) == 1, str(len(hour._tasks)))
-    for task in list(hour._tasks):
-        task.cancel()
+    check(
+        "второй канал ждёт своего часа",
+        len(hour._queue) == 1 and short(hour._queue["bank_ch"]) == "bank_ch/81",
+        str(list(hour._queue.items())),
+    )
+    hour._worker.cancel()
     await asyncio.sleep(0.05)
     check("отменённая очередь не успела заказать", len(queued.calls) == 2, str(len(queued.calls)))
 
     pile = reactor([], reactions_interval=3600)
-    for index in range(MAX_PENDING + 3):
-        pile.schedule(Message(client, 100 + index, yumor, caption="текст", photo=Photo(f"p{index}")))
+    for index in range(10):
+        pile.schedule(Message(client, 100 + index, bank, caption="текст", photo=Photo(f"p{index}")))
+    pile.schedule(published)
     check(
-        "очередь не растёт бесконечно",
-        len(pile._tasks) == MAX_PENDING and pile.skipped == 3,
-        f"{len(pile._tasks)} задач, пропущено {pile.skipped}",
+        "у канала в очереди один, самый свежий пост",
+        len(pile._queue) == 2 and short(pile._queue["bank_ch"]) == "bank_ch/109",
+        str(list(pile._queue.items())),
     )
-    for task in list(pile._tasks):
-        task.cancel()
+    check("посты не теряются молча", pile.skipped == 0, str(pile.skipped))
+    pile._worker.cancel()
     await asyncio.sleep(0.05)
 
     live_cfg = make_cfg(reactions_enabled=True)
