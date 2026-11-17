@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import List
 
-from pyrogram.enums import ChatMemberStatus, ChatType
+from pyrogram.enums import ChatMemberStatus, ChatType, ParseMode
 from pyrogram.errors import ChatForwardsRestricted, FloodWait, Unauthorized
 from pyrogram.types import InputMediaPhoto
 from pyrogram.types import Message as _PyrogramMessage
@@ -22,6 +22,7 @@ from config import Config
 from handlers import ParsBot
 from panel import Panel
 from registry import Registry, RegistryError, extract_refs
+from utils import TEXT_LIMIT
 
 CHECKS = []
 FAILED = []
@@ -500,6 +501,7 @@ async def main():
     await check_cabinet()
     await check_dead_topic()
     await check_diagnose()
+    await check_text_posts()
 
     print(f"\nПроверок: {len(CHECKS)}, неудач: {len(FAILED)}")
     if FAILED:
@@ -600,15 +602,20 @@ async def check_diagnose():
         Message(client, 902, donor, caption="пропущенный пост", photo=Photo("f_new", "u_new"), date=ago(20)),
         Message(client, 903, donor, text="просто текст без картинки", date=ago(5)),
     ]
-    client.histories[world["donor_sport_2"].id] = [Message(client, 904, world["donor_sport_2"], caption="без фото", date=ago(10))]
+    client.histories[world["donor_sport_2"].id] = [Message(client, 904, world["donor_sport_2"], photo=Photo("f_bare", "u_bare"), date=ago(10))]
 
     report = await bot.diagnose()
     check("проверка называет канал темы", "-> Спорт" in report, report)
-    check("проверка считает посты донора", "постов с фото и текстом 2, не дошло 1" in report, report)
-    check("проверка меряет свежесть поста", "последний пост 20 мин назад" in report, report)
+    check("проверка считает посты донора", "постов с текстом 3, не дошло 1" in report, report)
+    check("проверка меряет свежесть поста", "последний пост 5 мин назад" in report, report)
     check("проверка меряет свежесть без постов", "последнее сообщение 10 мин назад" in report, report)
     check("проверка отвечает про права", "пишем свободно" in report, report)
-    check("проверка видит пустого донора", "постов с фото и текстом 0" in report, report)
+    check("проверка видит пустого донора", "постов с текстом 0" in report, report)
+    check(
+        "проверка честно считает непроверяемое",
+        "текстовых до запуска не проверить: 1" in report,
+        [line for line in report.splitlines() if "не проверить" in line],
+    )
     check(
         "проверка считает реакции под постами канала",
         "пост 905: нет · пост 900: 🔥3 ⭐1 (всего 4)" in report,
@@ -672,6 +679,84 @@ async def check_diagnose():
     check("в меню появилась проверка", "check" in main_cells, str(main_cells))
 
 
+async def check_text_posts():
+    print("\n[20] Посты без картинки: публикуем текстом")
+    world = build_world(make_cfg(promo_delay=0))
+    bot, registry, _ = await make_bot(world)
+    client, sport, donor = world["client"], world["sport"], world["donor_sport_1"]
+
+    def sent_texts():
+        return [text for chat, text in client.sent if chat == sport.id]
+
+    seen_kwargs = {}
+    original_send = client.send_message
+
+    async def spy(chat, text, *args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return await original_send(chat, text, *args, **kwargs)
+
+    client.send_message = spy
+
+    await bot.on_message(client, Message(client, 61, donor, text="Расписание матчей на сегодня"))
+    check("пост без картинки опубликован", len(sent_texts()) == 1, str(client.sent))
+    check("текст поста от нейросети", sent_texts() == ["переписанный текст"], str(sent_texts()))
+    check("картинку выдумывать не стали", not client.posted, str(client.posted))
+    check("разметку в текст не подмешиваем", seen_kwargs.get("parse_mode") is ParseMode.DISABLED, str(seen_kwargs))
+    check("промо получило текстовый пост", client.forwarded[0][1] == sport.id, str(client.forwarded))
+    check("счётчики текстового поста", (bot.stats["caught"], bot.stats["published"], bot.stats["errors"]) == (1, 1, 0), str(bot.stats))
+
+    client.histories[donor.id] = [Message(client, 61, donor, text="Расписание матчей на сегодня", date=ago(1))]
+    answer = await bot.catch_up()
+    check("отправленный текстовый пост догон не повторяет", "Пропущенного нет" in answer and len(sent_texts()) == 1, answer)
+
+    bot.started = ago(60)
+    client.histories[donor.id] = [Message(client, 62, donor, text="Таблица трансферов", date=ago(5))]
+    check("текстовый пост после старта догоняется", "Догнал 1" in await bot.catch_up(), answer)
+    check("догнанный текст ушёл в канал", len(sent_texts()) == 2, str(sent_texts()))
+
+    bot.started = datetime.datetime.now(datetime.timezone.utc)
+    client.histories[donor.id].append(Message(client, 63, donor, text="Пост до нашего запуска", date=ago(40)))
+    check("текстовый пост до запуска дублем не выгоняет", "Пропущенного нет" in await bot.catch_up(), str(sent_texts()))
+    check("проверка о нём честно говорит", "текстовых до запуска не проверить: 1" in await bot.diagnose(), await bot.diagnose())
+
+    clip = Message(client, 64, donor, caption="Обзор тура")
+    clip.video = object()
+    await bot.on_message(client, clip)
+    check("пост с видео публикует свой текст", len(sent_texts()) == 3, str(sent_texts()))
+    check("носитель вместо текста не тащим", not client.posted and bot.stats["errors"] == 0, str(bot.stats))
+
+    cards = [Message(client, 71, donor, group="gv", caption="Нарезка голов"), Message(client, 72, donor, group="gv")]
+    cards[0].video = object()
+    client.donor_messages[donor.id] = cards
+    await bot.on_message(client, cards[0])
+    check("альбом без фото публикует свой текст", len(sent_texts()) == 4, str(sent_texts()))
+    check("пустой альбом не зовёт send_media_group", not client.albums, str(client.albums))
+
+    client.send_message = original_send
+
+    deep = build_world(make_cfg(promo_delay=0))
+    deep_bot, _, _ = await make_bot(deep, ai=StubAI("слово " * 400))
+    await deep_bot.on_message(deep["client"], Message(deep["client"], 65, deep["donor_sport_1"], text="длинный пост"))
+    published = [text for chat, text in deep["client"].sent if chat == deep["sport"].id][0]
+    check("лимит подписи картинки тексту не мешает", len(published) > 1024, str(len(published)))
+
+    deep_bot.ai = StubAI("слово " * 2000)
+    await deep_bot.on_message(deep["client"], Message(deep["client"], 66, deep["donor_sport_1"], text="очень длинный пост"))
+    over = [text for chat, text in deep["client"].sent if chat == deep["sport"].id][-1]
+    check("длиннее лимита сообщения не пишем", len(over) <= TEXT_LIMIT, str(len(over)))
+
+    fans = client.add_chat(Chat(-10080, title="Обсуждение спорта", username="fan_chat", chat_type=ChatType.SUPERGROUP))
+    await registry.add_donor(21, "@fan_chat")
+    await bot.on_message(client, Message(client, 77, fans, text="а кто вратаря купил?"))
+    check("реплика из группы-донора в канал не идёт", len(sent_texts()) == 4, str(client.sent))
+    check("переписку не считаем постом", bot.stats["caught"] == 3, str(bot.stats))
+
+    announcement = Message(client, 78, fans, text="Официально: матч перенесён")
+    announcement.sender_chat = fans
+    await bot.on_message(client, announcement)
+    check("пост группы-донора публикуется текстом", len(sent_texts()) == 5, str(sent_texts()))
+
+
 async def check_routing():
     print("\n[2] Публикация поста в канал темы")
     world = build_world()
@@ -698,8 +783,20 @@ async def check_routing():
         not await donor_filter(client, Message(client, 36, world["stranger"], caption="текст", photo=Photo("f6"))),
     )
     check(
-        "фильтр отсекает пост без фото",
-        not await donor_filter(client, Message(client, 37, world["donor_sport_1"], caption="текст")),
+        "фильтр берёт пост без картинки",
+        await donor_filter(client, Message(client, 37, world["donor_sport_1"], text="просто текст")),
+    )
+    check(
+        "фильтр берёт подпись без картинки",
+        await donor_filter(client, Message(client, 371, world["donor_sport_1"], caption="текст")),
+    )
+    check(
+        "картинку без текста фильтр берёт, но публикация её отсекает",
+        await donor_filter(client, Message(client, 372, world["donor_sport_1"], photo=Photo("f8"))),
+    )
+    check(
+        "сервисное сообщение не пост",
+        not await donor_filter(client, Message(client, 373, world["donor_sport_1"], text="вошёл", service=True)),
     )
     mine = Message(client, 38, world["donor_sport_1"], caption="текст", photo=Photo("f7"))
     mine.outgoing = True
