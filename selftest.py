@@ -502,6 +502,7 @@ async def main():
     await check_dead_topic()
     await check_diagnose()
     await check_text_posts()
+    await check_manual_reaction()
 
     print(f"\nПроверок: {len(CHECKS)}, неудач: {len(FAILED)}")
     if FAILED:
@@ -755,6 +756,118 @@ async def check_text_posts():
     announcement.sender_chat = fans
     await bot.on_message(client, announcement)
     check("пост группы-донора публикуется текстом", len(sent_texts()) == 5, str(sent_texts()))
+
+
+async def check_manual_reaction():
+    print("\n[21] 🎯 Ручной заказ реакций по ссылке из панели")
+    import time
+
+    from reactions import Entry, Reactor, short, wanted_link
+
+    def permit(key="kluch"):
+        return FakeResponse(200, text='{"data": "%s"}' % key)
+
+    cfg = make_cfg(bot_token="900:AAstub", reactions_enabled=True)
+    world = build_world(cfg)
+    client, yumor = world["client"], world["yumor"]
+    session = FakeSession([permit(), FakeResponse(200, text="OK"), permit(), FakeResponse(200, text="OK")])
+    bot, registry, _ = await make_bot(world, session=session)
+    reactor = bot.reactions
+    reactor.wait = reactor.poll = 0
+    reactor.permit_limit = 0.01
+    reactor.check_delays = ()
+
+    standing = Message(client, 77, yumor, caption="текст", photo=Photo("old1"))
+    client.histories[yumor.id] = [standing]
+
+    owner = client.add_user(User(777, "Витя"))
+    panel = Panel(client, cfg, registry, bot)
+    panel.setup()
+    await panel.start(owner.id, "Витя")
+
+    def press(data):
+        return Query(client, data, owner.id, Message(client, 9100, owner, text="меню"))
+
+    check("ссылка разворачивается в канал и номер", wanted_link("t.me/proprime_chan/896") == ("proprime_chan", 896))
+    check("пустая очередь названа", "заказов никто не ждёт" in reactor.queue_lines()[0], str(reactor.queue_lines()))
+
+    await panel.on_message(client, Message(client, 9101, owner, text="/start"))
+    cells = [button.callback_data for row in client.replies[-1][2].inline_keyboard for button in row]
+    check("в меню есть кнопка ручного заказа", "react" in cells, str(cells))
+
+    await panel.on_button(client, press("react"))
+    body = client.edits[-1][2]
+    check("кнопка просит ссылку на пост", "Пришли ссылку на пост" in body, body[:120])
+    check("экран показывает очередь", "Ждут заказа" in body and "заказов никто не ждёт" in body, body[-120:])
+
+    await panel.on_message(client, Message(client, 9102, owner, text="https://t.me/yumor_ch/77"))
+    body = client.replies[-1][1]
+    check("ссылка принята в очередь", "yumor_ch/77" in body and "поставил в очередь" in body, body[:160])
+    check("заказ помечен ручным", any(item.manual for item in reactor._queue.values()), str(list(reactor._queue.items())))
+    await asyncio.sleep(0.2)
+    check("ручной заказ ушёл в сервис", reactor.ordered == 1 and reactor.failed == 0, f"ручной заказ пропущен: {reactor.last_error}")
+    link = session.calls[1][2]["link"] if len(session.calls) > 1 else ""
+    check("сервис получил ссылку из кнопки", link == "https://t.me/yumor_ch/77?single", str(link))
+    told = [text for _, text in client.sent if "реакц" in text.lower()]
+    check("о результате написали в чат панели", any("Заказ реакций ушёл" in text for text in told), str(client.sent[-1:]))
+    check("в докладе есть ответ сервиса", any("сервис ответил «OK»" in text for text in told), str(told[:1]))
+
+    # окно сервиса закрыто на час: заказ постойт в очереди, тогда видно повтор
+    reactor._next_slot = time.monotonic() + 3600
+    await panel.on_button(client, press("react"))
+    await panel.on_message(client, Message(client, 9103, owner, text="t.me/yumor_ch/77"))
+    body = client.replies[-1][1]
+    check("повторный заказ встал в очередь", "поставил в очередь" in body and len(reactor._queue) == 1, body[:160])
+    await panel.on_button(client, press("react"))
+    await panel.on_message(client, Message(client, 9104, owner, text="https://t.me/yumor_ch/77"))
+    body = client.replies[-1][1]
+    check("повтор той же ссылки не плодит заказ", "уже ждёт" in body and len(reactor._queue) == 1, str(list(reactor._queue.items())))
+
+    newer = Message(client, 90, yumor, caption="текст", photo=Photo("new1"))
+    reactor.schedule(newer)
+    check("ручной заказ новым постом не вытесняется", short(reactor._queue["https://t.me/yumor_ch/77?single"].link) == "yumor_ch/77", str(list(reactor._queue.items())))
+    check("ручной заказ идёт первым", reactor._next_key() == "https://t.me/yumor_ch/77?single", reactor._next_key())
+    check("уже заказанный вручную пост не встаёт вторым", reactor.schedule(standing) is None and len(reactor._queue) == 2, str(list(reactor._queue.items())))
+    check("очередь видна целиком", len(reactor.queue_lines()) == 2, str(reactor.queue_lines()))
+    check("статус считает ручные заказы", "ручных 1" in reactor.describe(), reactor.describe())
+
+    async def refuses(raw, actor=reactor):
+        try:
+            await actor.request(raw)
+        except ValueError as exc:
+            return str(exc)
+        return ""
+
+    check("текст без ссылки отклонён", "Не вижу ссылки" in await refuses("привет"), await refuses("привет"))
+    check(
+        "ссылка закрытого канала отклонена",
+        "закрытого канала" in await refuses("https://t.me/c/123456/77"),
+        await refuses("https://t.me/c/123456/77"),
+    )
+    check("несуществующий пост отклонён", "Поста 999" in await refuses("https://t.me/yumor_ch/999"), await refuses("https://t.me/yumor_ch/999"))
+    check(
+        "канал, который аккаунт не видит, отклонён",
+        "не открылся" in await refuses("https://t.me/no_such_channel/5"),
+        await refuses("https://t.me/no_such_channel/5"),
+    )
+    check("при отказе очередь не тронулась", len(reactor._queue) == 2, str(list(reactor._queue.items())))
+
+    off = Reactor(make_cfg(reactions_enabled=False), FakeSession([]), client)
+    off_text = await refuses("https://t.me/yumor_ch/77", off)
+    check("при выключенных реакциях заказ не принимается", "Реакции выключены" in off_text, off_text)
+
+    await panel.on_button(client, press("react"))
+    await panel.on_message(client, Message(client, 9105, owner, text="привет"))
+    check("панель после отказа снова просит ссылку", "Пришли ссылку на пост" in client.replies[-1][1], client.replies[-1][1][:120])
+
+    reactor._worker.cancel()
+    # пока ждали окна сервиса, пост переехал из порядка в ручные: заказ не должен потеряться
+    reactor._queue.clear()
+    reactor._queue["https://t.me/yumor_ch/77?single"] = Entry("https://t.me/yumor_ch/77?single", manual=True)
+    taken = reactor._take("yumor_ch")
+    check("продвинутый вручную заказ не теряется", taken is not None and taken.manual, str(taken))
+    reactor._queue.clear()
+    check("пустая очередь в докладе панели", "заказов никто не ждёт" in reactor.report(), reactor.report()[:160])
 
 
 async def check_routing():
@@ -1426,7 +1539,7 @@ async def check_reactions():
     check("первый пост заказал сразу", len(queued.calls) == 2, str(len(queued.calls)))
     check(
         "второй канал ждёт своего часа",
-        len(hour._queue) == 1 and short(hour._queue["bank_ch"]) == "bank_ch/81",
+        len(hour._queue) == 1 and short(hour._queue["bank_ch"].link) == "bank_ch/81",
         str(list(hour._queue.items())),
     )
     hour._worker.cancel()
@@ -1439,7 +1552,7 @@ async def check_reactions():
     pile.schedule(published)
     check(
         "у канала в очереди один, самый свежий пост",
-        len(pile._queue) == 2 and short(pile._queue["bank_ch"]) == "bank_ch/109",
+        len(pile._queue) == 2 and short(pile._queue["bank_ch"].link) == "bank_ch/109",
         str(list(pile._queue.items())),
     )
     check("посты не теряются молча", pile.skipped == 0, str(pile.skipped))

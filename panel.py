@@ -23,6 +23,7 @@ log = logging.getLogger("panel")
 
 NAME_LIMIT = 50
 DONOR_LIMIT = 1000
+LINK_LIMIT = 200
 MAX_DONOR_BUTTONS = 30
 
 COMMANDS = [BotCommand("start", "Меню управления"), BotCommand("help", "Как это работает")]
@@ -46,9 +47,15 @@ HELP = (
     "по одному заказу на канал и всегда самый свежий его пост - старые посты тем же "
     "заказом не повторяются. Через 20 минут и через два часа после заказа бот сам "
     "пересчитывает реакции под постом - числа видны в «🩺 Проверка» и в «📊 Статус».\n"
-    "10) «👁 Просмотров» - напиши число от 1 до 10000: столько просмотров бот отправит "
+    "10) «🎯 Реакция на пост» - заказать реакции вручную: после кнопки пришли ссылку "
+    "https://t.me/канал/номер. Сначала бот сам откроет этот пост своим аккаунтом: "
+    "не увидит - заказ не потратит. Увидит - поставит в общую очередь, но ручной заказ "
+    "идёт раньше свежих постов, и новый пост канала его не вытеснит. Окно сервиса одно "
+    "в час, поэтому часть времени уходит на ожидание. О результате бот напишет сюда сам, "
+    "реакции пересчитает через 20 минут и через 2 часа.\n"
+    "11) «👁 Просмотров» - напиши число от 1 до 10000: столько просмотров бот отправит "
     "промо-боту после каждой новой публикации. Сохраняется в склад, перезапуск не сбрасывает.\n"
-    "11) «🩺 Проверка» - бот смотрит последние сообщения у доноров, пускает ли его в канал "
+    "12) «🩺 Проверка» - бот смотрит последние сообщения у доноров, пускает ли его в канал "
     "и сколько постов не дошло, а заодно считает реакции под свежими постами канала. "
     "«⤵️ Догнать пропущенное» публикует их тем же маршрутом.\n\n"
     "Ловим любой пост донора, в котором есть текст: с картинкой - картинкой, альбом - "
@@ -167,6 +174,9 @@ class Panel:
             else:
                 self.awaiting = ("views", 0)
                 await self._show(query, "views")
+        elif key == "react":
+            self.awaiting = ("react_link", 0)
+            await self._show(query, "react")
         elif key == "del":
             message_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
             await self._remove(query, arg, message_id)
@@ -252,6 +262,9 @@ class Panel:
                 added = await registry.add_donor(topic_id, cut(text, DONOR_LIMIT))
                 self.notice = "✅ Добавил доноров: " + ", ".join(donor.name for donor in added)
                 screen = ("cat", topic_id)
+            elif kind == "react_link":
+                self.notice = await self.bot.reactions.request(cut(text, LINK_LIMIT), self._notifier(message.chat.id))
+                screen = ("react", 0)
             elif kind == "channel":
                 category = await registry.add_category(text[:NAME_LIMIT])
                 self.notice = self._category_notice(category, f"Канал «{category.name}» добавлен")
@@ -274,10 +287,10 @@ class Panel:
                 screen = ("cat", topic_id)
         except ValueError as exc:
             self.notice = f"⚠ {exc}"
-            screen = ("views", 0)
+            screen = self._fail_screen(kind, topic_id)
         except RegistryError as exc:
             self.notice = f"⚠ {exc}"
-            screen = ("main", 0) if kind in ("channel", "group", "group_rename") else ("cat", topic_id)
+            screen = self._fail_screen(kind, topic_id)
         except Exception as exc:  # noqa: BLE001 - действие всегда должно заканчиваться ответом
             log.error("Действие из панели упало: %s: %s", type(exc).__name__, exc)
             self.notice = f"⚠ Ошибка: {type(exc).__name__}"
@@ -285,6 +298,24 @@ class Panel:
 
         body, buttons = self._view(*screen)
         await call(message.reply, body, reply_markup=buttons)
+
+    def _fail_screen(self, kind: str, topic_id: int) -> Tuple[str, int]:
+        """После отказа возвращаемся к тому экрану, где просили ввод, - чтобы можно было написать снова."""
+        if kind == "views":
+            return ("views", 0)
+        if kind == "react_link":
+            return ("react", 0)
+        if kind in ("channel", "group", "group_rename"):
+            return ("main", 0)
+        return ("cat", topic_id)
+
+    def _notifier(self, chat_id: int):
+        """Ручной заказ длится несколько минут: по окончанию Reactor пишет результат в этот чат."""
+
+        async def notify(text: str) -> None:
+            await call(self.client.send_message, chat_id, cut(text, TEXT_LIMIT))
+
+        return notify
 
     @staticmethod
     def _category_notice(category, head: str) -> str:
@@ -315,6 +346,8 @@ class Panel:
             return self._rename_group_view()
         if kind == "views":
             return self._views_view()
+        if kind == "react":
+            return self._react_view()
         return self._main_view()
 
     def _main_view(self) -> Tuple[str, InlineKeyboardMarkup]:
@@ -353,8 +386,9 @@ class Panel:
                 [("📂 Каналы и доноры", "topics"), ("➕ Новый канал", "channel")],
                 [("🔄 Обновить список", "update"), ("ℹ️ Статус", "status")],
                 [toggle, ("❓ Как это работает", "help")],
-                [reactions_toggle, (f"👁 Просмотров: {views}", "views")],
-                [("🩺 Проверка", "check"), ("✏️ Переименовать склад", "group_rename")],
+                [reactions_toggle, ("🎯 Реакция на пост", "react")],
+                [(f"👁 Просмотров: {views}", "views"), ("🩺 Проверка", "check")],
+                [("✏️ Переименовать склад", "group_rename")],
             ),
         )
 
@@ -428,7 +462,7 @@ class Panel:
         return (
             cut(text, TEXT_LIMIT),
             markup(
-                [("👁 Просмотров", "views")],
+                [("👁 Просмотров", "views"), ("🎯 Реакция на пост", "react")],
                 [("🩺 Проверка", "check"), ("🔄 Обновить список", "update")],
                 [("⬅️ Меню", "main")],
             ),
@@ -519,6 +553,29 @@ class Panel:
         return (
             cut(self._with_notice("\n".join(lines)), TEXT_LIMIT),
             markup(presets[:2], presets[2:], [("⬅️ Отмена", "main")]),
+        )
+
+    def _react_view(self) -> Tuple[str, InlineKeyboardMarkup]:
+        """Экран ручного заказа: как дать ссылку и что уже стоит в очереди."""
+        reactor = self.bot.reactions
+        lines = [
+            "Ручной заказ реакций на конкретный пост."
+            if reactor.enabled
+            else "Реакции сейчас выключены - включи их, иначе заказ не уйдёт.",
+            "",
+            "Пришли ссылку на пост: https://t.me/канал/номер (или просто t.me/канал/номер).",
+            "Сначала бот откроет этот пост своим аккаунтом: не увидит его - заказ не потратит.",
+            "Ручной заказ идёт раньше очереди свежих постов и новым постом не вытесняется.",
+            "Окно сервиса одно в час, поэтому ждать можно дольше самого заказа.",
+            "",
+            reactor.describe(),
+            "Ждут заказа:",
+            *reactor.queue_lines(),
+        ]
+        rows = [] if reactor.enabled else [("🎭 Реакции: включить", "reactions")]
+        return (
+            cut(self._with_notice("\n".join(lines)), TEXT_LIMIT),
+            markup(*rows, [("⬅️ Отмена", "main")]),
         )
 
     def _name(self, topic_id: int) -> str:
