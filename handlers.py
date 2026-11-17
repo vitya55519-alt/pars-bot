@@ -208,7 +208,21 @@ class ParsBot:
         self.stats["published"] += 1
         self.last_publish = now()
         self._remember(self._sent_posts, post_key(source))
-        log.info("Опубликовано в %s (тема «%s», id %s).", category.target_name, category.name, posted.id)
+        log.info(
+            "Опубликовано в %s (тема «%s», id %s): %s.",
+            category.target_name,
+            category.name,
+            posted.id,
+            self._what_posted(posted),
+        )
+
+    def _what_posted(self, message: Message) -> str:
+        """Чем заполнен пост у нас в канале - по журналу видно, ушла картинка или только текст."""
+        if message.photo:
+            return "картинка с текстом"
+        if (message.text or "").strip():
+            return "текст без картинки"
+        return "без текста и картинки"
 
     async def _boost(self, message: Message) -> None:
         if await self.promo.push(message):
