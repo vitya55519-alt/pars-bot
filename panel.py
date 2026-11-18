@@ -46,7 +46,10 @@ HELP = (
     "\n"
     "1) «🏛 Создать группу» - один раз. Бот создаст группу, в которой хранится список каналов. "
     "Руками в ней писать ничего не нужно.\n"
-    "2) «➕ Добавить канал» - напиши название или ссылку своего канала, куда бот будет постить.\n"
+    "2) «➕ Добавить канал» - напиши название, например «спортивные новости». Бот создаст с ним "
+    "тему в своей группе; это только название для тебя, новый канал в Telegram он не создаёт.\n"
+    "2а) В этом же экране - «📤 Куда постить»: пришли @юзернейм своего канала, который уже есть. "
+    "Если канал с таким же названием, как тема, уже открыт этому аккаунту, бот подставит его сам.\n"
     "3) Открой канал в «🗂 Мои каналы» и нажми «➕ Читать ещё канал» - пришли ссылку "
     "(@юзернейм или https://t.me/...), откуда брать посты. Сколько ссылок в сообщении, "
     "столько каналов и добавится.\n"
@@ -57,6 +60,8 @@ HELP = (
     "выбор, но пост всё равно выходит словами автора.\n"
     f"   «👁 Просмотры на пост» - число от 0 до {VIEWS_LIMIT} на каждый пост, 0 - не накручивать.\n"
     "   «🎭 Реакции: ставим / не ставим» - ставить ли под посты бесплатные реакции.\n"
+    "   «✏️ Название темы» - переименовать тему как тебе удобно; канал, куда постить, "
+    "от этого не меняется.\n"
     "\n"
     "Просмотры, реакции и переписывание бот сохраняет в свою группу, поэтому после "
     "перезапуска ничего не сбивается.\n"
@@ -74,10 +79,11 @@ HELP = (
     "начисления руками, если человек перевёл мимо заявки.\n"
     "10) «📄 Соглашение» и «🔒 Политика» - документы сервиса, читаются прямо здесь.\n"
     "\n"
-    "Про реакции честно: сервис smmnakrutka.ru принимает заказ раз в 5 минут, при отказе "
-    "про лимит бот сам ждёт час. Сервис отвечает «OK» и через 20 минут, и через 2 часа бот "
-    "пересчитывает реакции под постом - если сервис ничего не добавил, так и будет написано. "
-    "Гарантий бесплатный сервис не даёт ни нам, ни себе.\n"
+    "Про реакции честно: сервис smmnakrutka.ru принимает заказ раз в 5 минут, и каждый новый "
+    "пост ждёт своей очереди отдельно - один пост не вытесняет другой. Если сервис отвечает "
+    "словом «лимит», бот не отступает на час, а пробует тот же пост ещё раз в следующем окне. "
+    "Через 20 минут и через 2 часа бот пересчитывает реакции под постом - если сервис ничего "
+    "не добавил, так и будет написано. Гарантий бесплатный сервис не даёт ни нам, ни себе.\n"
     "\n"
     "Что берется из поста источника: любой пост с текстом. С картинкой - той же картинкой "
     "(ничего не скачивается), альбом - пачкой карточек, без картинки - просто текстом. "
@@ -185,11 +191,12 @@ class Panel:
             await self._show(query, "drop", arg)
         elif key == "drop_yes":
             await self._remove_category(query, arg)
-        elif key in ("add", "channel", "rename", "group", "group_rename"):
+        elif key in ("add", "channel", "rename", "target", "group", "group_rename"):
             self.awaiting = {
                 "add": ("donor", arg),
                 "channel": ("channel", 0),
                 "rename": ("rename", arg),
+                "target": ("target", arg),
                 "group": ("group", 0),
                 "group_rename": ("group_rename", 0),
             }[key]
@@ -426,9 +433,16 @@ class Panel:
             elif kind == "channel":
                 category = await registry.add_category(text[:NAME_LIMIT])
                 self.notice = self._category_notice(
-                    category, f"Канал «{category.target_name or category.name}» добавлен. Теперь добавь канал, откуда берём посты"
+                    category,
+                    f"Тема «{category.name}» создана. Дальше два шага: «📤 Куда постить» и «➕ Читать ещё канал»",
                 )
                 screen = ("cat", category.topic_id)
+            elif kind == "target":
+                category = await registry.set_target(topic_id, text[:NAME_LIMIT])
+                self.notice = self._category_notice(
+                    category, f"Постим в {category.target_name} - название темы осталось «{category.name}»"
+                )
+                screen = ("cat", topic_id)
             elif kind == "group":
                 name = await registry.create_storage_group(text[:NAME_LIMIT])
                 self.notice = (
@@ -456,7 +470,11 @@ class Panel:
                 screen = ("main", 0)
             else:
                 category = await registry.rename_category(topic_id, text[:NAME_LIMIT])
-                self.notice = self._category_notice(category, f"Переименовал в «{category.name}»")
+                self.notice = self._category_notice(
+                    category,
+                    f"Тема переименована в «{category.name}», канал для постов не трогал - "
+                    f"постим в {category.target_name or 'не задано'}",
+                )
                 screen = ("cat", topic_id)
         except (ValueError, StoreError) as exc:
             self.notice = f"⚠ {exc}"
@@ -478,6 +496,8 @@ class Panel:
         """После отказа возвращаемся к тому экрану, где просили ввод, - чтобы можно было написать снова."""
         if kind == "cviews":
             return ("cviews", topic_id)
+        if kind == "target":
+            return ("target", topic_id)
         if kind == "react_link":
             return ("react", 0)
         if kind in ("channel", "group", "group_rename"):
@@ -517,6 +537,8 @@ class Panel:
             return self._new_group_view()
         if kind == "rename":
             return self._rename_view(topic_id)
+        if kind == "target":
+            return self._target_view(topic_id)
         if kind == "drop":
             return self._drop_view(topic_id)
         if kind == "group_rename":
@@ -641,12 +663,13 @@ class Panel:
             )
 
         donors = list(category.donors.values())
-        where = category.target_name or "не определён - сними «🔗 Переименовать»"
+        where = category.target_name or "не задан - нажми «📤 Куда постить»"
         views = self.registry.views_for(category)
         reactions = self.registry.reactions_for(category)
         rewrite = self.registry.rewrite_for(category)
         lines = [
-            f"📢 Канал: {where}",
+            f"📂 Тема в группе: «{category.name}» - это только название для тебя",
+            f"📤 Куда постим: {where}",
             "",
             "1. Откуда берём посты:",
         ]
@@ -688,6 +711,7 @@ class Panel:
             markup(
                 [("➕ Читать ещё канал", f"add|{topic_id}")],
                 *rows,
+                [("📤 Куда постить", f"target|{topic_id}")],
                 [
                     (
                         ("✏️ Текст: переписывает ИИ" if rewrite else "✏️ Текст: словами автора"),
@@ -700,7 +724,7 @@ class Panel:
                         ("🎭 Реакции: ставим" if reactions else "🎭 Реакции: не ставим"),
                         f"cr|{topic_id}",
                     ),
-                    ("🔗 Переименовать", f"rename|{topic_id}"),
+                    ("✏️ Название темы", f"rename|{topic_id}"),
                 ],
                 [("🩺 Проверка: почему не идёт", "check"), ("🗂 Все каналы", "topics")],
                 [("🗑 Убрать этот канал", f"drop|{topic_id}"), ("⬅️ Меню", "main")],
@@ -770,11 +794,12 @@ class Panel:
     def _new_channel_view(self) -> Tuple[str, InlineKeyboardMarkup]:
         return (
             cut(
-                "Напиши название своего канала, куда бот будет постить.\n\n"
-                "Например: Спорт\n\n"
-                "Бот создаст в группе тему с таким названием, а потом ты добавишь в неё каналы, "
-                "откуда берём посты. Бот сам найдёт канал с этим названием и начнёт в него публиковать.\n\n"
-                "Если название темы должно отличаться от названия канала, напиши так: Спорт @sport_ch",
+                "Напиши название - бот создаст с ним тему в группе.\n\n"
+                "Например: спортивные новости\n\n"
+                "Новый канал в Telegram бот не создаёт: название - это только твоя вывеска. "
+                "Канал, куда постить, укажешь кнопкой «📤 Куда постить» - впишешь @юзернейм "
+                "канала, который уже есть. Потом добавишь каналы, откуда берём посты.\n\n"
+                "Если канал с таким же названием уже открыт этому аккаунту, бот подставит его сам.",
                 TEXT_LIMIT,
             ),
             markup([("⬅️ Отмена", "main")]),
@@ -793,12 +818,32 @@ class Panel:
         )
 
     def _rename_view(self, topic_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+        category = self.registry.categories.get(topic_id)
+        label = category.name if category else self._name(topic_id)
         return (
             cut(
-                f"Канал: «{self._name(topic_id)}»\n\n"
-                "Напиши новое название - оно станет и названием темы в группе, и именем канала, "
-                "куда бот постит.\n\n"
-                "Можно указать канал отдельно: Название @username",
+                f"Тема в группе: «{label}»\n\n"
+                "Напиши новое название - оно станет только названием темы в группе.\n"
+                "Канал, куда бот постит, от этого не изменится: для него есть кнопка «📤 Куда постить».\n\n"
+                "Например: спортивные новости",
+                TEXT_LIMIT,
+            ),
+            markup([("⬅️ Отмена", f"cat|{topic_id}")]),
+        )
+
+    def _target_view(self, topic_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+        category = self.registry.categories.get(topic_id)
+        current = (category.target_name or "не задано") if category else "не задано"
+        return (
+            cut(
+                self._with_notice(
+                    f"Тема в группе: «{self._name(topic_id)}»\n"
+                    f"Сейчас постим в: {current}\n\n"
+                    "Напиши @юзернейм канала, куда бот должен постить, например @sport_ch.\n"
+                    "Можно ссылкой https://t.me/sport_ch или id вида -1002088...\n\n"
+                    "Название темы останется как есть - оно только для тебя. Бот новые каналы не создаёт: "
+                    "выбери канал, который уже есть и открыт этому аккаунту."
+                ),
                 TEXT_LIMIT,
             ),
             markup([("⬅️ Отмена", f"cat|{topic_id}")]),
@@ -866,7 +911,8 @@ class Panel:
             "Пришли ссылку на пост: https://t.me/канал/номер (или просто t.me/канал/номер).",
             "Сначала бот откроет этот пост своим аккаунтом: не увидит его - заказ не потратит.",
             "Ручной заказ идёт раньше очереди свежих постов и новым постом не вытесняется.",
-            "Заказы идут раз в 5 минут; если сервис откажет словами про лимит - пауза до часа.",
+            "Заказы идут раз в 5 минут; каждый пост ждёт отдельно, при отказе про лимит "
+            "тот же пост попробуем ещё раз в следующем окне.",
             "",
             reactor.describe(),
             "Ждут заказа:",

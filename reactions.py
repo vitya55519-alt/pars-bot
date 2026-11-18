@@ -5,17 +5,23 @@
 форма уходит в Tilda. Без ключа заказ доходит до формы, но реакции не приходят.
 Мы делаем те же два шага. Про частоту у сервиса написано двояко: на странице
 «побудьте 5 минут - после можете заказать снова», а в правилах «один раз в
-час». Поэтому пробуем раз в 5 минут, а если сервис отказывает словами про
-лимит или час - сами откладываем следующую попытку на час. Что именно ответил
-сервис, каждый раз видно в журнале. Идентификаторы формы взяты из разметки
-страницы - если их поменяют, в журнале станет видно ответ сервиса.
+час». Пробуем раз в 5 минут и не отступаем после слова «лимит»: отказ - это
+потерянное окно сервиса, а не вина поста, поэтому тот же пост попробует ещё раз
+в следующем окне. Что именно ответил сервис, каждый раз видно в журнале.
+Идентификаторы формы взяты из разметки страницы - если их поменяют, в журнале
+станет видно ответ сервиса.
+
+Заказываем каждый новый пост отдельно: чья ссылка ушла раньше, тот пост и
+получит реакции, поэтому никто никого не вытесняет. Очередь не бесконечна -
+когда в ней 20 постов, самый старый снимаем: реакции на вчерашний пост уже не
+нужны.
 
 После заказа бот сам читает реакции под постом (через 20 минут и через два
 часа) и пишет в журнал конкретное число. Число реакций считается и ДО заказа:
 без него «одна реакция под постом» может оказаться подписчиком, а не сервисом.
 Сравнение двух чисел - единственный честный ответ на вопрос «идут реакции или
 нет»: в журнале и в кабинете появляется «сервис добавил 3» или «сервис не
-добавил ничего».
+добавил ничего». На то, ушёл ли заказ, это не влияет: замер только докладывает.
 
 Заказ бывает и ручной: из панели приходят ссылкой на пост, Reactor проверяет,
 что аккаунт этот пост видит, ставит его в ту же очередь - и по завершении сам
@@ -58,9 +64,10 @@ PERMIT_LIMIT = 900
 FORM_ATTEMPTS = 2
 CHECK_DELAYS = (1200, 7200)
 MEASURE_KEEP = 8
-# отказ сервиса со словами про лимит/час: следующую пробу откладываем на час
-RATE_BACKOFF = 3600
-RATE_RE = re.compile(r"\bчас|\bhour|\bлимит|\blimit|уже заказ|подождите", re.IGNORECASE)
+# один пост пробуем два раза: отказ сервиса - не вина поста, в следующем окне попробуем снова
+MAX_TRIES = 2
+# очередь не резина: держим 20 самых свежих постов, старый снимаем - реакции ему уже не нужны
+MAX_QUEUE = 20
 LINK_RE = re.compile(r"t\.me/([^/?#]+)/(\d+)", re.IGNORECASE)
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
@@ -164,6 +171,7 @@ class Entry:
 
     link: str
     manual: bool = False
+    tries: int = 0
     on_done: Optional[Notifier] = field(default=None, repr=False)
     on_added: Optional[DeltaNotifier] = field(default=None, repr=False)
 
@@ -172,7 +180,7 @@ class Entry:
 
 
 class Reactor:
-    """Очередь заказов на всех: пробуем раз в 5 минут, при отказе про лимит - пауза час."""
+    """Очередь заказов на всех: каждый пост ждёт отдельно, проба раз в 5 минут, отказ - не приговор."""
 
     def __init__(self, cfg, session, client=None):
         self.cfg = cfg
@@ -182,6 +190,7 @@ class Reactor:
         self.ordered = 0
         self.failed = 0
         self.skipped = 0
+        self.dropped = 0
         self.last_link = ""
         self.last_error = ""
         self.last_reply = ""
@@ -193,13 +202,13 @@ class Reactor:
         self.poll = PERMIT_POLL
         self.permit_limit = PERMIT_LIMIT
         self._next_slot = 0.0
-        # ключ: канал для заказа со страницы, сама ссылка для ручного - так ручной не вытесняется новым постом
+        # ключ очереди - ссылка поста: постов в порядке столько, сколько выходило, никто не вытесняет
         self._queue: "OrderedDict[str, Entry]" = OrderedDict()
         self._worker: asyncio.Task | None = None
         self._checks: Set[asyncio.Task] = set()
 
     def schedule(self, message, on_added: Optional[DeltaNotifier] = None) -> None:
-        """Автозаказ: у канала в порядке держится один, самый свежий его пост.
+        """Автозаказ: под каждый новый пост - своя ссылка в очередь.
 
         `on_added` - callback клиента: сколько реакций добавил сервис по замеру
         «до/после». Без него живёт только журнал, с ним - цифра в кабинете.
@@ -213,17 +222,27 @@ class Reactor:
             log.info("Реакции: у канала нет публичной ссылки - сервис не увидит пост, пропускаю.")
             return
 
-        username, _ = parse_link(link)
         if self._find(link) is not None:
-            log.info("Реакции: %s уже ждёт отдельного заказа - в общий порядок его не ставлю.", short(link))
+            log.info("Реакции: %s уже ждёт заказа - второй такой же заказ не ставлю.", short(link))
             return
 
-        old = self._queue.get(username)
-        if old:
-            log.info("Реакции: %s уже ждёт заказа - ставлю вместо него %s.", short(old.link), short(link))
-        self._queue[username] = Entry(link, on_added=on_added)
-        self._queue.move_to_end(username)
+        self._queue[link] = Entry(link, on_added=on_added)
+        self._trim()
         self._ensure_worker()
+
+    def _trim(self) -> None:
+        """Очередь ограничена: самый старый пост уступает место свежему, ручные заказы не трогаем."""
+        while len(self._queue) > MAX_QUEUE:
+            key = next((k for k, entry in self._queue.items() if not entry.manual), None)
+            if key is None:
+                return
+            entry = self._queue.pop(key)
+            self.dropped += 1
+            log.info(
+                "Реакции: очередь из %s постов переполнена - снимаю %s, он уже не свежий.",
+                MAX_QUEUE,
+                short(entry.link),
+            )
 
     async def request(self, raw: str, on_done: Optional[Notifier] = None) -> str:
         """Ручной заказ из панели.
@@ -249,6 +268,7 @@ class Reactor:
 
         ahead = sum(1 for entry in self._queue.values() if entry.manual)
         self._queue[link] = Entry(link, manual=True, on_done=on_done)
+        self._trim()
         self._ensure_worker()
         log.info("Реакции: ручной заказ %s, перед ним в очереди %s.", short(link), ahead)
         return (
@@ -309,11 +329,17 @@ class Reactor:
         return f"следующее окно сервиса через {human(remaining)}"
 
     def queue_lines(self) -> List[str]:
-        """Очередь глазами панели: что ждёт заказа и в каком порядке."""
+        """Очередь глазами панели: что ждёт заказа и в каком порядке (ручные - первыми)."""
         if not self._queue:
             return ["    заказов никто не ждёт"]
         order = sorted(self._queue.values(), key=lambda entry: not entry.manual)
-        return [f"    {short(entry.link)} - {'ручной заказ' if entry.manual else 'самый свежий пост'}" for entry in order]
+        lines = [
+            f"    {short(entry.link)} - {'ручной заказ' if entry.manual else 'ждёт своей очереди'}"
+            for entry in order[:10]
+        ]
+        if len(order) > 10:
+            lines.append(f"    ...и ещё {len(order) - 10}")
+        return lines
 
     def _reserve(self) -> float:
         now = time.monotonic()
@@ -332,21 +358,28 @@ class Reactor:
             entry = self._take(key)
             if entry is None:
                 continue
+            entry.tries += 1
             try:
                 body = await self.order(entry.link, entry.on_added)
                 await self._tell(entry, self._done_text(entry.link, body, self.last_baseline))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - реакции не должны влиять на публикацию
-                self.failed += 1
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 log.warning("Реакции: заказ для %s не отправился (%s).", entry.link, self.last_error)
-                if RATE_RE.search(str(exc)):
-                    self._next_slot = max(self._next_slot, time.monotonic() + RATE_BACKOFF)
-                    log.warning(
-                        "Реакции: сервис ответил отказом про лимит - следующая проба не раньше чем через час."
+                if entry.tries < MAX_TRIES:
+                    # «лимит» от сервиса - не вина поста: ставим в конец и пробуем в следующем окне
+                    self._queue[entry.link] = entry
+                    log.info(
+                        "Реакции: %s попробую ещё раз (попытка %s из %s) - окно сервиса освободится через %s.",
+                        short(entry.link),
+                        entry.tries + 1,
+                        MAX_TRIES,
+                        human(self.cfg.reactions_interval),
                     )
-                await self._tell(entry, f"⚠ Реакции для {short(entry.link)} не заказались: {self.last_error}")
+                else:
+                    self.failed += 1
+                    await self._tell(entry, f"⚠ Реакции для {short(entry.link)} не заказались: {self.last_error}")
 
     def _done_text(self, link: str, body: str, baseline: int = -1) -> str:
         return (
@@ -503,7 +536,8 @@ class Reactor:
         hand = f", из них ручных {manual}" if manual else ""
         fails = f", сбоев {self.failed}" if self.failed else ""
         skipped = f", пропущено {self.skipped}" if self.skipped else ""
-        return f"Реакции: {state}{done}{result}{queue}{hand}{fails}{skipped}"
+        dropped = f", снято со старья {self.dropped}" if self.dropped else ""
+        return f"Реакции: {state}{done}{result}{queue}{hand}{fails}{skipped}{dropped}"
 
     def report(self) -> str:
         """Показывает очередь и замеры в панели: без журнала видно, дошли ли реакции до поста."""

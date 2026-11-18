@@ -1,7 +1,9 @@
-"""Реестр доноров живёт в форум-группе: тема = категория, название темы = целевой канал.
+"""Реестр доноров живёт в форум-группе: тема = канал владельца, название темы - его вывеска.
 
-Своих файлов и базы нет - источник истины только Telegram, поэтому после
-перезапуска Railway список восстанавливается одним rebuild().
+Канал, куда постить, задаётся отдельно: явно вписанным @юзернеймом (служебное
+сообщение темы) или, если его не вписывали, названием темы. Своих файлов и базы
+нет - источник истины только Telegram, поэтому после перезапуска Railway список
+восстанавливается одним rebuild().
 """
 
 import asyncio
@@ -29,12 +31,15 @@ REACTIONS_RE = re.compile(r"реакции\s*[:=]\s*(вкл|выкл)", re.I)
 REACTIONS_TEXT = "Реакции: {}"
 REWRITE_RE = re.compile(r"переписывание\s*[:=]\s*(вкл|выкл)", re.I)
 REWRITE_TEXT = "Переписывание: {}"
+TARGET_RE = re.compile(r"куда\s+постить\s*[:=]\s*(\S+)", re.I)
+TARGET_TEXT = "Куда постить: {}"
 PUBLIC_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{4,31})", re.I)
 PRIVATE_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/c/(\d{4,20})", re.I)
 INVITE_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:\+|joinchat/)\S+", re.I)
 MENTION_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_]{4,31})")
 NUMERIC_ID_RE = re.compile(r"(?<!\d)(-100\d{8,16})(?!\d)")
 BARE_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
+ANY_ID_RE = re.compile(r"^-?\d{3,20}$")
 DONOR_TYPES = (ChatType.CHANNEL, ChatType.SUPERGROUP, ChatType.GROUP)
 
 
@@ -74,6 +79,10 @@ class Category:
     donors: Dict[int, Donor] = field(default_factory=dict)
     target: Optional[ChatRef] = None
     target_name: str = ""
+    # канал, куда постить, вписанный явно: @юзернейм, ссылка или id - он важнее названия темы
+    target_ref: str = ""
+    # как Telegram назвал этот канал (username или id) - этим и закрепляем цель при переименовании
+    target_link: str = ""
     problem: str = ""
     # свои настройки канала: None значит «не задано» - берётся значение по умолчанию
     views: Optional[int] = None
@@ -229,7 +238,8 @@ class Registry:
         views_match = VIEWS_RE.search(text)
         reactions_match = REACTIONS_RE.search(text)
         rewrite_match = REWRITE_RE.search(text)
-        if not views_match and not reactions_match and not rewrite_match:
+        target_match = TARGET_RE.search(text)
+        if not views_match and not reactions_match and not rewrite_match and not target_match:
             return False
         if message_id <= (category.settings_message or 0):
             return True
@@ -242,6 +252,8 @@ class Registry:
             category.reactions = reactions_match.group(1).casefold() == "вкл"
         if rewrite_match:
             category.rewrite = rewrite_match.group(1).casefold() == "вкл"
+        if target_match:
+            category.target_ref = target_match.group(1).strip()
         return True
 
     async def _absorb(self, text: str, message_id: int, category: Category) -> List[Donor]:
@@ -293,19 +305,33 @@ class Registry:
         return Donor(chat.id, chat_name(chat), str(ref), message_id)
 
     async def _resolve_target(self, category: Category) -> None:
-        ref = self._target_ref(category.name)
+        """Канал, куда постим: сначала вписанный явно, иначе - по названию темы (старый способ)."""
+        ref = self._target_ref(category.target_ref or category.name)
         if ref is None:
-            category.target = None
-            category.problem = f"нет канала с названием «{category.name}»"
+            self._forget_target(
+                category,
+                f"нет канала для постов: по названию «{category.name}» ничего не нашлось - "
+                "нажми «📤 Куда постить»",
+            )
             return
         try:
             chat = await call(self.client.get_chat, ref)
         except Exception as exc:  # noqa: BLE001
-            category.problem = f"канал {ref} не открылся ({type(exc).__name__})"
+            self._forget_target(category, f"канал {ref} не открылся ({type(exc).__name__})")
             return
         category.target = chat.id
         category.target_name = chat_name(chat)
+        username = getattr(chat, "username", "") or ""
+        category.target_link = f"@{username}" if username else str(chat.id)
         self.target_ids.add(chat.id)
+
+    @staticmethod
+    def _forget_target(category: Category, problem: str) -> None:
+        """Цели нет - и экран не должен врать старым названием канала: чистим всё, что показали."""
+        category.target = None
+        category.target_name = ""
+        category.target_link = ""
+        category.problem = problem
 
     def _target_ref(self, name: str) -> Optional[ChatRef]:
         refs = extract_refs(name)
@@ -314,6 +340,9 @@ class Registry:
         match_title = self._titles.get(norm_title(name))
         if match_title is not None:
             return match_title
+        if ANY_ID_RE.match(name.strip()):
+            # id канала, записанный как есть: его мы сами подставляем, когда закрепляем цель
+            return int(name.strip())
         if BARE_USERNAME_RE.match(name.strip()):
             return name.strip().lower()
         return None
@@ -345,6 +374,9 @@ class Registry:
         """Новое сообщение в группе: ссылки в теме сразу становятся донорами."""
         text = message.text or ""
         if not text or not self.ready or not extract_refs(text):
+            return []
+        if TARGET_RE.search(text):
+            # это наше служебное сообщение: там @юзернейм канала, куда постим, а не источник постов
             return []
 
         topic_id = int(getattr(message, "message_thread_id", 0) or 0)
@@ -409,6 +441,7 @@ class Registry:
         return category
 
     async def rename_category(self, topic_id: int, name: str) -> Category:
+        """Меняет только название темы. Канал, куда постить, остаётся тем же."""
         clean = " ".join((name or "").split())[:TOPIC_NAME_LIMIT]
         category = self._category(topic_id)
         if not clean:
@@ -416,14 +449,54 @@ class Registry:
 
         async with self.lock:
             await call(self.client.edit_forum_topic, self.group_id, topic_id, clean)
+            if not category.target_ref and category.target_link:
+                # цель была найдена по старому названию: закрепляем её, иначе переименование
+                # просто оставило бы канал без адреса, а посты перестали бы публиковаться
+                category.target_ref = category.target_link
             old = category.target
             category.name = clean
             category.problem = ""
             await self._resolve_target(category)
+            await self._write_settings(category)
             if old and old not in (c.target for c in self.categories.values()):
                 self.target_ids.discard(old)
             self._reindex()
+        log.info("Тема %s теперь называется «%s», постит в %s.", topic_id, category.name, category.target_link or "некуда")
         return category
+
+    async def set_target(self, topic_id: int, text: str) -> Category:
+        """Явно задаём канал, куда постить: @юзернейм, ссылка t.me/... или id вида -100..."""
+        category = self._category(topic_id)
+        refs = extract_refs(text or "")
+        if not refs:
+            raise RegistryError("Нужен @юзернейм канала, ссылка https://t.me/... или id вида -1002088...")
+        async with self.lock:
+            old = category.target
+            # снимок того, что было: при отказе возвращаем ровно это, а не ищем заново по названию
+            before = (category.target_ref, category.target, category.target_name, category.target_link, category.problem)
+            category.target_ref = self._ref_text(refs[0])
+            category.problem = ""
+            await self._resolve_target(category)
+            if category.problem:
+                reason = category.problem
+                (category.target_ref, category.target, category.target_name, category.target_link,
+                 category.problem) = before
+                raise RegistryError(
+                    f"Канал {text.strip()} не подошёл: {reason}. "
+                    "Проверь @юзернейм или подпишись этим аккаунтом на канал."
+                )
+            await self._write_settings(category)
+            if old and old != category.target and old not in {c.target for c in self.categories.values()}:
+                self.target_ids.discard(old)
+            self._reindex()
+        log.info("Канал «%s» постит в %s.", category.name, category.target_name)
+        return category
+
+    @staticmethod
+    def _ref_text(ref: ChatRef) -> str:
+        """Как записать канал в служебное сообщение: @юзернейм читабельнее, чем голое слово."""
+        text = str(ref).strip()
+        return f"@{text}" if BARE_USERNAME_RE.match(text) else text
 
     async def remove_category(self, topic_id: int) -> Category:
         """Убирает канал целиком: тема удаляется, её доноры перестают ловиться."""
@@ -500,6 +573,8 @@ class Registry:
     async def _write_settings(self, category: Category) -> None:
         """Одно служебное сообщение на тему: в нём только то, что задано явно."""
         lines = []
+        if category.target_ref:
+            lines.append(TARGET_TEXT.format(category.target_ref))
         if category.views is not None:
             lines.append(VIEWS_TEXT.format(category.views))
         if category.reactions is not None:
@@ -507,6 +582,9 @@ class Registry:
         if category.rewrite is not None:
             lines.append(REWRITE_TEXT.format("вкл" if category.rewrite else "выкл"))
         text = "\n".join(lines)
+        if not text:
+            # писать нечего: тема без явных настроек остаётся чистой, пустое сообщение Telegram не примет
+            return
         try:
             if category.settings_message:
                 await call(self.client.edit_message_text, self.group_id, category.settings_message, text)
@@ -529,8 +607,8 @@ class Registry:
             raise RegistryError("Это не ссылка на канал. Нужен @юзернейм или https://t.me/...")
         if not category.target:
             raise RegistryError(
-                f"У темы «{category.name}» нет целевого канала - постить некуда. "
-                "Переименуй тему в название или ссылку канала, куда постить."
+                f"У темы «{category.name}» нет канала, куда постить. "
+                "Нажми «📤 Куда постить» и пришли @юзернейм канала."
             )
 
         posted = await call(self.client.send_message, self.group_id, text, message_thread_id=topic_id)

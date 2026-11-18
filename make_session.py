@@ -25,6 +25,7 @@ ENV_FILE = os.path.join(ROOT, ".env")
 JOURNAL = os.path.join(ROOT, "login_journal.txt")
 SESSION_FILE = os.path.join(ROOT, "login.session")
 MAX_CODE_TRIES = 6
+MAX_PASSWORD_TRIES = 4
 
 
 def step(text: str) -> None:
@@ -200,6 +201,44 @@ QR_HINT = (
 )
 
 
+async def unlock_with_password(client: Client) -> None:
+    """QR подтверждён, но аккаунт защищает облачный пароль (2FA) - спрашиваем его здесь.
+
+    У либы на этом шаге свой ввод, а он читает консоль из пула потоков и теряет окно,
+    поэтому пароль просим сами. Значение никуда не печатаем: в журнале только шаги.
+    """
+    hint = ""
+    try:
+        hint = (await client.get_password_hint()) or ""
+    except Exception:  # noqa: BLE001 - без подсказки вход всё равно возможен
+        pass
+    step(f"Аккаунт требует облачный пароль{': подсказка - ' + hint if hint else ''}")
+
+    for attempt in range(1, MAX_PASSWORD_TRIES + 1):
+        password = read_secret(f"Облачный пароль (попытка {attempt}/{MAX_PASSWORD_TRIES}): ")
+        try:
+            await client.check_password(password)
+        except SessionPasswordNeeded:
+            step("Telegram по-прежнему просит пароль - этот не подошёл, напиши ещё раз")
+            continue
+        except FloodWait as exc:
+            wait = int(getattr(exc, "value", 0) or 0)
+            step(f"Telegram просит подождать {wait} сек перед новой попыткой - жду")
+            await asyncio.sleep(wait + 1)
+        except Exception as exc:  # noqa: BLE001 - тип ошибки показываем, пароль нет
+            name = type(exc).__name__
+            if "Password" in name or "Unauthorized" in name or "Session" in name:
+                step(f"Telegram отверг пароль ({name}) - попробуем ещё раз")
+                continue
+            step(f"Вход с паролем не удался: {name}")
+            raise
+        step("Облачный пароль принят")
+        return
+
+    step(f"Пароль так и не подошёл после {MAX_PASSWORD_TRIES} попыток")
+    raise SystemExit(1)
+
+
 async def authenticate_by_qr(client: Client) -> None:
     """Вход по QR: Telegram не выдаёт коды, поэтому ждёт сканирования картинки."""
     try:
@@ -243,6 +282,12 @@ async def authenticate_by_qr(client: Client) -> None:
             except (asyncio.TimeoutError, AuthTokenExpired):
                 step("QR-код истёк - показываю новый, отсканируй его.")
                 continue
+            except SessionPasswordNeeded:
+                # Телефон уже подтвердил код, но сверху стоит облачный пароль:
+                # спрашиваем его в этом окне и заканчиваем вход без нового сканирования.
+                await unlock_with_password(client)
+                step("Вход по QR завершён (с облачным паролем).")
+                return
 
             if user:
                 step(f"QR подтверждён, вошли под аккаунтом id {user.id}")

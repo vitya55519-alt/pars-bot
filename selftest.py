@@ -862,7 +862,7 @@ async def check_manual_reaction():
     check("о результате написали в чат панели", any("Заказ реакций ушёл" in text for text in told), str(client.sent[-1:]))
     check("в докладе есть ответ сервиса", any("сервис ответил «OK»" in text for text in told), str(told[:1]))
 
-    # окно сервиса закрыто на час: заказ постойт в очереди, тогда видно повтор
+    # окно сервиса занято прошлым заказом: новый стоит в очереди, тогда видно повтор
     reactor._next_slot = time.monotonic() + 3600
     await panel.on_button(client, press("react"))
     await panel.on_message(client, Message(client, 9103, owner, text="t.me/yumor_ch/77"))
@@ -1459,13 +1459,22 @@ async def check_failures():
     broken_ref = FakeClient()
     group = broken_ref.add_chat(Chat(-10010, title="Панель", chat_type=ChatType.SUPERGROUP, is_forum=True))
     broken_ref.add_chat(Chat(-10020, title="Спорт", chat_type=ChatType.CHANNEL))
-    broken_ref.topics[-10010] = [Topic(31, "Спорт"), Topic(32, "Нет такого канала")]
-    broken_ref.group_messages = [Message(broken_ref, 1, group, text="@ghost_channel", thread=31)]
+    broken_ref.add_chat(Chat(-10021, title="Прочее", username="other_ch", chat_type=ChatType.CHANNEL))
+    broken_ref.topics[-10010] = [Topic(31, "Спорт"), Topic(32, "Нет такого канала"), Topic(33, "Зеркало")]
+    broken_ref.group_messages = [
+        Message(broken_ref, 1, group, text="@ghost_channel", thread=31),
+        Message(broken_ref, 2, group, text="Куда постить: @other_ch", thread=33),
+    ]
     registry6 = Registry(broken_ref, make_cfg())
     await registry6.rebuild()
     check("битая ссылка не рвёт сборку", registry6.ready and registry6.unreadable == ["ghost_channel"], str(registry6.unreadable))
     check("тема без канала помечена", "нет канала" in registry6.categories[32].problem, registry6.categories[32].problem)
     check("замечания видны в /статус", any("нет канала" in line for line in registry6.problems()), str(registry6.problems()))
+    check("цель из темы важнее её названия",
+          registry6.categories[33].target == -10021 and registry6.categories[33].target_name == "@other_ch",
+          registry6.categories[33].describe())
+    check("служебное сообщение не стало источником постов", not registry6.categories[33].donors,
+          str(registry6.categories[33].donors))
 
 
 async def check_panel():
@@ -1475,7 +1484,7 @@ async def check_panel():
     client = world["client"]
     group = world["group"]
     fitnes = client.add_chat(Chat(-10081, title="Фитнес", chat_type=ChatType.CHANNEL))
-    yoga = client.add_chat(Chat(-10082, title="Йога", chat_type=ChatType.CHANNEL))
+    yoga = client.add_chat(Chat(-10082, title="Йога", username="yoga_ch", chat_type=ChatType.CHANNEL))
     new_donor = client.add_chat(Chat(-10080, title="Бег", username="donor_run"))
     owner = client.add_user(User(777, "Витя"))
     stranger = client.add_user(User(888, "Чужой"))
@@ -1523,9 +1532,10 @@ async def check_panel():
 
     await panel.on_button(client, press("cat|21"))
     check("экран канала показывает, откуда берём посты", "Откуда берём посты" in last_edit() and "@donor_sport_1" in last_edit(), last_edit()[:200])
-    check("экран канала называет канал публикации", "Канал: Спорт" in last_edit(), last_edit()[:160])
+    check("экран канала называет канал публикации", "Куда постим: Спорт" in last_edit() and "Тема в группе: «Спорт»" in last_edit(), last_edit()[:160])
     check("экран канала показывает текст, просмотры и реакции", "Что делаем с текстом:" in last_edit() and "3. Просмотры:" in last_edit() and "4. Реакции:" in last_edit(), last_edit()[:300])
     check("у канала свои кнопки настроек", "cv|21" in last_buttons() and "cr|21" in last_buttons() and "cw|21" in last_buttons(), str(last_buttons()))
+    check("у канала есть кнопка выбора адреса и кнопки названия", "target|21" in last_buttons() and "rename|21" in last_buttons(), str(last_buttons()))
     check("источник отключается кнопкой ✖", "del|21|1" in last_buttons(), str(last_buttons()))
     await panel.on_button(client, press("topics"))
     check("список каналов назван", "Спорт" in last_edit() and "@yumor_ch" in last_edit(), last_edit()[:200])
@@ -1565,16 +1575,37 @@ async def check_panel():
     fitness_topic = next(id_ for id_, category in registry.categories.items() if category.name == "Фитнес")
     check("тема для нового канала создана", any(topic.id == fitness_topic for topic in client.topics[group.id]))
     check("канал привязан по названию", registry.categories[fitness_topic].target == fitnes.id)
-    check("добавление подтверждено", "добавлен" in last_reply()[1], last_reply()[1][:80])
+    check("добавление подтверждено", "создана" in last_reply()[1], last_reply()[1][:80])
     await panel.on_button(client, press("channel"))
     await panel.on_message(client, Message(client, 5008, owner, text="Фитнес"))
     check("дубликат канала отклонён", "уже есть" in last_reply()[1], last_reply()[1][:80])
 
     await panel.on_button(client, press(f"rename|{fitness_topic}"))
+    check("кнопка названия обещает не трогать канал", "не изменится" in last_edit(), last_edit()[:140])
     await panel.on_message(client, Message(client, 5009, owner, text="Йога"))
     category = registry.categories[fitness_topic]
-    check("канал переименован", category.name == "Йога" and category.target == yoga.id, f"{category.name} -> {category.target_name}")
+    check("переименование темы оставило канал для постов",
+          category.name == "Йога" and category.target == fitnes.id, f"{category.name} -> {category.target_name}")
     check("тема переименована в группе", client.topic_edits[-1] == (fitness_topic, "Йога"), str(client.topic_edits))
+    check("канал для постов записан в тему",
+          any("Куда постить" in text for _chat, text, thread in client.topic_posts if thread == fitness_topic),
+          str(client.topic_posts[-3:]))
+
+    await panel.on_button(client, press(f"target|{fitness_topic}"))
+    check("кнопка куда постить просит канал", "@юзернейм канала" in last_edit(), last_edit()[:140])
+    await panel.on_message(client, Message(client, 5014, owner, text="привет"))
+    check("не канал для постов отклонён", "Нужен @юзернейм" in last_reply()[1], last_reply()[1][:120])
+    await panel.on_button(client, press(f"target|{fitness_topic}"))
+    await panel.on_message(client, Message(client, 5015, owner, text="@ghost_channel"))
+    check("неоткрытый канал для постов отклонён", "не подошёл" in last_reply()[1], last_reply()[1][:120])
+    check("и прежняя цель не сбросилась", registry.categories[fitness_topic].target == fitnes.id,
+          str(registry.categories[fitness_topic].target))
+    await panel.on_button(client, press(f"target|{fitness_topic}"))
+    await panel.on_message(client, Message(client, 5016, owner, text="@yoga_ch"))
+    check("канал для постов задан вручную", registry.categories[fitness_topic].target == yoga.id,
+          str(registry.categories[fitness_topic].target))
+    check("название темы при этом наше", registry.categories[fitness_topic].name == "Йога",
+          registry.categories[fitness_topic].name)
 
     await panel.on_button(client, press("pause"))
     check("пауза кнопкой", registry.paused is True and "пауза" in last_edit(), last_edit()[:80])
@@ -1755,7 +1786,7 @@ async def check_panel_login_flood():
 
 async def check_reactions():
     print("\n[12] Бесплатные реакции на посты")
-    from reactions import FORM_URL, PERMIT_URL, Reactor, post_link, short
+    from reactions import FORM_URL, PERMIT_URL, Reactor, ReactionsError, post_link, short
 
     client = FakeClient()
     yumor = client.add_chat(Chat(-10030, title="Юмор канала", username="yumor_ch", chat_type=ChatType.CHANNEL))
@@ -1819,10 +1850,14 @@ async def check_reactions():
         silent.last_error,
     )
 
-    broken = reactor([permit(), FakeResponse(502, text="Bad Gateway")])
+    broken = reactor([permit(), FakeResponse(502, text="Bad Gateway"), permit(), FakeResponse(200, text="OK")])
     broken.schedule(published)
     await asyncio.sleep(0.05)
-    check("сбой сервиса - только журнал", broken.failed == 1 and "Bad Gateway" in broken.last_error, broken.last_error)
+    check(
+        "сбой сервиса не теряет пост: вторая проба его добирает",
+        broken.ordered == 1 and broken.failed == 0 and not broken._queue and len(broken.session.calls) == 4,
+        f"{broken.ordered}/{broken.failed} {broken.last_error}",
+    )
 
     drop = aiohttp.ClientError("обрыв соединения")
     again = reactor([permit(), drop, FakeResponse(200, text="OK")])
@@ -1833,10 +1868,14 @@ async def check_reactions():
         again.ordered == 1 and again.failed == 0 and len(again.session.calls) == 3,
         f"{again.ordered}/{again.failed} {again.last_error}",
     )
-    never = reactor([permit(), drop, drop])
+    never = reactor([permit(), drop, drop, permit(), drop, drop])
     never.schedule(published)
     await asyncio.sleep(0.05)
-    check("два обрыва - заказ отпадает с объяснением", never.failed == 1 and "ClientError" in never.last_error, never.last_error)
+    check(
+        "после двух неудач пост отпускаем с объяснением",
+        never.failed == 1 and not never._queue and "ClientError" in never.last_error and len(never.session.calls) == 6,
+        f"{never.ordered}/{never.failed} {never.last_error}",
+    )
 
     off_session = FakeSession([permit(), FakeResponse(200, text="OK")])
     off = Reactor(make_cfg(reactions_enabled=False), off_session)
@@ -1862,9 +1901,10 @@ async def check_reactions():
     await asyncio.sleep(0.05)
     check("первый пост заказал сразу", len(queued.calls) == 2, str(len(queued.calls)))
     check(
-        "второй канал ждёт своего часа",
-        len(hour._queue) == 1 and short(hour._queue["bank_ch"].link) == "bank_ch/81",
-        str(list(hour._queue.items())),
+        "каждый свежий пост ждёт своего окна отдельно",
+        len(hour._queue) == 2
+        and sorted(short(entry.link) for entry in hour._queue.values()) == ["bank_ch/81", "yumor_ch/79"],
+        str(list(hour._queue)),
     )
     hour._worker.cancel()
     await asyncio.sleep(0.05)
@@ -1875,12 +1915,25 @@ async def check_reactions():
         pile.schedule(Message(client, 100 + index, bank, caption="текст", photo=Photo(f"p{index}")))
     pile.schedule(published)
     check(
-        "у канала в очереди один, самый свежий пост",
-        len(pile._queue) == 2 and short(pile._queue["bank_ch"].link) == "bank_ch/109",
-        str(list(pile._queue.items())),
+        "посты ждут все вместе, новый не вытесняет старый",
+        len(pile._queue) == 11 and "https://t.me/bank_ch/100?single" in pile._queue
+        and "https://t.me/bank_ch/109?single" in pile._queue,
+        str(len(pile._queue)),
     )
     check("посты не теряются молча", pile.skipped == 0, str(pile.skipped))
     pile._worker.cancel()
+    await asyncio.sleep(0.05)
+
+    crowd = reactor([], reactions_interval=3600)
+    for index in range(25):
+        crowd.schedule(Message(client, 200 + index, bank, caption="текст", photo=Photo(f"c{index}")))
+    check(
+        "очередь держит 20 самых свежих постов",
+        len(crowd._queue) == 20 and crowd.dropped == 5 and "https://t.me/bank_ch/204?single" not in crowd._queue,
+        f"{len(crowd._queue)} / снято {crowd.dropped}",
+    )
+    check("и снятые посты видны в докладе", "снято со старья 5" in crowd.describe(), crowd.describe())
+    crowd._worker.cancel()
     await asyncio.sleep(0.05)
 
     live_cfg = make_cfg(reactions_enabled=True)
@@ -1901,14 +1954,27 @@ async def check_reactions():
     check("по умолчанию заказ раз в 5 минут", Config(api_id=1, api_hash="h", session_string="s").reactions_interval == 300,
           str(Config(api_id=1, api_hash="h", session_string="s").reactions_interval))
 
-    refused = reactor([permit(), FakeResponse(200, text="Лимит: один заказ в час, подождите")])
+    refused = reactor([permit(), FakeResponse(200, text="Лимит: один заказ в час, подождите"),
+                       permit(), FakeResponse(200, text="OK")])
     refused.schedule(published)
     await asyncio.sleep(0.05)
     check(
-        "отказ про лимит откладывает следующую пробу на час",
-        refused.failed == 1 and refused._next_slot - time.monotonic() > 3500,
-        f"{refused.last_error} / {refused._next_slot - time.monotonic():.0f}",
+        "ответ про лимит не откатывает на час: тот же пост пробуется снова",
+        refused.ordered == 1 and refused.failed == 0 and not refused._queue
+        and refused._next_slot - time.monotonic() < 600,
+        f"{refused.ordered}/{refused.failed} {refused.last_error} / {refused._next_slot - time.monotonic():.0f}",
     )
+
+    denied = reactor([ReactionsError("Лимит: попробуй позже")], reactions_interval=300)
+    denied.schedule(published)
+    await asyncio.sleep(0.05)
+    check(
+        "отказ сервиса - не час, а вторая проба в следующем окне",
+        denied.ordered == 0 and denied.failed == 0 and len(denied._queue) == 1
+        and 0 < denied._next_slot - time.monotonic() < 600,
+        f"{denied.ordered}/{denied.failed} {denied.last_error} / {denied._next_slot - time.monotonic():.0f}",
+    )
+    denied._worker.cancel()
     plain = reactor([permit(), FakeResponse(502, text="Bad Gateway")])
     plain.schedule(published)
     await asyncio.sleep(0.05)
@@ -2974,9 +3040,11 @@ async def check_tenants():
     check("клиенту идут его просмотры", "1000" in numbers, str(numbers))
     check("складу - число из переменной", "25" in numbers, str(numbers))
     check("нулевые просмотры не отправляются", "0" not in numbers, str(numbers))
-    check("в порядке реакций только согласившийся", "client_a_ch" in bot.reactions._queue and "client_b_ch" not in bot.reactions._queue,
-          str(list(bot.reactions._queue)))
-    entry = bot.reactions._queue.get("client_a_ch")
+    queued_links = list(bot.reactions._queue)
+    check("в порядке реакций только согласившийся",
+          any("client_a_ch" in link for link in queued_links) and not any("client_b_ch" in link for link in queued_links),
+          str(queued_links))
+    entry = next((item for item in bot.reactions._queue.values() if "client_a_ch" in item.link), None)
     check("клиенту обещан замер: есть кому вернуть дельту", entry is not None and entry.on_added is not None, str(entry))
     check("пост клиента засчитан в суточный лимит", store.usage[5001] == 1 and store.usage[5002] == 1, str(store.usage))
     check("кабинету виден номер и время поста", store.tenants[5001].last_post_id > 0 and store.tenants[5001].last_post_at is not None,

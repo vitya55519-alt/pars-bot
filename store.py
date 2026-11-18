@@ -1,14 +1,16 @@
-"""База клиентов: кто платит, кого читаем и куда постим.
+"""База: клиенты и каналы владельца - кто платит, кого читаем и куда постим.
 
-Склад-группа в Telegram остаётся только для личного режима. Когда клиентов
-несколько, источник истины - Postgres: там баланс, срок тарифа, свой канал и
-свой список доноров на каждого.
+Склад-группа в Telegram остаётся только для личного режима и как зеркало списка.
+Когда клиентов несколько, источник истины - Postgres: там баланс, срок тарифа,
+свой канал и свой список доноров на каждого. Каналы самого владельца живут здесь
+же (owner_channels, owner_donors): группа с темами больше не список, она показывает
+то, что уже лежит в базе.
 """
 
 import datetime
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Union
 
 import asyncpg
@@ -131,6 +133,45 @@ class Donor:
     ref: str
     chat_id: Optional[int] = None
     title: str = ""
+
+
+@dataclass
+class OwnerDonor:
+    """Канал, откуда берём посты, - один ряд в базе для одного канала владельца.
+
+    message_id - id сообщения-зеркала в теме группы: по нему источник убирается
+    командой /убери, когда человек ответил на это сообщение.
+    """
+
+    channel_id: int
+    chat_id: int
+    id: int = 0
+    ref: str = ""
+    name: str = ""
+    message_id: int = 0
+
+
+@dataclass
+class OwnerChannel:
+    """Канал владельца: куда постим, какие настройки, откуда берём посты.
+
+    id - число, которым канал знает панель (кнопки cat|<id>); при переносе из
+    группы им остаётся id темы, поэтому старые кнопки не ломаются.
+    topic_id - id темы-зеркала в группе, 0 - темы ещё нет.
+    target_ref - канал, куда постить, вписанный человеком (@юзернейм или id). name при
+    этом только название темы: переименование не должно менять адресата.
+    """
+
+    id: int
+    name: str
+    topic_id: int = 0
+    target: Optional[int] = None
+    target_name: str = ""
+    target_ref: str = ""
+    views: Optional[int] = None
+    reactions: Optional[bool] = None
+    rewrite: Optional[bool] = None
+    donors: List[OwnerDonor] = field(default_factory=list)
 
 
 class StoreError(Exception):
@@ -446,6 +487,133 @@ class Store:
             rows = await con.fetch("SELECT * FROM tenants WHERE target <> '' AND target_ok = FALSE ORDER BY id")
         return [_tenant(row) for row in rows]
 
+    # ==== каналы владельца ====
+
+    # Список каналов раньше жил только в темах группы. Теперь он здесь, а группа -
+    # зеркало для глаз: её перечитывать не нужно, и правки в ней не властвуют.
+
+    async def list_owner_channels(self) -> List[OwnerChannel]:
+        """Все каналы владельца вместе с их источниками - одним проходом за рядами."""
+        async with self.pool.acquire() as con:
+            rows = await con.fetch("SELECT * FROM owner_channels ORDER BY id")
+            donor_rows = await con.fetch("SELECT * FROM owner_donors ORDER BY id")
+        channels = {int(row["id"]): _owner_channel(row) for row in rows}
+        for row in donor_rows:
+            channel = channels.get(int(row["channel_id"]))
+            if channel is not None:
+                channel.donors.append(_owner_donor(row))
+        return list(channels.values())
+
+    async def count_owner_channels(self) -> int:
+        async with self.pool.acquire() as con:
+            return int(await con.fetchval("SELECT count(*) FROM owner_channels") or 0)
+
+    async def add_owner_channel(self, channel: OwnerChannel) -> OwnerChannel:
+        """Запоминаем канал и возвращаем номер, под которым его знает база.
+
+        При переносе из группы id задаём явно - это id темы, поэтому кнопки панели,
+        которые человек нажимал раньше, продолжают вести к тому же каналу.
+        """
+        columns = (channel.name, channel.topic_id, channel.target, channel.target_name,
+                   channel.target_ref, channel.views, channel.reactions, channel.rewrite)
+        if channel.id:
+            async with self.pool.acquire() as con:
+                await con.execute(
+                    "INSERT INTO owner_channels (id, name, topic_id, target, target_name, target_ref, "
+                    "views, reactions, rewrite) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) "
+                    "ON CONFLICT (id) DO NOTHING",
+                    channel.id,
+                    *columns,
+                )
+                # явный номер сбивает очередь собственной нумерации - следующий канал не должен получить тот же id
+                await con.execute(
+                    "SELECT setval(pg_get_serial_sequence('owner_channels', 'id'), "
+                    "(SELECT MAX(id) FROM owner_channels))"
+                )
+            return channel
+
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow(
+                "INSERT INTO owner_channels (name, topic_id, target, target_name, target_ref, "
+                "views, reactions, rewrite) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+                *columns,
+            )
+        channel.id = int(row["id"])
+        return channel
+
+    async def save_owner_channel(self, channel: OwnerChannel) -> None:
+        """Название, канал-адресат, тема-зеркало и настройки - одним обновлением ряда."""
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE owner_channels SET name = $2, topic_id = $3, target = $4, target_name = $5, "
+                "target_ref = $6, views = $7, reactions = $8, rewrite = $9, updated_at = now() WHERE id = $1",
+                channel.id,
+                channel.name,
+                channel.topic_id,
+                channel.target,
+                channel.target_name,
+                channel.target_ref,
+                channel.views,
+                channel.reactions,
+                channel.rewrite,
+            )
+
+    async def remove_owner_channel(self, channel_id: int) -> None:
+        """Вместе с каналом убираются и его источники - ряды связаны, мусор не остаётся."""
+        async with self.pool.acquire() as con:
+            await con.execute("DELETE FROM owner_channels WHERE id = $1", channel_id)
+
+    async def add_owner_donor(self, donor: OwnerDonor) -> OwnerDonor:
+        """Источник канала: повторная та же ссылка не плодит ряд, а обновляет название."""
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow(
+                "INSERT INTO owner_donors (channel_id, chat_id, ref, name, message_id) "
+                "VALUES ($1, $2, $3, $4, $5) "
+                "ON CONFLICT (channel_id, chat_id) DO UPDATE SET ref = EXCLUDED.ref, name = EXCLUDED.name, "
+                "message_id = CASE WHEN EXCLUDED.message_id > 0 THEN EXCLUDED.message_id "
+                "ELSE owner_donors.message_id END "
+                "RETURNING id, message_id",
+                donor.channel_id,
+                donor.chat_id,
+                donor.ref,
+                donor.name,
+                donor.message_id,
+            )
+        donor.id = int(row["id"])
+        donor.message_id = int(row["message_id"] or 0)
+        return donor
+
+    async def save_owner_donor(self, donor: OwnerDonor) -> None:
+        """Нужно, когда зеркальное сообщение источника появилось уже после записи ряда."""
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE owner_donors SET ref = $2, name = $3, chat_id = $4, message_id = $5 WHERE id = $1",
+                donor.id,
+                donor.ref,
+                donor.name,
+                donor.chat_id,
+                donor.message_id,
+            )
+
+    async def remove_owner_donor(self, donor_id: int) -> None:
+        async with self.pool.acquire() as con:
+            await con.execute("DELETE FROM owner_donors WHERE id = $1", donor_id)
+
+    async def owner_state(self, key: str, default: str = "") -> str:
+        """Одиночные настройки сервиса: список перенесён в базу, просмотры по умолчанию."""
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow("SELECT value FROM owner_state WHERE key = $1", key)
+        return row["value"] if row else default
+
+    async def set_owner_state(self, key: str, value: str) -> None:
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "INSERT INTO owner_state (key, value) VALUES ($1, $2) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                key,
+                value,
+            )
+
     # ==== лимит дня ====
 
     async def posts_today(self, tenant_id: int) -> int:
@@ -521,6 +689,37 @@ CREATE TABLE IF NOT EXISTS day_usage (
     posts INT NOT NULL DEFAULT 0,
     PRIMARY KEY (tenant_id, day)
 );
+
+CREATE TABLE IF NOT EXISTS owner_channels (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    topic_id BIGINT NOT NULL DEFAULT 0,
+    target BIGINT,
+    target_name TEXT NOT NULL DEFAULT '',
+    target_ref TEXT NOT NULL DEFAULT '',
+    views INT,
+    reactions BOOLEAN,
+    rewrite BOOLEAN,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS owner_donors (
+    id BIGSERIAL PRIMARY KEY,
+    channel_id BIGINT NOT NULL REFERENCES owner_channels (id) ON DELETE CASCADE,
+    chat_id BIGINT NOT NULL,
+    ref TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    message_id BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (channel_id, chat_id)
+);
+CREATE INDEX IF NOT EXISTS owner_donors_chat_id_idx ON owner_donors (chat_id);
+
+CREATE TABLE IF NOT EXISTS owner_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -531,7 +730,33 @@ MIGRATIONS = (
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS last_post_at TIMESTAMPTZ",
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS reactions_added INT",
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS rewrite BOOLEAN NOT NULL DEFAULT TRUE",
+    "ALTER TABLE owner_channels ADD COLUMN IF NOT EXISTS target_ref TEXT NOT NULL DEFAULT ''",
 )
+
+
+def _owner_channel(row) -> OwnerChannel:
+    return OwnerChannel(
+        id=int(row["id"]),
+        name=row["name"] or "",
+        topic_id=int(row["topic_id"] or 0),
+        target=row["target"],
+        target_name=row["target_name"] or "",
+        target_ref=row["target_ref"] or "",
+        views=row["views"],
+        reactions=row["reactions"],
+        rewrite=row["rewrite"],
+    )
+
+
+def _owner_donor(row) -> OwnerDonor:
+    return OwnerDonor(
+        channel_id=int(row["channel_id"]),
+        chat_id=int(row["chat_id"]),
+        id=int(row["id"]),
+        ref=row["ref"] or "",
+        name=row["name"] or "",
+        message_id=int(row["message_id"] or 0),
+    )
 
 
 def _tenant(row) -> Tenant:
