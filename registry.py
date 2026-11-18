@@ -269,13 +269,13 @@ class Registry:
                 if match and message.id > found_id:
                     found_id, found_value = message.id, int(match.group(1))
         except Exception as exc:  # noqa: BLE001 - без служебного сообщения живём как раньше, по PROMO_VIEWS
-            log.warning("Служебное сообщение склада не прочитано (%s) - беру просмотры из переменной.", type(exc).__name__)
+            log.warning("Служебное сообщение в группе не прочитано (%s) - беру просмотры из переменной.", type(exc).__name__)
             return
 
         if 1 <= found_value <= VIEWS_LIMIT:
             self.views = found_value
             if self.cfg.promo_views != found_value:
-                log.info("Просмотры по умолчанию из склада: %s (в переменной было %s).", found_value, self.cfg.promo_views)
+                log.info("Просмотры по умолчанию взяты из группы: %s (в переменной было %s).", found_value, self.cfg.promo_views)
                 self.cfg.promo_views = found_value
 
     async def _open(self, ref: ChatRef, message_id: int) -> Optional[Donor]:
@@ -517,7 +517,7 @@ class Registry:
                 category.settings_message = int(getattr(posted, "id", 0) or 0)
         except Exception as exc:  # noqa: BLE001 - тему могли скрыть или удалить руками
             raise RegistryError(
-                f"Применил, но в склад записать не вышло ({type(exc).__name__}) - "
+                f"Применил, но записать в группу не вышло ({type(exc).__name__}) - "
                 "после перезапуска настройка канала возьмётся по умолчанию."
             ) from exc
 

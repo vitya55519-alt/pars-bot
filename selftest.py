@@ -624,7 +624,7 @@ async def check_dead_topic():
     except RegistryError:
         blocked = True
     check("донора в тему без канала не добавить", blocked)
-    check("кнопка ничего не записала в склад", 8 not in [m.id for m in client.group_messages])
+    check("кнопка ничего лишнего в группу не записала", 8 not in [m.id for m in client.group_messages])
 
 
 def ago(minutes: int):
@@ -1500,7 +1500,7 @@ async def check_panel():
     check("склад переименован кнопкой", registry.group_name == "АвтоПост" and group.title == "АвтоПост", registry.group_name)
     check("название записано в Telegram", client.titled[-1] == (group.id, "АвтоПост"), str(client.titled))
     check("переименование подтверждено", "Группа теперь называется" in last_reply()[1], last_reply()[1][:90])
-    check("переименование склада не трогает темы", client.topic_edits and client.topic_deletes == [21], str(client.topic_deletes))
+    check("переименование группы не трогает темы каналов", client.topic_edits and client.topic_deletes == [21], str(client.topic_deletes))
 
     await panel.on_button(client, press("main"))
     check("в меню есть кнопки документов", "doc|1" in last_buttons() and "doc|2" in last_buttons(), str(last_buttons()))
@@ -2578,7 +2578,7 @@ async def check_cabinet():
     check("в кабинете свои кнопки", "cadd" in reply_cells() and "cnext" in reply_cells(), str(reply_cells()))
     check("клиент не видит панель владельца", "🤖 АвтоПост" not in reply_text() and "донор" not in reply_text().lower(), reply_text()[:120])
     await panel.on_message(client, Message(client, 6002, owner, text="/start"))
-    check("владелец по-прежнему в панели склада", "АвтоПост" in reply_text(), reply_text()[:60])
+    check("владелец по-прежнему в своей панели", "АвтоПост" in reply_text(), reply_text()[:60])
 
     # ---- шаг 1: каналы-источники ----
     await panel.on_button(client, tap("cadd"))
