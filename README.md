@@ -125,7 +125,7 @@ copy .env.example .env
 ## Шаг 4. Railway
 
 1. Залей этот проект в репозиторий `pars-bot` на GitHub.
-2. Railway → New Project → **Deploy from GitHub repo** → выбери `pars-bot` (сервис соберётся сам, `railway.json` и `requirements.txt` уже настроены).
+2. Railway → New Project → **Deploy from GitHub repo** → выбери `pars-bot` (сервис соберётся сам: `requirements.txt` плюс автоопределение Python; отдельного конфиг-файла деплоя нет — настройками сервиса распоряжается дашборд Railway).
 3. В сервисе: **Variables** → добавь значения из `.env` (строго теми же именами; `SESSION_STRING` и `BOT_TOKEN` целиком, без кавычек). Старые `SOURCE_CHATS` и `TARGET_CHAT` больше не нужны — их можно удалить.
 4. Deploy → **Deploy Logs**: статусы идут цепочкой «Пойман пост → Рерайт завершён → Опубликовано → Переслано в промо-бота».
 
