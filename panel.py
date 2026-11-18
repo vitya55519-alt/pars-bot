@@ -106,9 +106,17 @@ class Panel:
         self.client.add_handler(MessageHandler(self.on_message, filters.private))
         self.client.add_handler(CallbackQueryHandler(self.on_button))
 
-    async def start(self, owner_id: int, account_name: str = "") -> None:
+    def claim_owner(self, owner_id: int, account_name: str = "") -> None:
+        """Владелец известен сразу после входа аккаунта: кнопки его, всё остальное - кабинеты.
+
+        Пока бот панели ждёт свою паузу, владелец уже должен узнаваться,
+        иначе его сообщение в боте уедет в чужой кабинет.
+        """
         self.owner = owner_id
         self.account = account_name or "аккаунт"
+
+    async def start(self, owner_id: int, account_name: str = "") -> None:
+        self.claim_owner(owner_id, account_name)
         try:
             await call(self.client.set_bot_commands, COMMANDS)
         except Exception as exc:  # noqa: BLE001 - меню без подсказок команд тоже работает

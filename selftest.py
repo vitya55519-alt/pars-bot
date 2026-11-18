@@ -1546,6 +1546,12 @@ def check_startup_wiring() -> None:
     check("у Kurigram нет client.idle", not hasattr(Client, "idle"))
     check("main ждёт через pyrogram.idle", callable(idle) and "await idle()" in source, str(hasattr(idle, "__call__")))
     check("в main не осталось client.idle", "client.idle()" not in source)
+    check(
+        "панель поднимается фоном, а не блокирует старт",
+        "asyncio.create_task(start_panel" in source and "await start_panel(" not in source,
+        "await start_panel" in source,
+    )
+    check("панель не перекрывает остальных", "panel_live" not in source, "panel_live")
 
 
 async def check_panel_login_flood():
@@ -1557,6 +1563,7 @@ async def check_panel_login_flood():
 
     async def fake_sleep(seconds):
         waits.append(int(seconds))
+        await real_sleep(0)
 
     class PanelClient:
         def __init__(self, errors):
@@ -1595,6 +1602,40 @@ async def check_panel_login_flood():
             await main_module.start_panel(crashed, PanelStub(), 1, "аккаунт") is False and crashed.starts == 1,
             str(crashed.starts),
         )
+
+        # ==== вход бота панели живёт фоном: пауза Telegram не держит автопостинг ====
+        waits.clear()
+
+        class AlwaysFlood:
+            def __init__(self):
+                self.starts = 0
+
+            async def start(self):
+                self.starts += 1
+                raise FloodWait(3000, "auth.ImportBotAuthorization")
+
+        stuck = AlwaysFlood()
+        login = asyncio.create_task(main_module.start_panel(stuck, PanelStub(), 1, "аккаунт"))
+        caught = []
+
+        async def pipeline():
+            await real_sleep(0.05)
+            caught.append("пост дошёл")
+
+        await pipeline()
+        check("пока бот панели ждёт паузу, посты ловятся", caught == ["пост дошёл"] and not login.done(),
+              f"{caught} done={login.done()}")
+        login.cancel()
+        try:
+            await login
+        except asyncio.CancelledError:
+            pass
+
+        owner_panel = Panel(None, make_cfg(), None, None)
+        owner_panel.claim_owner(500, "Фогель")
+        check("владелец известен до входа бота панели", owner_panel.owner == 500 and 500 in owner_panel.admins,
+              str(sorted(owner_panel.admins)))
+
     finally:
         asyncio.sleep = real_sleep
 

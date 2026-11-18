@@ -29,7 +29,11 @@ async def start_panel(panel_client: Client, panel: Panel, owner_id: int, account
             return True
         except FloodWait as exc:
             wait = int(getattr(exc, "value", 0) or 0) + 5
-            log.warning("Telegram просит паузу %s сек перед входом бота - пережду сам, автопостинг уже работает.", wait)
+            log.warning(
+                "Telegram просит паузу %s сек перед входом бота - пережду сам, кнопки появятся после неё. "
+                "Автопостинг в это время работает.",
+                wait,
+            )
             await asyncio.sleep(wait)
         except Unauthorized:
             log.error("BOT_TOKEN не принял Telegram - кнопок не будет, автопостинг работает.")
@@ -75,6 +79,7 @@ async def amain(cfg: Config) -> None:
 
     panel_client = None
     panel = None
+    panel_task = None
     if cfg.panel_enabled:
         panel_client = Client(
             name="pars-panel",
@@ -92,14 +97,18 @@ async def amain(cfg: Config) -> None:
         me = await client.get_me()
         log.info("Вход выполнен: %s (id %s)", me.first_name or me.username or "аккаунт", me.id)
 
-        panel_live = bool(panel_client) and await start_panel(panel_client, panel, me.id, me.first_name or "аккаунт")
+        # Панель поднимается фоном: пауза Telegram на входе бота не должна держать
+        # весь автопостинг - иначе в это время не ловится ни один пост.
+        if panel:
+            panel.claim_owner(me.id, me.first_name or "аккаунт")
+            panel_task = asyncio.create_task(start_panel(panel_client, panel, me.id, me.first_name or "аккаунт"))
 
         while not registry.ready:
             try:
                 await bot.setup()
             except RegistryError as exc:
-                log.error("Управление донорами не настроено: %s", exc)
-                if panel_live:
+                log.error("Список каналов не собрался: %s", exc)
+                if cfg.panel_enabled:
                     log.info("Нажми «🏛 Создать группу» в панели бота - проверю заново через минуту.")
                 else:
                     log.info("Без BOT_TOKEN кнопок нет: создай группу с темами и добавь туда этот аккаунт.")
@@ -115,6 +124,8 @@ async def amain(cfg: Config) -> None:
     finally:
         if sync:
             sync.cancel()
+        if panel_task:
+            panel_task.cancel()
         if store:
             await store.close()
         await session.close()
