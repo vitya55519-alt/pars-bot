@@ -1,7 +1,8 @@
 import asyncio
+import datetime
 import logging
 import re
-from typing import Iterator, List, Tuple, Union
+from typing import Iterator, List, Optional, Tuple, Union
 
 from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,6 +15,23 @@ TEXT_LIMIT = 3900
 CALLBACK_LIMIT = 64
 
 Cell = Tuple[str, str]
+
+
+def utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def as_utc(value: Optional[datetime.datetime]) -> Optional[datetime.datetime]:
+    """Telegram присылает дату без пояса времени - это UTC.
+
+    Сравнивать такую дату можно только с такой же: Python кидает TypeError
+    на смеси наивной и осознанной даты, и процесс на Railway падает на старте.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=datetime.timezone.utc)
+    return value.astimezone(datetime.timezone.utc)
 
 
 def markup(*rows: Union[Cell, List[Cell]]) -> InlineKeyboardMarkup:

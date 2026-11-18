@@ -23,10 +23,19 @@ from config import Config
 from handlers import ParsBot
 from panel import Panel
 from registry import Registry, RegistryError, extract_refs
-from utils import TEXT_LIMIT
+from utils import TEXT_LIMIT, as_utc
 
 CHECKS = []
 FAILED = []
+
+
+def naive_now() -> datetime.datetime:
+    """Как Telegram: дата без пояса времени, но это UTC.
+
+    Фейковый клиент обязан вести себя как настоящий: сравнение наивной даты
+    сообщения с датой старта с поясом времени роняет живой процесс на Railway.
+    """
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
 
 
 def check(name, condition, detail=""):
@@ -108,7 +117,7 @@ class Message(_PyrogramMessage):
         self.from_user = author or User(111)
         self.reply_markup = None
         self.outgoing = False
-        self.date = date if date is not None else datetime.datetime.now(datetime.timezone.utc)
+        self.date = date if date is not None else naive_now()
         self.client = client
 
     async def reply(self, text, *args, **kwargs):
@@ -619,7 +628,7 @@ async def check_dead_topic():
 
 
 def ago(minutes: int):
-    return datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=minutes)
+    return naive_now() - datetime.timedelta(minutes=minutes)
 
 
 async def check_diagnose():
@@ -1092,6 +1101,9 @@ async def check_ai_clean_answer():
           stub.calls == 1 and client.posted[1].caption == "второй текст автора", f"{stub.calls} / {client.posted[1].caption}")
 
     # ==== отчёт на старте: что аккаунт видит в каждом канале ====
+    client.histories[world["donor_sport_1"].id] = [
+        Message(client, 91, world["donor_sport_1"], text="пост с текстом", date=ago(7))
+    ]
     lines = []
 
     class Grab(logging.Handler):
@@ -1120,6 +1132,24 @@ async def check_ai_clean_answer():
     report = "\n".join(lines)
     check("на старте видно каждый канал-источник", "Источник @donor_sport_1 -> постим в Спорт:" in report, report[:200])
     check("и почему канал молчит", "не открылся (Unauthorized)" in report, [line for line in lines if "donor_sport_2" in line][:2])
+    check("в отчёте есть возраст поста", "7 мин назад" in report, [line for line in lines if "donor_sport_1" in line][:2])
+
+    # ==== даты: Telegram присылает их без пояса времени ====
+    plain = datetime.datetime(2026, 11, 18, 9, 0)
+    checked = as_utc(plain)
+    check("наивную дату считаем utc", checked is not None and checked.tzinfo is datetime.timezone.utc
+          and checked.hour == 9, str(checked))
+    aware = datetime.datetime(2026, 11, 18, 9, 0, tzinfo=datetime.timezone.utc)
+    check("дату с поясом не портим", as_utc(aware) == aware and as_utc(None) is None, str(as_utc(aware)))
+    stamp = bot._ago(Message(client, 77, world["donor_sport_1"], text="пост", date=ago(7)))
+    check("возраст наивной даты считается", stamp == "7 мин назад", stamp)
+    bot.started = datetime.datetime.now(datetime.timezone.utc)
+    later = Message(client, 78, world["donor_sport_1"], text="пост после старта",
+                    date=naive_now() + datetime.timedelta(minutes=5))
+    check("свежий текстовый пост отличим от старого", bot._unverifiable(later) is False, str(bot._unverifiable(later)))
+    older = Message(client, 79, world["donor_sport_1"], text="пост до старта",
+                    date=naive_now() - datetime.timedelta(minutes=5))
+    check("старый текстовый пост дублем не выгоняет", bot._unverifiable(older) is True, str(bot._unverifiable(older)))
 
 
 async def check_commands():

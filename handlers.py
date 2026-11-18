@@ -27,7 +27,7 @@ from promo import Promoter
 from reactions import Reactor, count_reactions
 from registry import Category
 from store import MAX_POSTS_PER_DAY
-from utils import TEXT_LIMIT, call, chat_name, strip_source
+from utils import TEXT_LIMIT, as_utc, call, chat_name, strip_source, utc_now
 
 log = logging.getLogger("pars")
 
@@ -95,7 +95,7 @@ class ParsBot:
         self.controls = Controls(client, cfg, registry, self)
         self._seen_groups: "OrderedDict[str, None]" = OrderedDict()
         self._sent_posts: "OrderedDict[str, None]" = OrderedDict()
-        self.started = datetime.datetime.now(datetime.timezone.utc)
+        self.started = utc_now()
         self.stats = {"caught": 0, "published": 0, "forwarded": 0, "errors": 0}
         self.last_publish = ""
         self.store = None
@@ -431,7 +431,7 @@ class ParsBot:
         return (
             not message.photo
             and post_key(message) not in self._sent_posts
-            and not (message.date and message.date > self.started)
+            and not (message.date and as_utc(message.date) > as_utc(self.started))
         )
 
     def _carried(self, message: Message, published: Set[str]) -> bool:
@@ -549,7 +549,7 @@ class ParsBot:
         date = getattr(message, "date", None)
         if not date:
             return "без даты"
-        minutes = int((datetime.datetime.now(datetime.timezone.utc) - date).total_seconds() // 60)
+        minutes = int((utc_now() - as_utc(date)).total_seconds() // 60)
         if minutes < 1:
             return "только что"
         if minutes < 60:
