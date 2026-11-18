@@ -70,6 +70,7 @@ class Tenant:
     target_ok: bool = False
     views: int = 0
     reactions: bool = True
+    rewrite: bool = True
     balance: int = 0
     plan_until: Optional[datetime.datetime] = None
     agreed: bool = False
@@ -216,6 +217,15 @@ class Store:
         async with self.pool.acquire() as con:
             await con.execute(
                 "UPDATE tenants SET reactions = $2, updated_at = now() WHERE id = $1",
+                tenant_id,
+                enabled,
+            )
+
+    async def set_rewrite(self, tenant_id: int, enabled: bool) -> None:
+        """Переписывать ли посты клиента нейросетью: выключено - публикуем текст источника."""
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE tenants SET rewrite = $2, updated_at = now() WHERE id = $1",
                 tenant_id,
                 enabled,
             )
@@ -473,6 +483,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     target_ok BOOLEAN NOT NULL DEFAULT FALSE,
     views INT NOT NULL DEFAULT 0,
     reactions BOOLEAN NOT NULL DEFAULT TRUE,
+    rewrite BOOLEAN NOT NULL DEFAULT TRUE,
     balance_rub INT NOT NULL DEFAULT 0,
     plan_until TIMESTAMPTZ,
     agreed_at TIMESTAMPTZ,
@@ -519,6 +530,7 @@ MIGRATIONS = (
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS last_post_id BIGINT",
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS last_post_at TIMESTAMPTZ",
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS reactions_added INT",
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS rewrite BOOLEAN NOT NULL DEFAULT TRUE",
 )
 
 
@@ -531,6 +543,7 @@ def _tenant(row) -> Tenant:
         target_ok=bool(row["target_ok"]),
         views=int(row["views"] or 0),
         reactions=bool(row["reactions"]),
+        rewrite=bool(row["rewrite"]),
         balance=int(row["balance_rub"] or 0),
         plan_until=row["plan_until"],
         agreed=row["agreed_at"] is not None,

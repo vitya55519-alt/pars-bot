@@ -27,6 +27,8 @@ VIEWS_RE = re.compile(r"просмотры\s*[:=]\s*(\d{1,5})", re.I)
 VIEWS_TEXT = "Просмотры: {}"
 REACTIONS_RE = re.compile(r"реакции\s*[:=]\s*(вкл|выкл)", re.I)
 REACTIONS_TEXT = "Реакции: {}"
+REWRITE_RE = re.compile(r"переписывание\s*[:=]\s*(вкл|выкл)", re.I)
+REWRITE_TEXT = "Переписывание: {}"
 PUBLIC_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{4,31})", re.I)
 PRIVATE_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/c/(\d{4,20})", re.I)
 INVITE_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:\+|joinchat/)\S+", re.I)
@@ -76,6 +78,7 @@ class Category:
     # свои настройки канала: None значит «не задано» - берётся значение по умолчанию
     views: Optional[int] = None
     reactions: Optional[bool] = None
+    rewrite: Optional[bool] = None
     settings_message: Optional[int] = None
 
     @property
@@ -84,11 +87,14 @@ class Category:
 
     def describe(self) -> str:
         where = self.target_name or self.problem or "канал не определён"
-        donors = ", ".join(self.donor_names) or "нет доноров"
-        return f"Тема «{self.name}» -> {where}\n    доноры: {donors}"
+        donors = ", ".join(self.donor_names) or "нет"
+        return f"Канал «{self.name}» -> постим в {where}\n    откуда берём посты: {donors}"
 
-    def settings_line(self, views: int, reactions: bool) -> str:
-        return f"    просмотры: {views} · реакции: {'вкл' if reactions else 'выкл'}"
+    def settings_line(self, views: int, reactions: bool, rewrite: bool) -> str:
+        return (
+            f"    просмотры: {views} · реакции: {'вкл' if reactions else 'выкл'}"
+            f" · переписывание: {'вкл' if rewrite else 'выкл'}"
+        )
 
 
 class Registry:
@@ -219,10 +225,11 @@ class Registry:
 
     @staticmethod
     def _absorb_settings(text: str, message_id: int, category: Category) -> bool:
-        """Служебное сообщение темы хранит свои просмотры и реакции канала: побеждает самое свежее."""
+        """Служебное сообщение темы хранит свои настройки канала: побеждает самое свежее."""
         views_match = VIEWS_RE.search(text)
         reactions_match = REACTIONS_RE.search(text)
-        if not views_match and not reactions_match:
+        rewrite_match = REWRITE_RE.search(text)
+        if not views_match and not reactions_match and not rewrite_match:
             return False
         if message_id <= (category.settings_message or 0):
             return True
@@ -233,6 +240,8 @@ class Registry:
                 category.views = value
         if reactions_match:
             category.reactions = reactions_match.group(1).casefold() == "вкл"
+        if rewrite_match:
+            category.rewrite = rewrite_match.group(1).casefold() == "вкл"
         return True
 
     async def _absorb(self, text: str, message_id: int, category: Category) -> List[Donor]:
@@ -279,7 +288,7 @@ class Registry:
 
         chat_type = getattr(chat, "type", None)
         if chat_type not in DONOR_TYPES:
-            log.warning("%s - это %s, донором быть не может.", ref, getattr(chat_type, "name", chat_type))
+            log.warning("%s - это %s, читать отсюда посты нельзя.", ref, getattr(chat_type, "name", chat_type))
             return None
         return Donor(chat.id, chat_name(chat), str(ref), message_id)
 
@@ -456,6 +465,10 @@ class Registry:
         """Реакции канала: свой флаг из темы, иначе общая настройка REACTIONS."""
         return category.reactions if category.reactions is not None else self.cfg.reactions_enabled
 
+    def rewrite_for(self, category: Category) -> bool:
+        """Переписывать ли тексты этого канала: своё значение из темы, иначе общая настройка REWRITE."""
+        return category.rewrite if category.rewrite is not None else self.cfg.rewrite_default
+
     async def save_category_views(self, topic_id: int, raw: str) -> int:
         """Свои просмотры канала: число живёт служебным сообщением в его теме и переживает перезапуск."""
         number = parse_views(raw, low=0)
@@ -475,6 +488,15 @@ class Registry:
         log.info("Реакции канала «%s»: %s.", category.name, "вкл" if category.reactions else "выкл")
         return category.reactions
 
+    async def toggle_category_rewrite(self, topic_id: int) -> bool:
+        """Своё решение по каналу: переписывать тексты нейросетью или брать их как есть."""
+        category = self._category(topic_id)
+        async with self.lock:
+            category.rewrite = not self.rewrite_for(category)
+            await self._write_settings(category)
+        log.info("Переписывание канала «%s»: %s.", category.name, "вкл" if category.rewrite else "выкл")
+        return category.rewrite
+
     async def _write_settings(self, category: Category) -> None:
         """Одно служебное сообщение на тему: в нём только то, что задано явно."""
         lines = []
@@ -482,6 +504,8 @@ class Registry:
             lines.append(VIEWS_TEXT.format(category.views))
         if category.reactions is not None:
             lines.append(REACTIONS_TEXT.format("вкл" if category.reactions else "выкл"))
+        if category.rewrite is not None:
+            lines.append(REWRITE_TEXT.format("вкл" if category.rewrite else "выкл"))
         text = "\n".join(lines)
         try:
             if category.settings_message:
@@ -525,7 +549,7 @@ class Registry:
     async def remove_donor(self, message_id: int) -> List[Donor]:
         removed = await self.forget_ids({message_id})
         if not removed:
-            raise RegistryError("Этого донора в списке уже нет - нажми «Обновить».")
+            raise RegistryError("Это сообщение уже убрано из списка - нажми «🔄 Обновить список».")
         self.suppressed.add(message_id)
         try:
             await call(self.client.delete_messages, self.group_id, [message_id])
@@ -595,15 +619,16 @@ class Registry:
 
     def summary(self) -> str:
         if not self.categories:
-            return "В группе пока нет тем с донорами."
+            return "В группе пока нет ни одного канала: добавь его кнопкой «➕ Добавить канал»."
         return "\n".join(
-            f"  {category.describe()}\n{category.settings_line(self.views_for(category), self.reactions_for(category))}"
+            f"  {category.describe()}\n"
+            f"{category.settings_line(self.views_for(category), self.reactions_for(category), self.rewrite_for(category))}"
             for category in self.categories.values()
         )
 
     def problems(self) -> List[str]:
         found = [category.problem for category in self.categories.values() if category.problem]
-        found += [f"тема «{c.name}» без доноров" for c in self.categories.values() if not c.donors]
+        found += [f"«{c.name}» - не указано, откуда брать посты" for c in self.categories.values() if not c.donors]
         if self.unreadable:
             found.append("не открылись ссылки: " + ", ".join(sorted(set(self.unreadable))))
         return found

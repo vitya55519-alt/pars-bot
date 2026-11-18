@@ -78,14 +78,17 @@ class Controls:
 
     async def on_deleted(self, client, messages) -> None:
         group = self.registry.group_id
-        ids = {message.id for message in messages if message.chat.id == group}
-        if not group or self._rebuilding or not ids:
+        if not group or self._rebuilding:
+            return
+        # у служебных уведомлений об удалении chat бывает пустым - на него смотреть нельзя
+        ids = {message.id for message in messages if getattr(message, "chat", None) and message.chat.id == group}
+        if not ids:
             return
         if {message_id for message_id in ids if self.registry.took_out(message_id)} == ids:
             return
         self._rebuilding = True
         try:
-            log.info("В группе удалили сообщение - перечитываю список доноров.")
+            log.info("В группе удалили сообщение - перечитываю список каналов.")
             await self.registry.rebuild()
         except Exception as exc:  # noqa: BLE001 - удаление не должно ронять бота
             log.error("Перечитать список не удалось: %s: %s", type(exc).__name__, exc)
@@ -154,12 +157,12 @@ class Controls:
     async def _cmd_remove(self, message) -> None:
         origin: Optional[object] = message.reply_to_message
         if origin is None:
-            await self._reply(message, "Ответь /убери на сообщение со ссылкой донора.")
+            await self._reply(message, "Ответь /убери на сообщение со ссылкой канала, который больше не читаем.")
             return
 
         removed = await self.registry.forget(origin)
         if not removed:
-            await self._reply(message, "В этом сообщении нет донора из списка.")
+            await self._reply(message, "В этом сообщении нет ссылки из списка.")
             return
 
         try:

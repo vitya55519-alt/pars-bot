@@ -516,6 +516,7 @@ async def main():
     await check_routing()
     await check_album()
     await check_flood_and_ai()
+    await check_ai_clean_answer()
     await check_commands()
     await check_live_and_delete()
     await check_promo_flow()
@@ -1041,6 +1042,86 @@ async def check_flood_and_ai():
     )
 
 
+async def check_ai_clean_answer():
+    print("\n[4б] Ответ нейросети: монолог вырезается, параметр thinking не ломает запрос")
+    import logging
+
+    from ai import MAX_OUTPUT, AiRewriter, answered_in_foreign_language, cut, strip_thinking
+
+    monologue = "The user wants a rewritten sports post in Russian. " * 4
+    with_tags = f"<think>{monologue}</think>\n\n«Зенит» выиграл"
+    check("закрытый монолог вырезается", strip_thinking(with_tags) == "«Зенит» выиграл", strip_thinking(with_tags)[:60])
+    check("незакрытый монолог - готового текста нет", strip_thinking(f"<think>{monologue}") == "", strip_thinking(f"<think>{monologue}")[:60])
+    check("текст без тегов не портится", strip_thinking("Обычный пост без тегов") == "Обычный пост без тегов")
+    check("ответ латиницей отклоняется", answered_in_foreign_language(monologue))
+    check("русский пост с латинскими названиями проходит",
+          not answered_in_foreign_language("«Зенит» обыграл «Спартак» 2:1 в матче РПЛ"))
+    long_answer = cut("пост " * 2000)
+    check("длинный ответ не режется до 1024", 1024 < len(long_answer) <= MAX_OUTPUT, str(len(long_answer)))
+
+    cfg = make_cfg(minimax_api_key="key")
+    answered = {"choices": [{"message": {"content": with_tags}}]}
+    session = FakeSession([FakeResponse(400, text="unsupported parameter: thinking"), FakeResponse(200, answered)])
+    rewriter = AiRewriter(cfg, session)
+    text = await rewriter.rewrite("исходный текст")
+    check("размышления вслух просим выключить", session.calls[0][1].get("thinking") == {"type": "disabled"},
+          str(session.calls[0][1].get("thinking")))
+    check("адрес без такого параметра - шлём без него",
+          session.calls[1][1].get("thinking") is None and rewriter.supports_thinking is False,
+          str(session.calls[1][1].get("thinking")))
+    check("публикуем русский ответ, а не монолог", text == "«Зенит» выиграл", text[:80])
+
+    only_mono = FakeSession([FakeResponse(200, {"choices": [{"message": {"content": f"<think>{monologue}"}}]}) for _ in range(3)])
+    out = await AiRewriter(cfg, only_mono).rewrite("пост автора")
+    check("если в ответе только монолог - публикуем оригинал",
+          out == "пост автора" and len(only_mono.calls) == 3, out[:60])
+
+    # ==== человек выбирает, переписывать или нет ====
+    cfg2 = make_cfg(promo_delay=0)
+    world = build_world(cfg2)
+    client = world["client"]
+    stub = StubAI("переписанный текст")
+    bot = ParsBot(client, cfg2, stub, Registry(client, cfg2), FakeSession([]))
+    await bot.setup()
+    await bot.on_message(client, Message(client, 61, world["donor_sport_1"], caption="текст автора", photo=Photo("w1")))
+    check("по умолчанию пост переписывается", stub.calls == 1 and client.posted[0].caption == "переписанный текст",
+          client.posted[0].caption)
+    await bot.registry.toggle_category_rewrite(21)
+    await bot.on_message(client, Message(client, 62, world["donor_sport_1"], caption="второй текст автора", photo=Photo("w2")))
+    check("канал с выключенным переписыванием ждёт оригинал",
+          stub.calls == 1 and client.posted[1].caption == "второй текст автора", f"{stub.calls} / {client.posted[1].caption}")
+
+    # ==== отчёт на старте: что аккаунт видит в каждом канале ====
+    lines = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    handler = Grab()
+    pars_log = logging.getLogger("pars")
+    old_level = pars_log.level
+    pars_log.addHandler(handler)
+    pars_log.setLevel(logging.INFO)
+    original_history = bot._history
+
+    async def flaky(chat, limit=50):
+        if getattr(chat, "id", chat) == world["donor_sport_2"].id:
+            raise Unauthorized("NO_CHAT_MEMBER")
+        return await original_history(chat, limit)
+
+    bot._history = flaky
+    try:
+        await bot.setup()
+    finally:
+        bot._history = original_history
+        pars_log.setLevel(old_level)
+        pars_log.removeHandler(handler)
+    report = "\n".join(lines)
+    check("на старте видно каждый канал-источник", "Источник @donor_sport_1 -> постим в Спорт:" in report, report[:200])
+    check("и почему канал молчит", "не открылся (Unauthorized)" in report, [line for line in lines if "donor_sport_2" in line][:2])
+
+
 async def check_commands():
     print("\n[5] Команды в группе")
     world = build_world()
@@ -1050,11 +1131,11 @@ async def check_commands():
 
     await controls.on_group_message(client, Message(client, 60, group, text="/список", thread=21))
     text = client.replies[-1][1]
-    check("/список показывает темы и доноров", "Спорт" in text and "@donor_sport_1" in text, text)
+    check("/список показывает каналы и источники", "Спорт" in text and "@donor_sport_1" in text, text)
 
     await controls.on_group_message(client, Message(client, 61, group, text="/обнови", thread=21))
     check("/обнови сначала отвечает", "Перечитываю" in client.replies[-2][1], client.replies[-2][1])
-    check("/обнови вернул сводку", "Тема «Спорт»" in client.replies[-1][1], client.replies[-1][1])
+    check("/обнови вернул сводку", "Канал «Спорт»" in client.replies[-1][1], client.replies[-1][1])
 
     await controls.on_group_message(client, Message(client, 62, group, text="/статус", thread=21))
     status = client.replies[-1][1]
@@ -1119,6 +1200,10 @@ async def check_live_and_delete():
 
     await bot.controls.on_deleted(client, [Message(client, 82, world["donor_sport_1"], text="x")])
     check("удаление в чужом чате игнорируем", rebuilds == [1], str(rebuilds))
+    await bot.controls.on_deleted(client, [Message(client, 0, None)])
+    check("уведомление без чата не роняет обработчик", rebuilds == [1], str(rebuilds))
+    await bot.controls.on_deleted(client, [Message(client, 0, None), Message(client, 85, group, text="x", thread=21)])
+    check("такое уведомление не мешает перечитать список", len(rebuilds) == 2, str(rebuilds))
     registry.rebuild = original_rebuild
 
     added = await registry.note(Message(client, 83, group, text="@stranger", thread=1))
@@ -1198,7 +1283,11 @@ async def check_failures():
     registry3 = Registry(no_topics, make_cfg())
     await registry3.rebuild()
     check("группа без тем запускается", registry3.ready and registry3.donor_count == 0)
-    check("сводка пустой группы понятна", "нет тем" in registry3.summary().lower(), registry3.summary())
+    check(
+        "сводка пустой группы понятна",
+        "нет ни одного канала" in registry3.summary().lower() and "Добавить канал" in registry3.summary(),
+        registry3.summary(),
+    )
 
     plain = FakeClient()
     plain.add_chat(Chat(-10010, title="Обычная группа", chat_type=ChatType.SUPERGROUP, is_forum=False))
@@ -1285,7 +1374,7 @@ async def check_panel():
     check("у бота два обработчика", len(client.handlers) == 5, str(len(client.handlers)))
 
     await panel.on_message(client, Message(client, 5002, owner, text="/start"))
-    check("меню знает группу и счётчики", "АвтоПост" in last_reply()[1] and "Каналов: 2" in last_reply()[1], last_reply()[1][:90])
+    check("меню знает группу и счётчики", "АвтоПост" in last_reply()[1] and "Твоих каналов: 2" in last_reply()[1], last_reply()[1][:90])
     cells = [button.callback_data for row in last_reply()[2].inline_keyboard for button in row]
     check("в меню есть кнопка списков", "topics" in cells, str(cells))
 
@@ -1296,14 +1385,14 @@ async def check_panel():
     check("чужая кнопка не исполняется", client.edits == [] and "Доступ" in wrong.answers[0][0], str(wrong.answers))
 
     await panel.on_button(client, press("cat|21"))
-    check("экран канала показывает источники", "источники (2)" in last_edit(), last_edit()[:120])
-    check("экран канала говорит, куда идут посты", "Куда идут посты" in last_edit() and "Спорт" in last_edit(), last_edit()[:160])
-    check("экран канала показывает просмотры и реакции", "Просмотров на пост" in last_edit() and "🎭 Реакции:" in last_edit(), last_edit()[:200])
-    check("у канала свои кнопки настроек", "cv|21" in last_buttons() and "cr|21" in last_buttons(), str(last_buttons()))
+    check("экран канала показывает, откуда берём посты", "Откуда берём посты" in last_edit() and "@donor_sport_1" in last_edit(), last_edit()[:200])
+    check("экран канала называет канал публикации", "Канал: Спорт" in last_edit(), last_edit()[:160])
+    check("экран канала показывает текст, просмотры и реакции", "Что делаем с текстом:" in last_edit() and "3. Просмотры:" in last_edit() and "4. Реакции:" in last_edit(), last_edit()[:300])
+    check("у канала свои кнопки настроек", "cv|21" in last_buttons() and "cr|21" in last_buttons() and "cw|21" in last_buttons(), str(last_buttons()))
     check("источник отключается кнопкой ✖", "del|21|1" in last_buttons(), str(last_buttons()))
     await panel.on_button(client, press("topics"))
-    check("список каналов назван", "Спорт" in last_edit() and "Юмор" in last_edit(), last_edit()[:90])
-    check("список каналов считает источники", "ист." in last_edit(), last_edit()[:120])
+    check("список каналов назван", "Спорт" in last_edit() and "@yumor_ch" in last_edit(), last_edit()[:200])
+    check("список каналов считает каналы", "канал(ов)" in last_edit(), last_edit()[:200])
     await panel.on_button(client, press("status"))
     check("статус описывает настройки", "Промо-бот" in last_edit() and "promo_bot" in last_edit(), last_edit()[:90])
     await panel.on_button(client, press("help"))
@@ -1313,9 +1402,9 @@ async def check_panel():
     check("донор убран кнопкой", world["donor_sport_1"].id not in registry.categories[21].donors)
     check("сообщение со ссылкой удалено", 1 in client.deleted, str(client.deleted))
     check("убранное не перечитывает группу", rebuilt == [], str(rebuilt))
-    check("экран подтверждает отключение", "Отключил источник" in last_edit(), last_edit()[:80])
+    check("экран подтверждает отключение", "Перестал читать" in last_edit(), last_edit()[:80])
     await panel.on_button(client, press("del|21|999"))
-    check("несуществующий донор - понятный отказ", "уже нет" in last_edit(), last_edit()[:80])
+    check("уже убранный канал - понятный отказ", "уже убрано" in last_edit(), last_edit()[:80])
 
     await panel.on_button(client, press("add|21"))
     check("кнопка донора просит ссылку", "Пришли ссылку" in last_edit(), last_edit()[:80])
@@ -1323,7 +1412,7 @@ async def check_panel():
     check("донор добавлен из бота", new_donor.id in registry.categories[21].donors)
     check("маршрут появился", registry.routes.get(new_donor.id) == 21, str(registry.routes))
     check("ссылка записана в тему группы", client.topic_posts[-1] == (group.id, "https://t.me/donor_run", 21), str(client.topic_posts[-1]))
-    check("ответ подтверждает добавление", "Добавил источники" in last_reply()[1], last_reply()[1][:80])
+    check("ответ подтверждает добавление", "Добавил каналы, откуда берём посты" in last_reply()[1], last_reply()[1][:80])
 
     await panel.on_button(client, press("add|21"))
     await panel.on_message(client, Message(client, 5005, owner, text="привет"))
@@ -1376,11 +1465,11 @@ async def check_panel():
     check("в списке остался только второй канал", "cat|22" in last_buttons() and "cat|21" not in last_buttons(), str(last_buttons()))
 
     await panel.on_button(client, press("group_rename"))
-    check("кнопка склада просит название", "Напиши новое название склада" in last_edit(), last_edit()[:90])
+    check("кнопка группы просит название", "Напиши новое название группы" in last_edit(), last_edit()[:90])
     await panel.on_message(client, Message(client, 5013, owner, text="АвтоПост"))
     check("склад переименован кнопкой", registry.group_name == "АвтоПост" and group.title == "АвтоПост", registry.group_name)
     check("название записано в Telegram", client.titled[-1] == (group.id, "АвтоПост"), str(client.titled))
-    check("переименование подтверждено", "Склад теперь называется" in last_reply()[1], last_reply()[1][:90])
+    check("переименование подтверждено", "Группа теперь называется" in last_reply()[1], last_reply()[1][:90])
     check("переименование склада не трогает темы", client.topic_edits and client.topic_deletes == [21], str(client.topic_deletes))
 
     await panel.on_button(client, press("main"))
@@ -1664,7 +1753,18 @@ async def check_reactions():
     check("общей кнопки реакций больше нет", "reactions" not in cells, str(cells))
 
     await panel.on_button(pclient, press("cat|22"))
-    check("канал показывает свои реакции", "🎭 Реакции: вкл" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
+    check("канал показывает свои реакции", "4. Реакции:" in pclient.edits[-1][2] and "ставим" in pclient.edits[-1][2], pclient.edits[-1][2][:260])
+    await panel.on_button(pclient, press("cw|22"))
+    check("переключатель текста выключает переписывание", panel_registry.categories[22].rewrite is False
+          and "словами автора" in pclient.edits[-1][2], pclient.edits[-1][2][:260])
+    check("переписывание записано в тему канала",
+          any("Переписывание: выкл" in text for _, text, _thread in pclient.topic_posts),
+          str(pclient.topic_posts[-1]))
+    check("у другого канала текст не тронут", panel_registry.rewrite_for(panel_registry.categories[21]) is True,
+          str(panel_registry.categories[21].rewrite))
+    await panel.on_button(pclient, press("cw|22"))
+    check("и возвращается обратно", panel_registry.categories[22].rewrite is True
+          and "переписывает нейросеть" in pclient.edits[-1][2], pclient.edits[-1][2][:260])
     await panel.on_button(pclient, press("cr|22"))
     check("кнопка выключает реакции канала", panel_registry.categories[22].reactions is False
           and "выключены" in pclient.edits[-1][2], pclient.edits[-1][2][:160])
@@ -1781,7 +1881,7 @@ async def check_views():
     client, group = world["client"], world["group"]
     registry = Registry(client, cfg)
     await registry.rebuild()
-    check("в складе числа нет - остаётся переменная", registry.views == 0 and cfg.promo_views == 1000, str(registry.views))
+    check("в группе числа нет - остаётся переменная", registry.views == 0 and cfg.promo_views == 1000, str(registry.views))
     check("канал без своей настройки берёт число по умолчанию", registry.views_for(registry.categories[21]) == 1000,
           str(registry.views_for(registry.categories[21])))
 
@@ -1829,6 +1929,15 @@ async def check_views():
           registry.views_for(registry.categories[22]) == 500 and registry.reactions_for(registry.categories[22]) is False,
           f"{registry.views_for(registry.categories[22])} / {registry.reactions_for(registry.categories[22])}")
 
+    off = await registry.toggle_category_rewrite(22)
+    check("переписывание канала выключилось", off is False and registry.rewrite_for(registry.categories[22]) is False, str(off))
+    check("в сообщении все три поля канала",
+          client.edits[-1][2] == "Просмотры: 500\nРеакции: выкл\nПереписывание: выкл", str(client.edits[-1][2]))
+    await registry.rebuild()
+    check("третье поле пережило перечитку", registry.rewrite_for(registry.categories[22]) is False,
+          str(registry.rewrite_for(registry.categories[22])))
+    check("и нелезет в доноры", registry.donor_count == 3, str(registry.donor_count))
+
     live_cfg = make_cfg(promo_views=1000, promo_delay=0, reactions_enabled=True)
     live = build_world(live_cfg)
     bot, live_registry, _ = await make_bot(live)
@@ -1864,7 +1973,7 @@ async def check_views():
     check("в меню есть «Мои каналы»", "topics" in cells, str(cells))
 
     await panel.on_button(pclient, press("cat|21"))
-    check("экран канала показывает число по умолчанию", "Просмотров на пост: 1000" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
+    check("экран канала показывает число по умолчанию", "1000 на каждый пост" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
     check("у канала своя кнопка просмотров", "cv|21" in panel_buttons(), str(panel_buttons()))
 
     await panel.on_button(pclient, press("cv|21"))
@@ -1898,7 +2007,7 @@ async def check_views():
           str(panel_registry.views_for(panel_registry.categories[21])))
 
     await panel.on_button(pclient, press("status"))
-    check("статус показывает число по умолчанию", "Просмотры по умолчанию" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
+    check("статус показывает число по умолчанию", "Просмотры для новых каналов" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
 
 
 async def check_legal():
@@ -1998,6 +2107,7 @@ def _tenant_row(tenant_id: int = 777, balance: int = 0, until=None, target: str 
         "target_ok": False,
         "views": 0,
         "reactions": True,
+        "rewrite": True,
         "balance_rub": balance,
         "plan_until": until,
         "agreed_at": None,
@@ -2079,6 +2189,9 @@ class MemoryStore:
 
     async def set_reactions(self, tenant_id, enabled):
         (await self.ensure_tenant(tenant_id)).reactions = enabled
+
+    async def set_rewrite(self, tenant_id, enabled):
+        (await self.ensure_tenant(tenant_id)).rewrite = enabled
 
     async def set_target_ok(self, tenant_id, ok, title=""):
         tenant = await self.ensure_tenant(tenant_id)
@@ -2388,7 +2501,7 @@ async def check_cabinet():
 
     # ---- новичок: первое окно ----
     await panel.on_message(client, Message(client, 6001, petr, text="/start"))
-    check("новичок попадает в пошаговый запуск", "Пошаговый запуск" in reply_text() and "Шаг 1 из 4" in reply_text(), reply_text()[:90])
+    check("новичок попадает в пошаговый запуск", "Пошаговый запуск" in reply_text() and "Шаг 1 из 5" in reply_text(), reply_text()[:90])
     check("первый шаг назван человеческим словом", "Откуда брать посты" in reply_text(), reply_text()[:160])
     check("первый экран начинается с инструкции", "Что сделать" in reply_text() and "➕ Добавить канал" in reply_text(), reply_text()[:200])
     check("в кабинете свои кнопки", "cadd" in reply_cells() and "cnext" in reply_cells(), str(reply_cells()))
@@ -2437,7 +2550,7 @@ async def check_cabinet():
     await panel.on_message(client, Message(client, 6008, petr, text="https://t.me/petr_ch"))
     check("после отказа ввод принимается снова", store.tenants[petr.id].target == "petr_ch", store.tenants[petr.id].target)
 
-    # ---- шаг 3: просмотры ----
+    # ---- шаг 4: просмотры ----
     await panel.on_button(client, tap("cviews"))
     check("диапазон просмотров назван", "10000" in text(), text()[:300])
     check("ноль назван выбором человека", "не накручивать" in text(), text()[:320])
@@ -2461,7 +2574,7 @@ async def check_cabinet():
     await panel.on_button(client, tap("creactions"))
     check("реакции включаются обратно", store.tenants[petr.id].reactions is True and "включены" in text(), text()[:200])
 
-    # ---- шаг 4: тариф и оплата ----
+    # ---- шаг 5: тариф и оплата ----
     await panel.on_button(client, tap("cplans"))
     check("цены названы", "Неделя - 600 ₽" in text() and "Месяц - 2000 ₽" in text(), text()[:200])
     check("что входит - перечислено", "постов в сутки" in text(), text()[:280])
@@ -2520,7 +2633,7 @@ async def check_cabinet_launch():
     print("\n[23] Пошаговый запуск и экран «Результат»: идёт либо названа причина")
     from store import MAX_POSTS_PER_DAY
 
-    cfg = make_cfg(bot_token="900:AAstub")
+    cfg = make_cfg(bot_token="900:AAstub", minimax_api_key="key")
     world = build_world(cfg)
     client = world["client"]
     bot, registry, _ = await make_bot(world)
@@ -2545,18 +2658,26 @@ async def check_cabinet_launch():
         return client.replies[-1]
 
     await panel.on_message(client, Message(client, 6101, nina, text="/start"))
-    check("первый экран ведёт за руку", "Шаг 1 из 4 - Откуда брать посты" in reply()[1], reply()[1][:80])
+    check("первый экран ведёт за руку", "Шаг 1 из 5 - Откуда брать посты" in reply()[1], reply()[1][:80])
     check("у шага есть кнопка «Дальше»", "cnext" in reply()[2].inline_keyboard[-1][0].callback_data, reply()[1][:60])
 
     await panel.on_button(client, tap("cstart"))
-    check("«Пошаговый запуск» открывает шаг 1", "Шаг 1 из 4" in text(), text()[:70])
+    check("«Пошаговый запуск» открывает шаг 1", "Шаг 1 из 5" in text(), text()[:70])
     await panel.on_button(client, tap("cnext"))
-    check("«Дальше» ведёт к каналу публикации", "Шаг 2 из 4 - Куда публиковать" in text(), text()[:90])
+    check("«Дальше» ведёт к каналу публикации", "Шаг 2 из 5 - Куда публиковать" in text(), text()[:90])
     check("без рабочего аккаунта просят помощь", "нажми «🆘 Помощь»" in text(), text()[-200:])
     await panel.on_button(client, tap("cnext"))
-    check("просмотры остаются в walkthrough", "Шаг 3 из 4 - Просмотры на пост" in text(), text()[:90])
+    check("шаг про выбор человека", "Шаг 3 из 5 - Текст поста" in text(), text()[:90])
+    check("и объясняет переключатель", "Сейчас: переписывает нейросеть" in text() and "cretext" in cells(), text()[:260])
+    await panel.on_button(client, tap("cretext"))
+    check("переключатель выключает переписывание", store.tenants[nina.id].rewrite is False
+          and "Сейчас: публикуем словами автора" in text(), text()[:300])
+    await panel.on_button(client, tap("cretext"))
+    check("и включает обратно", store.tenants[nina.id].rewrite is True and "cretext" in cells(), str(cells()))
     await panel.on_button(client, tap("cnext"))
-    check("последний шаг - тариф", "Шаг 4 из 4 - Тариф и оплата" in text(), text()[:90])
+    check("просмотры остаются в walkthrough", "Шаг 4 из 5 - Просмотры на пост" in text(), text()[:90])
+    await panel.on_button(client, tap("cnext"))
+    check("последний шаг - тариф", "Шаг 5 из 5 - Тариф и оплата" in text(), text()[:90])
     await panel.on_button(client, tap("cnext"))
     check("пройдены все шаги - «Готово»", "Готово - все шаги пройдены" in text(), text()[:90])
     check("и предлагают результат", "cresult" in cells(), str(cells()))
@@ -2564,7 +2685,7 @@ async def check_cabinet_launch():
     # ---- экран результата: по одной настоящей причине за раз ----
     await panel.on_button(client, tap("cresult"))
     check("без тарифа названа причина", "нужен оплаченный тариф" in text(), text()[:180])
-    check("и сказано, что нажать", "нажми «4️⃣ Тариф»" in text(), text()[:220])
+    check("и сказано, что нажать", "нажми «5️⃣ Тариф»" in text(), text()[:220])
     check("числа видены всегда", "Постов сегодня: 0 из 50" in text() and "Последний пост: постов ещё не было" in text(), text()[-300:])
 
     await panel.on_button(client, tap("cadd"))
@@ -2604,7 +2725,7 @@ async def check_cabinet_launch():
     # ---- помощник и оплата без реквизитов ----
     await panel.on_button(client, tap("cguide"))
     check("помощь объясняет каждую кнопку", "Что делает каждая кнопка" in text() and "📊 Результат" in text(), text()[:200])
-    check("и порядок шагов", "1️⃣ Откуда брать посты" in text() and "4️⃣ Тариф" in text(), text()[:300])
+    check("и порядок шагов", "1️⃣ Откуда брать посты" in text() and "5️⃣ Тариф" in text(), text()[:300])
     await store.set_agreed(nina.id)
     await panel.on_button(client, tap("ctopup"))
     check("без реквизитов обещают прислать их", "Реквизиты пришлю" in text() and "cguide" in cells(), text()[-200:])

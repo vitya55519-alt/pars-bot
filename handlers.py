@@ -42,7 +42,7 @@ OTHER_MEDIA = ("video", "animation", "document", "audio", "voice", "video_note",
 
 @dataclass
 class Destination:
-    """Куда положить переписанный пост и с какими настройками: у клиента они свои.
+    """Куда положить пост и с какими настройками: у клиента они свои.
 
     Один пост донора умеет разойтись по нескольким каналам - своему складу и
     кабинетам клиентов, которые подписаны на того же донора. Рерайт тогда
@@ -54,6 +54,7 @@ class Destination:
     label: str
     views: Optional[int] = None
     reactions: bool = True
+    rewrite: bool = True
     tenant_id: int = 0
 
 
@@ -119,7 +120,36 @@ class ParsBot:
         self.client.add_handler(MessageHandler(self.on_message, is_donor & has_text & ~filters.outgoing))
         self.controls.setup()
 
-        log.info("Доноров в списке: %s.", self.registry.donor_count)
+        log.info("Каналов, откуда берём посты: %s.", self.registry.donor_count)
+        await self._report_sources()
+
+    async def _report_sources(self) -> None:
+        """Пишем в журнал, что аккаунт реально видит в каждом канале-источнике.
+
+        «Ничего не ловит» почти всегда значит одно: канал не открылся этому
+        аккаунту или там просто не было новых постов. По этим строкам видно какое.
+        """
+        for category in self.registry.categories.values():
+            where = category.target_name or category.problem or "канал не определён"
+            for donor in category.donors.values():
+                log.info(
+                    "Источник %s -> постим в %s: %s",
+                    donor.name,
+                    where,
+                    await self._source_state(donor.chat_id),
+                )
+
+    async def _source_state(self, chat_id: int) -> str:
+        try:
+            history = await self._history(chat_id, 3)
+        except Exception as exc:  # noqa: BLE001 - доступ к каналу мог пропасть
+            return f"не открылся ({type(exc).__name__}) - этот аккаунт должен быть подписан"
+        if not history:
+            return "сообщений нет"
+        posts = [message for message in history if post_text(message)]
+        if not posts:
+            return f"постов с текстом не нашли (последнее сообщение {self._ago(history[-1])})"
+        return f"последний пост {self._ago(posts[-1])}"
 
     def _remember(self, store: "OrderedDict[str, None]", key: str) -> None:
         """Память на этот запуск: пачки карточек и уже отправленные посты, не больше cache_size."""
@@ -159,7 +189,8 @@ class ParsBot:
         if category is not None:
             if not category.target:
                 log.warning(
-                    "Тема «%s» без целевого канала - пост %s пропущен: переименуй тему в канал, куда постить.",
+                    "Канал «%s» без адреса, куда публиковать - пост %s пропущен: "
+                    "в названии темы укажи @юзернейм канала или назови тему так же, как канал.",
                     category.name,
                     message.id,
                 )
@@ -168,9 +199,10 @@ class ParsBot:
                     Destination(
                         target=category.target,
                         name=category.target_name,
-                        label=f"тема «{category.name}»",
+                        label=f"мой канал {category.target_name}",
                         views=self.registry.views_for(category),
                         reactions=self.registry.reactions_for(category),
+                        rewrite=self.registry.rewrite_for(category),
                     )
                 )
         for tenant in await self._tenants(message.chat.id):
@@ -196,6 +228,7 @@ class ParsBot:
             label=f"клиент {tenant.id}",
             views=tenant.views,
             reactions=tenant.reactions,
+            rewrite=tenant.rewrite,
             tenant_id=tenant.id,
         )
 
@@ -203,7 +236,7 @@ class ParsBot:
         """Подпись донора - его @юзернейм и ссылки на его канал - в наш канал попадать не должна."""
         cleaned = strip_source(text, chat)
         if cleaned != text:
-            log.info("Убрал подпись донора %s из текста поста.", chat_name(chat))
+            log.info("Убрал подпись канала-источника %s из текста поста.", chat_name(chat))
         return cleaned
 
     async def _single(self, message: Message, dests: List[Destination]) -> None:
@@ -217,18 +250,32 @@ class ParsBot:
 
         original = post_text(message)
         if not original:
-            log.info("В посте нет текста - пропуск (нечего рерайтить).")
+            log.info("В посте нет текста - пропуск (перепечатывать нечего).")
             return
 
-        text = self._drop_source(await self.ai.rewrite(original), message.chat)
-        log.info("Рерайт завершён (%s символов).", len(text))
+        author = self._drop_source(original, message.chat)
+        rewritten = await self._rewritten(message, dests, author)
 
         for dest in dests:
             if not await self._allowed(dest):
                 continue
-            posted = await self._publish(dest, message, text)
+            posted = await self._publish(dest, message, self._text_for(dest, author, rewritten))
             await self._published(dest, posted, message)
             await self._boost(dest, posted)
+
+    async def _rewritten(self, message: Message, dests: List[Destination], author: str) -> str:
+        """Переписанный текст считаем только если он кому-то нужен: лишний запрос к ИИ - лишние деньги."""
+        if not any(dest.rewrite for dest in dests):
+            log.info("Переписывание выключено у всех адресатов - публикуем текст автора.")
+            return ""
+        text = strip_source(await self.ai.rewrite(author), message.chat)
+        log.info("Рерайт завершён (%s символов).", len(text))
+        return text
+
+    @staticmethod
+    def _text_for(dest: Destination, author: str, rewritten: str) -> str:
+        """Что уходит в этот канал: переписанный текст или текст автора - выбор человека, а не наша догадка."""
+        return (rewritten or author) if dest.rewrite else author
 
     async def _allowed(self, dest: Destination) -> bool:
         """Суточный лимит клиента: складу владельца он не нужен, у него один хозяин."""
@@ -284,24 +331,25 @@ class ParsBot:
             log.info("В альбоме %s нет текста - пропуск.", group_id)
             return
 
-        text = self._drop_source(await self.ai.rewrite(original), message.chat)
+        author = self._drop_source(original, message.chat)
+        rewritten = await self._rewritten(message, dests, author)
 
         if not photos:
             log.info("В альбоме %s нет фото - публикую его текст обычным постом.", group_id)
             for dest in dests:
                 if not await self._allowed(dest):
                     continue
-                posted = await self._publish(dest, message, text)
+                posted = await self._publish(dest, message, self._text_for(dest, author, rewritten))
                 await self._published(dest, posted, message)
                 await self._boost(dest, posted)
             return
 
-        log.info("Рерайт альбома завершён (%s символов, карточек %s).", len(text), len(photos[:TELEGRAM_ALBUM_LIMIT]))
-        caption = cut(text, self.cfg.caption_limit)
+        log.info("Альбом: карточек %s, текстов %s символов.", len(photos[:TELEGRAM_ALBUM_LIMIT]), len(rewritten or author))
 
         for dest in dests:
             if not await self._allowed(dest):
                 continue
+            caption = cut(self._text_for(dest, author, rewritten), self.cfg.caption_limit)
             media: List[InputMediaPhoto] = [
                 InputMediaPhoto(media=item.photo.file_id, caption=caption if index == 0 else "")
                 for index, item in enumerate(photos[:TELEGRAM_ALBUM_LIMIT])
@@ -516,15 +564,16 @@ class ParsBot:
                 for message in await self._missed(category):
                     todo.append((category, message))
         if not todo:
-            return "Пропущенного нет: всё свежее у доноров уже лежит в каналах."
+            return "Пропущенного нет: всё свежее уже лежит в каналах."
         done = 0
         for category, message in todo[:limit]:
             dest = Destination(
                 target=category.target,
                 name=category.target_name,
-                label=f"тема «{category.name}» (догон)",
+                label=f"мой канал {category.target_name} (догон)",
                 views=self.registry.views_for(category),
                 reactions=self.registry.reactions_for(category),
+                rewrite=self.registry.rewrite_for(category),
             )
             try:
                 await self._single(message, [dest])

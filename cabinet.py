@@ -1,8 +1,9 @@
 """Личный кабинет клиента в том же боте.
 
-Владелец аккаунта видит панель склада, все остальные - кабинет: откуда брать
-посты, куда их выкладывать, сколько просмотров, идут ли реакции. Всё живёт в
-базе, поэтому между перезапусками бот ничего не должен помнить сам.
+Владелец аккаунта видит своё меню, все остальные - кабинет: откуда брать
+посты, куда их выкладывать, переписывать ли текст, сколько просмотров, идут
+ли реакции. Всё живёт в базе, поэтому между перезапусками бот ничего не
+должен помнить сам.
 
 Тексты читаются как инструкция: нажал кнопку - получил, что сделать по шагам и
 что будет дальше. Служебных слов («склад», «тема», «донор») человек не видит:
@@ -25,10 +26,11 @@ log = logging.getLogger("cabinet")
 VIEWS_PRESETS = (0, 500, 1000, 2000, 5000)
 
 # порядок пошагового запуска: один экран - один шаг, «Дальше» ведёт по ним
-STEPS = ("donors", "channel", "views", "plans")
+STEPS = ("donors", "channel", "text", "views", "plans")
 STEP_TITLES = {
     "donors": "Откуда брать посты",
     "channel": "Куда публиковать",
+    "text": "Текст поста: переписывать или нет",
     "views": "Просмотры на пост",
     "plans": "Тариф и оплата",
 }
@@ -82,6 +84,7 @@ class Cabinet:
         "cstart": "wizard",
         "cdonors": "donors",
         "cchannel": "channel",
+        "ctext": "text",
         "cviews": "views",
         "cplans": "plans",
         "cresult": "result",
@@ -165,6 +168,8 @@ class Cabinet:
             await self._remove_donor(query, int(arg or 0))
         elif key == "creactions":
             await self._toggle_reactions(query)
+        elif key == "cretext":
+            await self._toggle_rewrite(query)
         elif key == "cbuy":
             await self._buy(query, arg)
         elif key == "cagree":
@@ -203,6 +208,17 @@ class Cabinet:
             else "✨ Реакции выключены - заказы не отправляю, посты публикуются как раньше.",
         )
         await self._show(query, "reactions")
+
+    async def _toggle_rewrite(self, query) -> None:
+        tenant = await self.store.ensure_tenant(query.from_user.id)
+        await self.store.set_rewrite(tenant.id, not tenant.rewrite)
+        self._note(
+            tenant.id,
+            "✏️ Включил: каждый пост переписывается своими словами - он не совпадает с оригиналом."
+            if not tenant.rewrite
+            else "✏️ Выключил: пост выходит теми же словами, что написал автор канала-источника.",
+        )
+        await self._show(query, "text")
 
     async def _buy(self, query, kind: str) -> None:
         if kind not in PLANS:
@@ -252,7 +268,8 @@ class Cabinet:
             donor = await self.store.add_donor(user_id, parse_ref(text))
             self._note(
                 user_id,
-                f"✅ Добавил {ref_word(donor.ref)} в источники.\nБот подпишется сам и начнёт читать этот канал.",
+                f"✅ Добавил {ref_word(donor.ref)}: буду читать этот канал.\n"
+                "Бот подпишется сам и начнёт ловить каждый новый пост этого канала.",
             )
         elif kind == "views":
             number = parse_views(text, low=0)
@@ -292,13 +309,13 @@ class Cabinet:
 
     @staticmethod
     def _next_step(tenant: Tenant, donors: List, now: datetime.datetime) -> int:
-        """С какого шага начинать: просмотры - не преграда, там и ноль бывает выбором."""
+        """С какого шага начинать: просмотры и переписывание - не преграда, там всё уже выбрано по умолчанию."""
         if not donors:
             return 0
         if not tenant.target:
             return 1
         if not tenant.active(now):
-            return 3
+            return STEPS.index("plans")
         return len(STEPS)
 
     async def _step(self, user_id: int) -> int:
@@ -357,6 +374,25 @@ class Cabinet:
                 f"Сейчас: {channel_line(tenant)}",
             ), markup([("⬅️ К шагу 2", "cchannel")])
 
+        if kind == "text":
+            return self._notice(
+                user_id,
+                "Что сделать:\n"
+                "Выбери одним переключателем ниже, что делать с текстом чужого поста.\n\n"
+                "Как это работает:\n"
+                "• Переписывать - бот просит нейросеть написать тот же смысл другими\n"
+                "   словами. Пост перестаёт совпадать с оригиналом, картинка остаётся та же.\n"
+                "• Словами автора - бот публикует текст точно как в канале-источнике.\n\n"
+                "Что выбрать:\n"
+                "Если не хочешь, чтобы в твоём канале лежали чужие тексты слово в слово,\n"
+                "оставь переписывание. Если важен оригинальный текст - выключи.\n\n"
+                f"Сейчас: {self._text_line(tenant)}",
+            ), markup(
+                [self._text_cell(tenant)],
+                [("📊 Результат", "cresult")],
+                [("⬅️ Кабинет", "chome")],
+            )
+
         if kind == "views":
             presets = [
                 [("не накручивать (0)" if count == 0 else str(count), f"cviews|{count}") for count in VIEWS_PRESETS[:3]],
@@ -407,13 +443,14 @@ class Cabinet:
             return self._notice(
                 user_id,
                 "Что делает каждая кнопка\n\n"
-                "🚀 Пошаговый запуск - четыре шага по порядку, от ссылок до тарифа.\n"
+                "🚀 Пошаговый запуск - пять шагов по порядку, от ссылок до тарифа.\n"
                 f"1️⃣ Откуда брать посты - каналы, которые читаем. До {MAX_DONORS} штук.\n"
                 "2️⃣ Куда публиковать - твой канал и как добавить рабочего аккаунта.\n"
-                f"3️⃣ Просмотры - число от 0 до {VIEWS_LIMIT} на каждый пост. 0 - не накручивать.\n"
+                "3️⃣ Текст поста - переписывать чужой текст своими словами или публиковать как есть.\n"
+                f"4️⃣ Просмотры - число от 0 до {VIEWS_LIMIT} на каждый пост. 0 - не накручивать.\n"
+                "5️⃣ Тариф - цена, баланс, оплата и срок подписки.\n"
                 "✨ Реакции - бесплатная накрутка реакций, включается и выключается.\n"
                 "📊 Результат - видно, работает ли всё сейчас и что нажать, если нет.\n"
-                "4️⃣ Тариф - цена, баланс, оплата и срок подписки.\n"
                 "📄 Соглашение и 🔒 Политика - документы сервиса, читаются прямо в боте.\n\n"
                 f"Рабочий аккаунт, которого нужно добавить в администраторы: {self.worker}\n\n"
                 "Дальше ничего нажимать не нужно: посты выходят сами, как только у источника\n"
@@ -482,11 +519,13 @@ class Cabinet:
             "",
             "Бот читает каналы, которые ты укажешь, переписывает их посты своими",
             "словами и выкладывает в твой канал. Следом добавляет просмотры и реакции.",
+            "Переписывание, просмотры и реакции включаются и выключаются по отдельности.",
             "",
             f"1️⃣ Откуда брать посты: {len(donors)} из {MAX_DONORS} (читаю {bound})",
             f"2️⃣ Куда публиковать: {channel_line(tenant)}",
-            f"3️⃣ Просмотры: {views_line(tenant)}",
-            f"4️⃣ Тариф: {plan_line(tenant, now)}",
+            f"3️⃣ Текст поста: {self._text_line(tenant)}",
+            f"4️⃣ Просмотры: {views_line(tenant)}",
+            f"5️⃣ Тариф: {plan_line(tenant, now)}",
         ]
         payments = await self.store.list_payments(user_id, 3)
         if payments:
@@ -507,7 +546,8 @@ class Cabinet:
         return self._notice(user_id, "\n".join(lines)), markup(
             *rows,
             [("1️⃣ Откуда брать посты", "cdonors"), ("2️⃣ Куда публиковать", "cchannel")],
-            [("3️⃣ Просмотры", "cviews"), ("4️⃣ Тариф", "cplans")],
+            [("3️⃣ Текст поста", "ctext"), ("4️⃣ Просмотры", "cviews")],
+            [("5️⃣ Тариф", "cplans")],
             [("🆘 Помощь", "cguide")],
             [("📄 Соглашение", "cdoc|1"), ("🔒 Политика", "cdoc|2")],
         )
@@ -554,9 +594,10 @@ class Cabinet:
             lines += ["✅ Всё идёт - посты выходят сами.", ""]
         lines += [
             f"Канал: {channel_line(tenant)}",
-            f"Источники постов: {len(donors)} (читаю {bound})",
+            f"Каналы, откуда берём посты: {len(donors)} (читаю {bound})",
             f"Постов сегодня: {posts} из {MAX_POSTS_PER_DAY}",
             f"Последний пост: {tenant.last_post_phrase(now)}",
+            f"Текст поста: {self._text_line(tenant)}",
             f"Просмотры: {views_line(tenant)}",
             f"Реакции: {'включены' if tenant.reactions else 'выключены'} - {tenant.reactions_phrase()}",
             f"Тариф: {plan_line(tenant, now)}",
@@ -565,14 +606,15 @@ class Cabinet:
             lines += ["", "Не открылись: " + ", ".join(donor_problems[:5]), "   Проверь ссылку или убери канал кнопкой 🗑."]
         return self._notice(user_id, "\n".join(lines)), markup(
             [("1️⃣ Откуда брать посты", "cdonors"), ("2️⃣ Куда публиковать", "cchannel")],
-            [("4️⃣ Тариф", "cplans"), ("✨ Реакции", "cboost")],
+            [("3️⃣ Текст поста", "ctext"), ("4️⃣ Просмотры", "cviews")],
+            [("5️⃣ Тариф", "cplans"), ("✨ Реакции", "cboost")],
             [("⬅️ Кабинет", "chome")],
         )
 
     def _blocker(self, tenant: Tenant, donors: List, bound: int, posts: int) -> Optional[Tuple[str, str]]:
         """Первая настоящая причина, по которой пост сейчас не выйдет, и что нажать."""
         if not tenant.active(now_utc()):
-            return ("нужен оплаченный тариф", "нажми «4️⃣ Тариф» - неделя или месяц, оплата с баланса")
+            return ("нужен оплаченный тариф", "нажми «5️⃣ Тариф» - неделя или месяц, оплата с баланса")
         if not donors:
             return ("не указан ни один канал-источник", "нажми «1️⃣ Откуда брать посты» и пришли ссылку на канал")
         if not bound:
@@ -601,8 +643,9 @@ class Cabinet:
             return self._notice(
                 user_id,
                 "Готово - все шаги пройдены.\n\n"
-                f"• Источники постов: {len(donors)}\n"
+                f"• Каналы, откуда берём посты: {len(donors)}\n"
                 f"• Публикуем в: {channel_line(tenant)}\n"
+                f"• Текст поста: {self._text_line(tenant)}\n"
                 f"• Просмотры: {views_line(tenant)}\n"
                 f"• Тариф: {plan_line(tenant, now)}\n\n"
                 "Дальше бот работает сам: ловит новый пост источника, переписывает его,\n"
@@ -620,6 +663,18 @@ class Cabinet:
 
     def _reactions_cell(self, tenant: Tenant) -> Tuple[str, str]:
         return ("✨ Реакции: выключить" if tenant.reactions else "✨ Реакции: включить", "creactions")
+
+    def _text_line(self, tenant: Tenant) -> str:
+        """Честная строка про текст: без ключа нейросети переписывание не работает, как бы ни стояло."""
+        if not tenant.rewrite:
+            return "публикуем словами автора"
+        if not self.cfg.minimax_api_key:
+            return "переписывание включено, но ключа нейросети нет - выходит словами автора"
+        return f"переписывает нейросеть ({self.cfg.ai_model})"
+
+    def _text_cell(self, tenant: Tenant) -> Tuple[str, str]:
+        """Переключатель: надпись показывает, как сейчас, - нажал и стало наоборот."""
+        return ("✏️ Текст: переписывает ИИ" if tenant.rewrite else "✏️ Текст: словами автора", "cretext")
 
     @property
     def worker(self) -> str:
@@ -650,6 +705,7 @@ class Cabinet:
             "cchannel": "channel",
             "cset_target": "channel",
             "creactions": "reactions",
+            "cretext": "text",
             "cnext": "wizard",
         }.get(key, "home")
 

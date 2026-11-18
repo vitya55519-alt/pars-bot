@@ -5,19 +5,29 @@ from typing import List, Union
 
 MINIMAX_URL = "https://api.minimax.io/v1/chat/completions"
 DEFAULT_MODEL = "MiniMax-M3"
-EFFORTS = ("low", "medium", "high", "xhigh", "max")
+THINKING_MODES = ("disabled", "adaptive")
 
 # потолок сервиса накрутки: больше десяти тысяч просмотров за заказ он не даёт
 VIEWS_LIMIT = 10000
 
 DEFAULT_PROMPT = (
-    "Ты — редактор Telegram-канала. Перепиши присланный рекламный или бизнес-пост своими словами. "
-    "Сохрани смысл, все факты, цифры, цены и призыв к действию. "
-    "Сделай текст вовлекающим: цепляющая первая строка, короткие абзацы, 1-3 эмодзи в меру. "
+    "Ты — редактор русскоязычного Telegram-канала. Перепиши присланный рекламный или бизнес-пост "
+    "своими словами, чтобы текст стал уникальным и не совпадал с оригиналом дословно. "
+    "Отвечай только по-русски, даже если оригинал на другом языке. "
+    "Сохрани смысл, все факты, цифры, цены, названия и призыв к действию — ничего не придумывай. "
+    "Сделай текст вовлекающим: цепляющая первая строка, короткие абзацы, 1-3 эмодзи в меру, "
+    "переносы строк как в посте. "
     "Полностью удали ссылки, юзернеймы, @упоминания и любые упоминания авторов, доноров и исходных каналов. "
-    "Не придумывай ничего, чего нет в оригинале. "
-    "Выведи только готовый текст поста, без пояснений, заголовков и кавычек."
+    "Уложись примерно в 900 знаков: если оригинал длиннее, сожми его, не теряя фактов. "
+    "Выведи только готовый текст поста — без размышлений, без служебных тегов, без пояснений, "
+    "заголовков, кавычек и слова «Вот»."
 )
+
+
+def thinking_mode(raw: str) -> str:
+    """Как просить MiniMax не рассуждать вслух: по умолчанию «выключено», «adaptive» - по желанию."""
+    value = (raw or "").strip().casefold()
+    return "adaptive" if value in THINKING_MODES else "disabled"
 
 
 class ConfigError(Exception):
@@ -83,7 +93,8 @@ class Config:
     ai_model: str = DEFAULT_MODEL
     ai_prompt: str = DEFAULT_PROMPT
     ai_max_tokens: int = 2000
-    ai_reasoning_effort: str = "low"
+    ai_thinking: str = "disabled"
+    rewrite_default: bool = True
     ai_timeout: int = 90
     ai_retries: int = 3
     ai_retry_delay: int = 5
@@ -138,7 +149,8 @@ class Config:
             ai_model=_text("AI_MODEL", DEFAULT_MODEL),
             ai_prompt=_text("AI_SYSTEM_PROMPT", DEFAULT_PROMPT),
             ai_max_tokens=int(_number("AI_MAX_TOKENS", 2000)),
-            ai_reasoning_effort=_text("AI_REASONING_EFFORT", "low"),
+            ai_thinking=thinking_mode(_text("AI_THINKING")),
+            rewrite_default=_flag("REWRITE", True),
             ai_timeout=int(_number("AI_TIMEOUT", 90)),
             ai_retries=int(_number("AI_RETRIES", 3)),
             ai_retry_delay=int(_number("AI_RETRY_DELAY", 5)),
@@ -181,12 +193,22 @@ class Config:
             if self.clients_enabled
             else "кабинетов нет: DATABASE_URL не задан - работает только твоя панель"
         )
+        thinking = "размышления вслух выключены" if self.ai_thinking == "disabled" else "размышления вслух включены"
+        if not self.minimax_api_key:
+            ai = "ключа MINIMAX_API_KEY нет - публикуем оригинальный текст"
+        else:
+            ai = f"{self.ai_model} ({thinking}), попыток: {self.ai_retries}, пауза: {self.ai_retry_delay} сек"
+        rewrite = (
+            "переписывает нейросеть (по умолчанию, у каждого канала своё)"
+            if self.rewrite_default
+            else "своими словами автора, без нейросети (по умолчанию, у каждого канала своё)"
+        )
         return (
             f"Группа управления донорами: {group}\n"
             f"Панель кнопок: {panel}\n"
             f"Клиенты: {clients}\n"
             f"Промо-бот: {promo}\n"
             f"Реакции: {reactions}\n"
-            f"Нейросеть: {self.ai_model} (глубина {self.ai_reasoning_effort}), "
-            f"попыток: {self.ai_retries}, пауза: {self.ai_retry_delay} сек"
+            f"Нейросеть: {ai}\n"
+            f"Текст поста: {rewrite}"
         )

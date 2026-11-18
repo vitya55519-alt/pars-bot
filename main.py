@@ -106,7 +106,7 @@ async def amain(cfg: Config) -> None:
                 await asyncio.sleep(60)
 
         log.info("Настройки:\n%s", cfg.describe())
-        log.info("Готов - жду новые посты от доноров.")
+        log.info("Готов - жду новые посты из каналов-источников.")
         sync = asyncio.create_task(clients_loop(clients)) if clients else None
         await idle()
     except (Unauthorized, SessionExpired, SessionRevoked) as exc:
