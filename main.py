@@ -148,8 +148,12 @@ async def amain(cfg: Config) -> None:
             await idle()
         finally:
             beat.cancel()
-    except (Unauthorized, SessionExpired, SessionRevoked) as exc:
-        log.error("Сессия недействительна (%s). Нужно создать SESSION_STRING заново: python make_session.py", type(exc).__name__)
+    except SESSION_ERRORS as exc:
+        log.error(
+            "Telegram не принимает этот вход (%s): посты ловиться не будут, пока не сделаешь новый - "
+            "python make_session.py --window, затем обнови SESSION_STRING в Railway.",
+            type(exc).__name__,
+        )
         raise SystemExit(1)
     finally:
         if sync:

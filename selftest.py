@@ -1554,6 +1554,11 @@ def check_startup_wiring() -> None:
     )
     check("панель не перекрывает остальных", "panel_live" not in source, "panel_live")
     check("ловля постов докладывает о себе сама", "asyncio.create_task(bot.heartbeat())" in source, "heartbeat")
+    check(
+        "отозванный вход описан словами, а не трейсбеком",
+        "except SESSION_ERRORS as exc" in source and "make_session.py --window" in source,
+        "SESSION_ERRORS",
+    )
 
 
 async def check_panel_login_flood():
