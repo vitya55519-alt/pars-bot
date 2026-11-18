@@ -1,13 +1,17 @@
 """Личный кабинет клиента в том же боте.
 
-Владелец аккаунта видит панель склада, все остальные - кабинет: свой канал,
-свои доноры, просмотры, баланс. Всё живёт в базе, поэтому между перезапусками
-бот ничего не должен помнить сам.
+Владелец аккаунта видит панель склада, все остальные - кабинет: откуда брать
+посты, куда их выкладывать, сколько просмотров, идут ли реакции. Всё живёт в
+базе, поэтому между перезапусками бот ничего не должен помнить сам.
+
+Тексты читаются как инструкция: нажал кнопку - получил, что сделать по шагам и
+что будет дальше. Служебных слов («склад», «тема», «донор») человек не видит:
+для него канал-источник и канал, куда посты ложатся.
 """
 
 import datetime
 import logging
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ai import cut
 from config import VIEWS_LIMIT, parse_views
@@ -19,30 +23,74 @@ log = logging.getLogger("cabinet")
 AGREEMENT_URL = "https://telegra.ph/Polzovatelskoe-soglashenie-08-01-39"
 PRIVACY_URL = "https://telegra.ph/Politika-konfidencialnosti-08-01-83"
 
-VIEWS_PRESETS = (500, 1000, 2000, 5000)
+# 0 - не ошибка ввода, а осознанный выбор человека: просмотры не накручивать
+VIEWS_PRESETS = (0, 500, 1000, 2000, 5000)
+
+# порядок пошагового запуска: один экран - один шаг, «Дальше» ведёт по ним
+STEPS = ("donors", "channel", "views", "plans")
+STEP_TITLES = {
+    "donors": "Откуда брать посты",
+    "channel": "Куда публиковать",
+    "views": "Просмотры на пост",
+    "plans": "Тариф и оплата",
+}
 
 # куда возвращаем человека, если он ошибся вводом
-SCREENS = {"channel": "channel", "donor": "donors", "views": "views", "sum": "plans"}
+SCREENS = {"donor": "donors", "channel": "channel", "views": "views", "sum": "plans"}
 
 
 def date(value) -> str:
     return value.strftime("%d.%m.%Y") if value else "?"
 
 
+def now_utc() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def ref_word(ref) -> str:
+    """Как показать ссылку человеку: юзернейм - с собачкой, числовой id - как есть."""
+    value = str(ref or "")
+    if not value:
+        return "не указан"
+    return value if value.startswith("-") else f"@{value}"
+
+
 def plan_line(tenant: Tenant, now: datetime.datetime) -> str:
     if not tenant.active(now):
         return "⛔ не подключён - посты не публикуются"
-    return f"⏳ активен ещё {tenant.days_left(now)} дн. (до {date(tenant.plan_until)})"
+    return f"✅ активен ещё {tenant.days_left(now)} дн. (до {date(tenant.plan_until)})"
 
 
 def channel_line(tenant: Tenant) -> str:
     if not tenant.target:
-        return "➕ не указан"
-    return f"{tenant.target_title or tenant.target} - {'✅ доступ подтверждён' if tenant.target_ok else '⏳ ждёт проверки'}"
+        return "⛔ не указан"
+    return f"{ref_word(tenant.target)} - {'✅ доступ подтверждён' if tenant.target_ok else '⏳ проверяю доступ'}"
+
+
+def views_line(tenant: Tenant) -> str:
+    return f"{tenant.views} на каждый пост" if tenant.views else "не накручиваем (0)"
+
+
+def add_row(buttons, row: List[Tuple[str, str]]):
+    """Дописать ряд кнопок к готовому экрану: так пошаговый запуск не дублирует тексты шагов."""
+    rows = [[(button.text, button.callback_data) for button in line] for line in (buttons.inline_keyboard or [])]
+    rows.append(list(row))
+    return markup(*rows)
 
 
 class Cabinet:
-    SHOW = {"chome": "home", "cdocs": "docs", "cplans": "plans", "cdonors": "donors"}
+    SHOW = {
+        "chome": "home",
+        "cstart": "wizard",
+        "cdonors": "donors",
+        "cchannel": "channel",
+        "cviews": "views",
+        "cplans": "plans",
+        "cresult": "result",
+        "cguide": "guide",
+        "cboost": "reactions",
+        "cdocs": "docs",
+    }
 
     def __init__(self, client, cfg, store):
         self.client = client
@@ -50,6 +98,7 @@ class Cabinet:
         self.store = store
         self.awaiting: Dict[int, Tuple[str, int]] = {}
         self.notice: Dict[int, str] = {}
+        self.wizard: Dict[int, int] = {}
 
     # ==== вход ====
 
@@ -61,7 +110,7 @@ class Cabinet:
             await self._apply_text(message, kind, text)
             return
 
-        body, buttons = await self._view(user_id, "home")
+        body, buttons = await self._view(user_id, await self._entry(user_id))
         await call(message.reply, cut(body, TEXT_LIMIT), reply_markup=buttons)
 
     async def on_button(self, query) -> None:
@@ -74,6 +123,12 @@ class Cabinet:
             log.error("Кабинет: кнопка «%s» не сделалась: %s: %s", query.data, type(exc).__name__, exc)
             await call(query.answer, f"Ошибка: {type(exc).__name__}", show_alert=True)
 
+    async def _entry(self, user_id: int) -> str:
+        """Новичок попадает сразу в пошаговый запуск, у настроенного - обычный кабинет."""
+        tenant = await self.store.ensure_tenant(user_id)
+        donors = await self.store.list_donors(user_id)
+        return "wizard" if self._next_step(tenant, donors, now_utc()) == 0 else "home"
+
     # ==== разбор кнопок ====
 
     async def _route(self, query) -> None:
@@ -82,20 +137,24 @@ class Cabinet:
         key = parts[0]
         arg = parts[1] if len(parts) > 1 else ""
 
-        if key in self.SHOW:
-            await self._show(query, self.SHOW[key])
-        elif key == "cchannel":
-            self.awaiting[user_id] = ("channel", 0)
-            await self._show(query, "channel")
-        elif key == "cadd":
-            self.awaiting[user_id] = ("donor", 0)
-            await self._show(query, "add")
-        elif key == "cviews":
+        if key == "cviews":
+            # раньше SHOW: у готовых кнопок числа есть arg, и он обязан примениться, а не открыть экран
             if arg:
                 await self._apply(user_id, "views", arg)
             else:
                 self.awaiting[user_id] = ("views", 0)
             await self._show(query, "views")
+        elif key in self.SHOW:
+            await self._show(query, self.SHOW[key])
+        elif key == "cset_target":
+            self.awaiting[user_id] = ("channel", 0)
+            await self._show(query, "target")
+        elif key == "cadd":
+            self.awaiting[user_id] = ("donor", 0)
+            await self._show(query, "add")
+        elif key == "cnext":
+            self.wizard[user_id] = await self._step(user_id) + 1
+            await self._show(query, "wizard")
         elif key == "ctopup":
             tenant = await self.store.ensure_tenant(user_id)
             if not tenant.agreed:
@@ -114,22 +173,28 @@ class Cabinet:
             self._note(user_id, "✅ Спасибо, условия приняты.")
             await self._show(query, "plans")
         else:
-            await call(query.answer, "Такой кнопки нет - нажми «🏠 Кабинет».")
+            await call(query.answer, "Такой кнопки нет - нажми «⬅️ Кабинет».")
 
     async def _remove_donor(self, query, position: int) -> None:
         donors = await self.store.list_donors(query.from_user.id)
         if not 1 <= position <= len(donors):
-            self._note(query.from_user.id, "⚠ Этот донор уже убран.")
+            self._note(query.from_user.id, "⚠ Этот канал уже убран.")
         else:
-            await self.store.remove_donor(query.from_user.id, donors[position - 1].ref)
-            self._note(query.from_user.id, f"✅ Убрал {donors[position - 1].ref}.")
+            donor = donors[position - 1]
+            await self.store.remove_donor(query.from_user.id, donor.ref)
+            self._note(query.from_user.id, f"✅ Убрал {ref_word(donor.ref)}.")
         await self._show(query, "donors")
 
     async def _toggle_reactions(self, query) -> None:
         tenant = await self.store.ensure_tenant(query.from_user.id)
         await self.store.set_reactions(tenant.id, not tenant.reactions)
-        self._note(tenant.id, "🎭 Реакции включены." if not tenant.reactions else "🎭 Реакции выключены.")
-        await self._show(query, "home")
+        self._note(
+            tenant.id,
+            "✨ Реакции включены: каждый новый пост канала встаёт в очередь на бесплатный заказ."
+            if not tenant.reactions
+            else "✨ Реакции выключены - заказы не отправляю, посты публикуются как раньше.",
+        )
+        await self._show(query, "reactions")
 
     async def _buy(self, query, kind: str) -> None:
         if kind not in PLANS:
@@ -140,7 +205,7 @@ class Cabinet:
             await self._show(query, "agree")
             return
         if not tenant.target:
-            self._note(tenant.id, "⚠ Сначала укажи канал, куда постить.")
+            self._note(tenant.id, "⚠ Сначала укажи канал, куда постить - шаг 2.")
             await self._show(query, "channel")
             return
         await self.store.buy(tenant.id, kind)
@@ -168,19 +233,45 @@ class Cabinet:
 
     async def _apply(self, user_id: int, kind: str, text: str) -> None:
         if kind == "channel":
-            ref = parse_ref(text)
+            ref = self._public_ref(text)
             await self.store.set_target(user_id, str(ref), ref if isinstance(ref, int) else None, "")
-            self._note(user_id, f"✅ Записал канал {ref}. Появится галочка, когда рабочий аккаунт получит доступ.")
+            self._note(
+                user_id,
+                f"✅ Канал {ref_word(ref)} записал. Проверю, пускает ли рабочего аккаунта,"
+                "\nи поставлю отметку в «📊 Результат» - обычно это пара минут.",
+            )
         elif kind == "donor":
             donor = await self.store.add_donor(user_id, parse_ref(text))
-            self._note(user_id, f"✅ Донор {donor.ref} в списке - рабочий аккаунт подпишется сам.")
+            self._note(
+                user_id,
+                f"✅ Добавил {ref_word(donor.ref)} в источники.\nБот подпишется сам и начнёт читать этот канал.",
+            )
         elif kind == "views":
-            number = parse_views(text)
+            number = parse_views(text, low=0)
             await self.store.set_views(user_id, number)
-            self._note(user_id, f"✅ Просмотры: {number} на каждый пост.")
+            self._note(
+                user_id,
+                f"✅ Просмотры: {number} на каждый пост."
+                if number
+                else "✅ Просмотры не накручиваем - посты будут выходить без них.",
+            )
         elif kind == "sum":
             request_id = await self.store.request_topup(user_id, self._rubles(text))
-            self._note(user_id, f"✅ Заявка №{request_id} отправлена. Начислю баланс, как только увижу платёж.")
+            self._note(
+                user_id,
+                f"✅ Заявка №{request_id} принята. Посмотрю платёж и начислю сумму на баланс -"
+                "\nтогда и купишь тариф.",
+            )
+
+    @staticmethod
+    def _public_ref(text: str):
+        """Ссылка на канал клиента: закрытый адрес вида t.me/c/... не годится - по нему сервисы пост не найдут."""
+        if "t.me/c/" in (text or "").lower():
+            raise ValueError(
+                "Это закрытый канал - по такой ссылке ни промо-бот, ни реакции пост не увидят.\n"
+                "Открой свой канал → Изменить → Публичная ссылка и пришли адрес вида @name или https://t.me/name."
+            )
+        return parse_ref(text)
 
     @staticmethod
     def _rubles(text: str) -> int:
@@ -189,81 +280,173 @@ class Cabinet:
             raise ValueError(f"Напиши сумму цифрами, например 600 - от {MIN_TOPUP} ₽.")
         return int(digits)
 
+    # ==== пошаговый запуск ====
+
+    @staticmethod
+    def _next_step(tenant: Tenant, donors: List, now: datetime.datetime) -> int:
+        """С какого шага начинать: просмотры - не преграда, там и ноль бывает выбором."""
+        if not donors:
+            return 0
+        if not tenant.target:
+            return 1
+        if not tenant.active(now):
+            return 3
+        return len(STEPS)
+
+    async def _step(self, user_id: int) -> int:
+        tenant = await self.store.ensure_tenant(user_id)
+        donors = await self.store.list_donors(user_id)
+        return self.wizard.get(user_id, self._next_step(tenant, donors, now_utc()))
+
     # ==== экраны ====
 
     async def _view(self, user_id: int, kind: str) -> Tuple[str, object]:
         tenant = await self.store.ensure_tenant(user_id)
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = now_utc()
 
-        if kind == "channel":
-            return self._notice(
-                user_id,
-                "Куда постить.\n\n"
-                f"Сейчас: {channel_line(tenant)}\n\n"
-                "1) Добавь в администраторы своего канала рабочий аккаунт: "
-                f"{self.cfg.worker_contact or 'пришлю его в этом чате'}.\n"
-                "   Права: публиковать сообщения и оставлять реакции.\n"
-                "2) Напиши сюда ссылку на канал: @name или https://t.me/name.\n\n"
-                "Аккаунт проверит доступ, и посты пойдут сами.",
-            ), markup([("⬅️ Кабинет", "chome")])
+        if kind == "wizard":
+            return await self._wizard_view(user_id, tenant, now)
+
+        if kind == "donors":
+            return await self._donors_view(user_id, tenant)
 
         if kind == "add":
             return self._notice(
                 user_id,
-                "Пришли ссылку на канал-донор: @name или https://t.me/name.\n\n"
-                f"Подписываемся сами, максимум {MAX_DONORS} доноров на кабинет.",
-            ), markup([("⬅️ Доноры", "cdonors")])
+                "Пришли ссылку на канал-источник.\n\n"
+                "Где её взять: открой нужный канал, нажми на его название - в адресе будет\n"
+                "@name или https://t.me/name. Скопируй и пришли сюда одним сообщением.\n\n"
+                f"Сколько можно: до {MAX_DONORS} каналов. Бот подпишется на них сам, и через\n"
+                "пару минут начнёт ловить каждый новый пост этого канала.",
+            ), markup([("⬅️ К списку каналов", "cdonors")])
 
-        if kind == "donors":
-            donors = await self.store.list_donors(user_id)
-            lines = [f"Доноры ({len(donors)} из {MAX_DONORS}). Нажми 🗑, чтобы убрать:"]
-            if donors:
-                for donor in donors:
-                    status = f"✅ {donor.title or 'подписаны'}" if donor.chat_id else "⏳ ждёт подписки"
-                    lines.append(f"• {donor.ref} - {status}")
-            else:
-                lines.append("Пока никого. Нажми «➕ Добавить донора» и пришли ссылку на канал.")
-            rows = [[(f"🗑 {donor.ref[:24]}", f"cdel|{index}")] for index, donor in enumerate(donors, 1)]
-            return self._notice(user_id, "\n".join(lines)), markup(
-                *rows, [("➕ Добавить донора", "cadd")], [("⬅️ Кабинет", "chome")]
+        if kind == "channel":
+            return self._notice(
+                user_id,
+                "Что сделать:\n"
+                "1. Добавь рабочего аккаунта в администраторы своего канала:\n"
+                f"   {self.worker}\n"
+                "   Нужны два права: публиковать сообщения и оставлять реакции.\n"
+                "2. Нажми «📤 Указать мой канал» и пришли ссылку на него:\n"
+                "   @name или https://t.me/name.\n\n"
+                "Как поймёшь, что всё готово:\n"
+                "Появится «✅ доступ подтверждён» - с этого момента каждый новый пост из\n"
+                "каналов-источников выходит в твоём канале. Проверка занимает пару минут.\n\n"
+                f"Сейчас: {channel_line(tenant)}",
+            ), markup(
+                [("📤 Указать мой канал", "cset_target")],
+                [("📊 Результат", "cresult")],
+                [("⬅️ Кабинет", "chome")],
             )
+
+        if kind == "target":
+            return self._notice(
+                user_id,
+                "Пришли ссылку на свой канал: @name или https://t.me/name.\n\n"
+                "Канал должен быть публичным - с именем. Закрытая ссылка вида t.me/c/... не\n"
+                "подойдёт: по ней ни промо-бот, ни сервис реакций пост не найдут.\n"
+                "Публичную ссылку задают в настройках канала: Изменить → Публичная ссылка.\n\n"
+                f"Сейчас: {channel_line(tenant)}",
+            ), markup([("⬅️ К шагу 2", "cchannel")])
 
         if kind == "views":
-            body = self._notice(
+            presets = [
+                [("не накручивать (0)" if count == 0 else str(count), f"cviews|{count}") for count in VIEWS_PRESETS[:3]],
+                [(str(count), f"cviews|{count}") for count in VIEWS_PRESETS[3:]],
+            ]
+            return self._notice(
                 user_id,
-                f"Сейчас: {tenant.views if tenant.views else 'не задано'} просмотров на каждый пост.\n\n"
-                f"Напиши одно число от 1 до {VIEWS_LIMIT} или выбери готовое кнопкой.\n\n"
-                "Число остаётся в кабинете после перезапуска.",
+                "Сколько хочешь, столько и ставь.\n\n"
+                "Что сделать:\n"
+                f"1. Напиши одним числом, сколько просмотров добавлять к каждому посту - от 0\n"
+                f"   до {VIEWS_LIMIT}. Ноль значит «просмотры не накручивать».\n"
+                "   Или выбери готовое кнопкой.\n\n"
+                "Что будет дальше:\n"
+                "Сразу после публикации поста бот отправляет это число боту продвижения.\n"
+                "Сколько назвал - столько и будет на каждом новом посте. Менять можно в\n"
+                "любой момент, число остаётся в кабинете.\n\n"
+                f"Сейчас: {views_line(tenant)}",
+            ), markup(*presets, [("📊 Результат", "cresult")], [("⬅️ Кабинет", "chome")])
+
+        if kind == "reactions":
+            return self._notice(
+                user_id,
+                "Что делает: бесплатно ставит реакции под каждый новый пост твоего канала.\n\n"
+                "Обязательное условие:\n"
+                "В настройках канала должны быть разрешены ВСЕ реакции. Если часть эмодзи\n"
+                "запрещена, сервис не поставит ни одной - это настройка канала, изменить её\n"
+                "бот не может: канал → Изменить → Реакции.\n\n"
+                "Как устроено:\n"
+                "Сервис принимает один заказ в час, поэтому в очереди держится один самый\n"
+                "свежий пост канала. Сам заказ идёт около 6 минут: столько сервис требует,\n"
+                "чтобы страница была открыта.\n\n"
+                "Как проверить, что работает:\n"
+                "Бот считает реакции до заказа и после, поэтому в «📊 Результат» видно\n"
+                "конкретное число - добавил сервис что-то или нет.\n\n"
+                f"Сейчас: {'реакции включены' if tenant.reactions else 'реакции выключены'}."
+                f"\n{tenant.reactions_phrase()}",
+            ), markup(
+                [self._reactions_cell(tenant)],
+                [("📊 Результат", "cresult")],
+                [("⬅️ Кабинет", "chome")],
             )
-            presets = [[(str(count), f"cviews|{count}") for count in VIEWS_PRESETS[:2]],
-                       [(str(count), f"cviews|{count}") for count in VIEWS_PRESETS[2:]]]
-            return body, markup(*presets, [("⬅️ Кабинет", "chome")])
+
+        if kind == "result":
+            return await self._result_view(user_id, tenant, now)
+
+        if kind == "guide":
+            return self._notice(
+                user_id,
+                "Что делает каждая кнопка\n\n"
+                "🚀 Пошаговый запуск - четыре шага по порядку, от ссылок до тарифа.\n"
+                f"1️⃣ Откуда брать посты - каналы, которые читаем. До {MAX_DONORS} штук.\n"
+                "2️⃣ Куда публиковать - твой канал и как добавить рабочего аккаунта.\n"
+                f"3️⃣ Просмотры - число от 0 до {VIEWS_LIMIT} на каждый пост. 0 - не накручивать.\n"
+                "✨ Реакции - бесплатная накрутка реакций, включается и выключается.\n"
+                "📊 Результат - видно, работает ли всё сейчас и что нажать, если нет.\n"
+                "4️⃣ Тариф - цена, баланс, оплата и срок подписки.\n"
+                "📄 Документы - соглашение и политика конфиденциальности.\n\n"
+                f"Рабочий аккаунт, которого нужно добавить в администраторы: {self.worker}\n\n"
+                "Дальше ничего нажимать не нужно: посты выходят сами, как только у источника\n"
+                "появляется новый текст. Проверить - кнопка «📊 Результат».",
+            ), markup(
+                [("🚀 Пошаговый запуск", "cstart")],
+                [("📊 Результат", "cresult")],
+                [("⬅️ Кабинет", "chome")],
+            )
 
         if kind == "plans":
             return self._notice(
                 user_id,
                 "Сколько стоит\n\n"
-                f"Неделя - {PLANS['week']['price']} ₽ ({PLANS['week']['days']} дней)\n"
-                f"Месяц - {PLANS['month']['price']} ₽ ({PLANS['month']['days']} дней) - выходит дешевле\n\n"
-                "Один кабинет: свой канал, до 10 доноров, до 50 постов в сутки, просмотры до "
-                f"{VIEWS_LIMIT} на пост и бесплатные реакции.\n\n"
+                f"• Неделя - {PLANS['week']['price']} ₽ ({PLANS['week']['days']} дней)\n"
+                f"• Месяц - {PLANS['month']['price']} ₽ ({PLANS['month']['days']} дней) - выходит дешевле\n\n"
+                "Что входит в один кабинет:\n"
+                f"свой канал, до {MAX_DONORS} каналов-источников, до {MAX_POSTS_PER_DAY} постов в сутки,\n"
+                f"просмотры до {VIEWS_LIMIT} на пост и бесплатные реакции.\n\n"
                 f"На балансе: {tenant.balance} ₽\n"
                 f"Тариф: {plan_line(tenant, now)}\n\n"
-                "Покупка списывает деньги с баланса. Не хватает - сначала «Пополнить баланс»: я проверю "
-                "платёж и начислю сумму. Дни текущей подписки не сгорают, новая покупка добавляется к остатку.",
+                "Как платить:\n"
+                "1. «Пополнить баланс» - напиши сумму цифрами и переведи по реквизитам.\n"
+                "2. Я проверю платёж и положу деньги на баланс.\n"
+                "3. «Купить неделю» или «Купить месяц» - сумма спишется с баланса.\n"
+                "Дни текущей подписки не сгорают: покупка добавляется к остатку.",
             ), markup(
-                [(f"Неделя {PLANS['week']['price']} ₽", "cbuy|week"), (f"Месяц {PLANS['month']['price']} ₽", "cbuy|month")],
+                [(f"Купить неделю {PLANS['week']['price']} ₽", "cbuy|week")],
+                [(f"Купить месяц {PLANS['month']['price']} ₽", "cbuy|month")],
                 [("💳 Пополнить баланс", "ctopup")],
-                [("📄 Условия", "cdocs"), ("⬅️ Кабинет", "chome")],
+                [("📄 Документы", "cdocs"), ("📊 Результат", "cresult")],
+                [("⬅️ Кабинет", "chome")],
             )
 
         if kind == "sum":
             return self._notice(
                 user_id,
-                f"Сколько перевёл - напиши сумму цифрами (от {MIN_TOPUP} ₽).\n\n"
-                f"{self.cfg.payment_details or 'Реквизиты пришлю в этом чате.'}\n\n"
-                "Начислю на баланс, как только проверю платёж. Тогда и купишь тариф.",
-            ), markup([("⬅️ Кабинет", "chome")])
+                "Напиши, сколько перевёл - одним числом, например 600.\n\n"
+                f"{self.cfg.payment_details or 'Реквизиты пришлю здесь же - нажми «🆘 Помощь».'}\n\n"
+                f"Меньше {MIN_TOPUP} ₽ заявку не делаю. Начислю на баланс, как только увижу платёж,\n"
+                "и напишу тебе в этот чат.",
+            ), markup([("🆘 Помощь", "cguide")], [("⬅️ Кабинет", "chome")])
 
         if kind == "docs":
             return self._notice(
@@ -271,7 +454,7 @@ class Cabinet:
                 "Документы сервиса:\n\n"
                 f"Пользовательское соглашение: {AGREEMENT_URL}\n"
                 f"Политика конфиденциальности: {PRIVACY_URL}\n\n"
-                "Оплачивая тариф, ты соглашаешься с обоими документами.",
+                "Оплачивая тариф, ты соглашаешься с обоими.",
             ), markup([("⬅️ Кабинет", "chome")])
 
         if kind == "agree":
@@ -279,36 +462,49 @@ class Cabinet:
                 "Перед оплатой - документы сервиса.\n\n"
                 f"Пользовательское соглашение: {AGREEMENT_URL}\n"
                 f"Политика конфиденциальности: {PRIVACY_URL}",
-                markup([("✅ Принимаю условия", "cagree")], [("⬅️ Кабинет", "chome")]),
+                markup([("✅ Принимаю условия", "cagree")], [("📄 Читать позже", "cdocs")], [("⬅️ Кабинет", "chome")]),
             )
 
+        return await self._home_view(user_id, tenant, now)
+
+    # ==== отдельные экраны ====
+
+    async def _home_view(self, user_id: int, tenant: Tenant, now: datetime.datetime) -> Tuple[str, object]:
         donors = await self.store.list_donors(user_id)
         bound = sum(1 for donor in donors if donor.chat_id)
+        ready = bool(donors) and bool(tenant.target) and tenant.active(now)
         lines = [
-            "👤 Твой кабинет",
+            "🚀 АвтоПост - твой канал на автопилоте",
             "",
-            f"Тариф: {plan_line(tenant, now)}",
-            f"Канал: {channel_line(tenant)}",
-            f"Доноры: {len(donors)} из {MAX_DONORS} (подписаны: {bound})",
-            f"Просмотры: {tenant.views if tenant.views else 'не заданы'} на пост",
-            f"Реакции: {'включены' if tenant.reactions else 'выключены'}",
-            f"Сегодня: {await self.store.posts_today(user_id)} из {MAX_POSTS_PER_DAY} постов",
+            "Бот читает каналы, которые ты укажешь, переписывает их посты своими",
+            "словами и выкладывает в твой канал. Следом добавляет просмотры и реакции.",
+            "",
+            f"1️⃣ Откуда брать посты: {len(donors)} из {MAX_DONORS} (читаю {bound})",
+            f"2️⃣ Куда публиковать: {channel_line(tenant)}",
+            f"3️⃣ Просмотры: {views_line(tenant)}",
+            f"4️⃣ Тариф: {plan_line(tenant, now)}",
         ]
         payments = await self.store.list_payments(user_id, 3)
         if payments:
             lines.append("")
             lines.append("Последнее по оплате:")
             lines += [f"• {self._payment_line(row)}" for row in payments]
-        if not tenant.target_ok or not donors:
-            lines += [
-                "",
-                "Чтобы пост пошёл: укажи канал, добавь в администраторы рабочий аккаунт "
-                f"({self.cfg.worker_contact or 'пришлю в этом чате'}), добавь доноров и купи тариф.",
-            ]
+        lines += [
+            "",
+            "Нажми «🚀 Пошаговый запуск» - проведу по шагам по очереди."
+            if not ready
+            else "Всё настроено - посты идут сами. «📊 Результат» покажет, что происходит.",
+        ]
+        rows = (
+            [[("🚀 Пошаговый запуск", "cstart")]]
+            if not ready
+            else [[("📊 Результат", "cresult"), self._reactions_cell(tenant)]]
+        )
         return self._notice(user_id, "\n".join(lines)), markup(
-            [("📢 Мой канал", "cchannel"), (f"📥 Доноры ({len(donors)})", "cdonors")],
-            [("👁 Просмотры", "cviews"), self._reactions_cell(tenant)],
-            [("💳 Тариф и оплата", "cplans"), ("📄 Условия", "cdocs")],
+            *rows,
+            [("1️⃣ Откуда брать посты", "cdonors"), ("2️⃣ Куда публиковать", "cchannel")],
+            [("3️⃣ Просмотры", "cviews"), ("4️⃣ Тариф", "cplans")],
+            [("🆘 Помощь", "cguide"), ("📄 Документы", "cdocs")],
         )
 
     def _payment_line(self, row: dict) -> str:
@@ -316,8 +512,114 @@ class Cabinet:
         status = "" if row.get("status") == "done" else " (ждёт проверки)"
         return f"{title} {row.get('amount_rub')} ₽ {date(row.get('created_at'))}{status}".strip()
 
+    async def _donors_view(self, user_id: int, tenant: Tenant) -> Tuple[str, object]:
+        donors = await self.store.list_donors(user_id)
+        lines = [
+            "Что сделать:\n"
+            "1. Открой канал, чьи посты тебе нравятся.\n"
+            "2. Нажми «➕ Добавить канал» и пришли на него ссылку:\n"
+            "   @name или https://t.me/name.\n"
+            f"3. Повтори для каждого интересного канала - вместе до {MAX_DONORS} штук.\n\n"
+            "Что будет дальше:\n"
+            "Бот сам подпишется на эти каналы и поймает каждый новый пост, в котором\n"
+            "есть текст. Пост с картинкой выйдет с картинкой, пост без картинки -\n"
+            "текстом. Ничего скачивать и загружать тебе не нужно.\n\n"
+            f"Сейчас в списке: {len(donors)} из {MAX_DONORS}.",
+        ]
+        for donor in donors:
+            lines.append(f"• {ref_word(donor.ref)} - " + ("✅ читаем" if donor.chat_id else "⏳ подписываюсь"))
+        rows = [[(f"🗑 {ref_word(donor.ref)[:22]}", f"cdel|{index}")] for index, donor in enumerate(donors, 1)]
+        return self._notice(user_id, "\n".join(lines)), markup(
+            [("➕ Добавить канал", "cadd")],
+            *rows,
+            [("📊 Результат", "cresult")],
+            [("⬅️ Кабинет", "chome")],
+        )
+
+    async def _result_view(self, user_id: int, tenant: Tenant, now: datetime.datetime) -> Tuple[str, object]:
+        """Экран «идёт / не идёт»: одна причина, что делать, и все числа по порядку."""
+        donors = await self.store.list_donors(user_id)
+        bound = sum(1 for donor in donors if donor.chat_id)
+        posts = await self.store.posts_today(user_id)
+        blocker = self._blocker(tenant, donors, bound, posts)
+        lines = ["📊 Результат", ""]
+        if blocker:
+            lines += [f"⛔ Сейчас не идёт: {blocker[0]}", f"   Что сделать: {blocker[1]}", ""]
+        else:
+            lines += ["✅ Всё идёт - посты выходят сами.", ""]
+        lines += [
+            f"Канал: {channel_line(tenant)}",
+            f"Источники постов: {len(donors)} (читаю {bound})",
+            f"Постов сегодня: {posts} из {MAX_POSTS_PER_DAY}",
+            f"Последний пост: {tenant.last_post_phrase(now)}",
+            f"Просмотры: {views_line(tenant)}",
+            f"Реакции: {'включены' if tenant.reactions else 'выключены'} - {tenant.reactions_phrase()}",
+            f"Тариф: {plan_line(tenant, now)}",
+        ]
+        if donor_problems := [ref_word(donor.ref) for donor in donors if not donor.chat_id]:
+            lines += ["", "Не открылись: " + ", ".join(donor_problems[:5]), "   Проверь ссылку или убери канал кнопкой 🗑."]
+        return self._notice(user_id, "\n".join(lines)), markup(
+            [("1️⃣ Откуда брать посты", "cdonors"), ("2️⃣ Куда публиковать", "cchannel")],
+            [("4️⃣ Тариф", "cplans"), ("✨ Реакции", "cboost")],
+            [("⬅️ Кабинет", "chome")],
+        )
+
+    def _blocker(self, tenant: Tenant, donors: List, bound: int, posts: int) -> Optional[Tuple[str, str]]:
+        """Первая настоящая причина, по которой пост сейчас не выйдет, и что нажать."""
+        if not tenant.active(now_utc()):
+            return ("нужен оплаченный тариф", "нажми «4️⃣ Тариф» - неделя или месяц, оплата с баланса")
+        if not donors:
+            return ("не указан ни один канал-источник", "нажми «1️⃣ Откуда брать посты» и пришли ссылку на канал")
+        if not bound:
+            return (
+                "ни один канал-источник не открылся",
+                "проверь ссылки: канал может быть без публичного адреса - тогда поправь ссылку",
+            )
+        if not tenant.target:
+            return ("не указан канал, куда публиковать", "нажми «2️⃣ Куда публиковать»")
+        if not tenant.target_ok:
+            return (
+                "рабочий аккаунт не админ в твоём канале",
+                f"добавь {self.worker} в администраторы с правом публиковать сообщения",
+            )
+        if posts >= MAX_POSTS_PER_DAY:
+            return (
+                f"на сегодня использован лимит {MAX_POSTS_PER_DAY} постов",
+                "ничего делать не нужно - после полуночи лимит обнулится сам",
+            )
+        return None
+
+    async def _wizard_view(self, user_id: int, tenant: Tenant, now: datetime.datetime) -> Tuple[str, object]:
+        index = await self._step(user_id)
+        if index >= len(STEPS):
+            donors = await self.store.list_donors(user_id)
+            return self._notice(
+                user_id,
+                "Готово - все шаги пройдены.\n\n"
+                f"• Источники постов: {len(donors)}\n"
+                f"• Публикуем в: {channel_line(tenant)}\n"
+                f"• Просмотры: {views_line(tenant)}\n"
+                f"• Тариф: {plan_line(tenant, now)}\n\n"
+                "Дальше бот работает сам: ловит новый пост источника, переписывает его,\n"
+                "выкладывает в твой канал, добавляет просмотры и реакции.\n"
+                "Заглядывать стоит только в «📊 Результат» - там видно, идёт ли всё сейчас.",
+            ), markup(
+                [("📊 Результат", "cresult")],
+                [("🚀 В кабинет", "chome")],
+            )
+
+        step = STEPS[index]
+        body, buttons = await self._view(user_id, step)
+        head = f"🚀 Пошаговый запуск\nШаг {index + 1} из {len(STEPS)} - {STEP_TITLES[step]}\n\n"
+        return head + body, add_row(buttons, [("✅ Дальше", "cnext")])
+
     def _reactions_cell(self, tenant: Tenant) -> Tuple[str, str]:
-        return ("🎭 Реакции: выключить" if tenant.reactions else "🎭 Реакции: включить", "creactions")
+        return ("✨ Реакции: выключить" if tenant.reactions else "✨ Реакции: включить", "creactions")
+
+    @property
+    def worker(self) -> str:
+        """Как клиенту найти рабочего аккаунта: адрес даёт владелец, без него просим через помощь."""
+        return self.cfg.worker_contact or "пришлю по запросу - нажми «🆘 Помощь»"
 
     # ==== вывод ====
 
@@ -334,9 +636,17 @@ class Cabinet:
 
     def _back_to(self, query) -> str:
         key = (query.data or "").split("|")[0]
-        return {"cdel": "donors", "cadd": "donors", "cviews": "views", "cbuy": "plans", "ctopup": "plans", "cchannel": "channel"}.get(
-            key, "home"
-        )
+        return {
+            "cdel": "donors",
+            "cadd": "donors",
+            "cviews": "views",
+            "cbuy": "plans",
+            "ctopup": "plans",
+            "cchannel": "channel",
+            "cset_target": "channel",
+            "creactions": "reactions",
+            "cnext": "wizard",
+        }.get(key, "home")
 
     def _note(self, user_id: int, text: str) -> None:
         self.notice[user_id] = text

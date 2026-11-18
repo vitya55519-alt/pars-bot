@@ -12,7 +12,8 @@ import asyncio
 import datetime
 import logging
 from collections import OrderedDict
-from typing import List, Set, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Set, Tuple, Union
 
 from pyrogram import filters
 from pyrogram.enums import ChatMemberStatus, ChatType, ParseMode
@@ -25,6 +26,7 @@ from commands import Controls
 from promo import Promoter
 from reactions import Reactor, count_reactions
 from registry import Category
+from store import MAX_POSTS_PER_DAY
 from utils import TEXT_LIMIT, call, chat_name, strip_source
 
 log = logging.getLogger("pars")
@@ -36,6 +38,23 @@ CATCH_UP_LIMIT = 10
 WRITING_STATUSES = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
 # носители, которые мы по file_id не переносим: у такого поста в канал пойдёт только текст
 OTHER_MEDIA = ("video", "animation", "document", "audio", "voice", "video_note", "sticker")
+
+
+@dataclass
+class Destination:
+    """Куда положить переписанный пост и с какими настройками: у клиента они свои.
+
+    Один пост донора умеет разойтись по нескольким каналам - своему складу и
+    кабинетам клиентов, которые подписаны на того же донора. Рерайт тогда
+    считается один раз, а публикаций столько, сколько адресатов.
+    """
+
+    target: Union[int, str]
+    name: str
+    label: str
+    views: Optional[int] = None
+    reactions: bool = True
+    tenant_id: int = 0
 
 
 def now() -> str:
@@ -78,11 +97,24 @@ class ParsBot:
         self.started = datetime.datetime.now(datetime.timezone.utc)
         self.stats = {"caught": 0, "published": 0, "forwarded": 0, "errors": 0}
         self.last_publish = ""
+        self.store = None
+        self.clients = None
+
+    def attach(self, store, clients) -> None:
+        """База клиентов подключается после старта процесса: без неё остаётся личный режим."""
+        self.store = store
+        self.clients = clients
 
     async def setup(self) -> None:
         await self.registry.rebuild()
 
-        is_donor = filters.create(lambda _, __, message: self.registry.route(message.chat.id) is not None)
+        def interested(_, __, message):
+            """Наш пост - тот, чей канал ловим для склада или для кого-то из клиентов."""
+            if self.registry.route(message.chat.id) is not None:
+                return True
+            return bool(self.clients) and message.chat.id in self.clients.chats
+
+        is_donor = filters.create(interested)
         has_text = (filters.photo | filters.text | filters.caption) & ~filters.service
         self.client.add_handler(MessageHandler(self.on_message, is_donor & has_text & ~filters.outgoing))
         self.controls.setup()
@@ -96,15 +128,8 @@ class ParsBot:
             store.popitem(last=False)
 
     async def on_message(self, client, message: Message) -> None:
-        category = self.registry.route(message.chat.id)
-        if category is None:
-            return
-        if not category.target:
-            log.warning(
-                "Тема «%s» без целевого канала - пост %s пропущен: переименуй тему в канал, куда постить.",
-                category.name,
-                message.id,
-            )
+        dests = await self._dests(message)
+        if not dests:
             return
 
         if not is_broadcast(message):
@@ -118,14 +143,59 @@ class ParsBot:
         self.stats["caught"] += 1
         try:
             if message.media_group_id:
-                await self._album(message, category)
+                await self._album(message, dests)
             else:
-                await self._single(message, category)
+                await self._single(message, dests)
         except ChatForwardsRestricted:
             log.warning("Донор %s запрещает пересылку/копирование - пост пропущен.", chat_name(message.chat))
         except Exception as exc:  # noqa: BLE001 - скрипт не должен падать на одном посте
             self.stats["errors"] += 1
             log.error("Сбой на посте %s: %s: %s", message.id, type(exc).__name__, exc, exc_info=True)
+
+    async def _dests(self, message: Message) -> List[Destination]:
+        """Кому нужен этот пост: склад владельца и каждый клиент, у которого донор в списке."""
+        dests: List[Destination] = []
+        category = self.registry.route(message.chat.id)
+        if category is not None:
+            if not category.target:
+                log.warning(
+                    "Тема «%s» без целевого канала - пост %s пропущен: переименуй тему в канал, куда постить.",
+                    category.name,
+                    message.id,
+                )
+            else:
+                dests.append(
+                    Destination(
+                        target=category.target,
+                        name=category.target_name,
+                        label=f"тема «{category.name}»",
+                    )
+                )
+        for tenant in await self._tenants(message.chat.id):
+            dests.append(self._tenant_dest(tenant))
+        return dests
+
+    async def _tenants(self, chat_id: int) -> List:
+        """Клиенты, для которых этот канал - источник: только активные, база сама отсекает срок."""
+        if self.store is None or not self.clients or chat_id not in self.clients.chats:
+            return []
+        try:
+            return await self.store.donors_by_chat(chat_id)
+        except Exception as exc:  # noqa: BLE001 - без ответа базы пост уходит складу, а не в никуда
+            self.stats["errors"] += 1
+            log.error("Клиенты канала %s не прочитаны (%s: %s).", chat_id, type(exc).__name__, exc)
+            return []
+
+    @staticmethod
+    def _tenant_dest(tenant) -> Destination:
+        return Destination(
+            target=tenant.target_id or tenant.target,
+            name=tenant.target_title or str(tenant.target),
+            label=f"клиент {tenant.id}",
+            views=tenant.views,
+            reactions=tenant.reactions,
+            tenant_id=tenant.id,
+        )
 
     def _drop_source(self, text: str, chat) -> str:
         """Подпись донора - его @юзернейм и ссылки на его канал - в наш канал попадать не должна."""
@@ -134,8 +204,14 @@ class ParsBot:
             log.info("Убрал подпись донора %s из текста поста.", chat_name(chat))
         return cleaned
 
-    async def _single(self, message: Message, category) -> None:
-        log.info("Пойман пост из %s (тема «%s», id %s).", chat_name(message.chat), category.name, message.id)
+    async def _single(self, message: Message, dests: List[Destination]) -> None:
+        log.info(
+            "Пойман пост из %s (id %s) - адресатов %s: %s.",
+            chat_name(message.chat),
+            message.id,
+            len(dests),
+            ", ".join(dest.label for dest in dests),
+        )
 
         original = post_text(message)
         if not original:
@@ -145,34 +221,58 @@ class ParsBot:
         text = self._drop_source(await self.ai.rewrite(original), message.chat)
         log.info("Рерайт завершён (%s символов).", len(text))
 
-        posted = await self._publish(category, message, text)
-        self._published(category, posted, message)
-        await self._boost(posted)
+        for dest in dests:
+            if not await self._allowed(dest):
+                continue
+            posted = await self._publish(dest, message, text)
+            await self._published(dest, posted, message)
+            await self._boost(dest, posted)
 
-    async def _publish(self, category, message: Message, text: str) -> Message:
+    async def _allowed(self, dest: Destination) -> bool:
+        """Суточный лимит клиента: складу владельца он не нужен, у него один хозяин."""
+        if not dest.tenant_id or self.store is None:
+            return True
+        try:
+            left = await self.store.quota_left(dest.tenant_id)
+        except Exception as exc:  # noqa: BLE001 - без цифр базы пост лучше не удваивать на следующий день
+            log.error("Клиент %s: лимит дня не прочитан (%s) - пост не публикую.", dest.tenant_id, type(exc).__name__)
+            return False
+        if not left:
+            log.warning(
+                "Клиент %s: дневной лимит %s постов исчерпан - пост пропущен, после полуночи снова пойдут.",
+                dest.tenant_id,
+                MAX_POSTS_PER_DAY,
+            )
+        return left
+
+    async def _publish(self, dest: Destination, message: Message, text: str) -> Message:
         """Картинку несём по file_id, пост без картинки уходит в канал текстом - как есть, без разметки."""
         if message.photo:
             return await call(
                 self.client.send_photo,
-                category.target,
+                dest.target,
                 message.photo.file_id,
                 caption=cut(text, self.cfg.caption_limit),
             )
         kind = other_media(message)
         if kind:
             log.info("Пост %s: %s по file_id не переносим - в канал пойдёт только текст.", message.id, kind)
-        return await call(
-            self.client.send_message, category.target, cut(text, TEXT_LIMIT), parse_mode=ParseMode.DISABLED
-        )
+        return await call(self.client.send_message, dest.target, cut(text, TEXT_LIMIT), parse_mode=ParseMode.DISABLED)
 
-    async def _album(self, message: Message, category) -> None:
+    async def _album(self, message: Message, dests: List[Destination]) -> None:
         group_id = message.media_group_id
         if group_id in self._seen_groups:
             log.debug("Альбом %s уже обработан - пропуск карточки.", group_id)
             return
         self._remember(self._seen_groups, group_id)
 
-        log.info("Пойман альбом из %s (тема «%s», id %s).", chat_name(message.chat), category.name, message.id)
+        log.info(
+            "Пойман альбом из %s (id %s) - адресатов %s: %s.",
+            chat_name(message.chat),
+            message.id,
+            len(dests),
+            ", ".join(dest.label for dest in dests),
+        )
         await asyncio.sleep(self.cfg.album_wait)
 
         items = await call(self.client.get_media_group, message.chat.id, message.id)
@@ -186,35 +286,46 @@ class ParsBot:
 
         if not photos:
             log.info("В альбоме %s нет фото - публикую его текст обычным постом.", group_id)
-            posted = await self._publish(category, message, text)
-            self._published(category, posted, message)
-            await self._boost(posted)
+            for dest in dests:
+                if not await self._allowed(dest):
+                    continue
+                posted = await self._publish(dest, message, text)
+                await self._published(dest, posted, message)
+                await self._boost(dest, posted)
             return
 
         log.info("Рерайт альбома завершён (%s символов, карточек %s).", len(text), len(photos[:TELEGRAM_ALBUM_LIMIT]))
-
         caption = cut(text, self.cfg.caption_limit)
-        media: List[InputMediaPhoto] = [
-            InputMediaPhoto(media=item.photo.file_id, caption=caption if index == 0 else "")
-            for index, item in enumerate(photos[:TELEGRAM_ALBUM_LIMIT])
-        ]
 
-        posted = await call(self.client.send_media_group, category.target, media)
-        main_message = next((item for item in posted if (item.caption or "").strip()), posted[0])
-        self._published(category, main_message, message)
-        await self._boost(main_message)
+        for dest in dests:
+            if not await self._allowed(dest):
+                continue
+            media: List[InputMediaPhoto] = [
+                InputMediaPhoto(media=item.photo.file_id, caption=caption if index == 0 else "")
+                for index, item in enumerate(photos[:TELEGRAM_ALBUM_LIMIT])
+            ]
+            posted = await call(self.client.send_media_group, dest.target, media)
+            main_message = next((item for item in posted if (item.caption or "").strip()), posted[0])
+            await self._published(dest, main_message, message)
+            await self._boost(dest, main_message)
 
-    def _published(self, category, posted: Message, source: Message) -> None:
+    async def _published(self, dest: Destination, posted: Message, source: Message) -> None:
         self.stats["published"] += 1
         self.last_publish = now()
         self._remember(self._sent_posts, post_key(source))
         log.info(
-            "Опубликовано в %s (тема «%s», id %s): %s.",
-            category.target_name,
-            category.name,
+            "Опубликовано в %s (%s, id %s): %s.",
+            dest.name,
+            dest.label,
             posted.id,
             self._what_posted(posted),
         )
+        if dest.tenant_id and self.store is not None:
+            try:
+                await self.store.count_post(dest.tenant_id)
+                await self.store.note_publish(dest.tenant_id, posted.id)
+            except Exception as exc:  # noqa: BLE001 - пост вышел, учёт допишем следующим
+                log.error("Клиент %s: пост в учёт не записан (%s: %s).", dest.tenant_id, type(exc).__name__, exc)
 
     def _what_posted(self, message: Message) -> str:
         """Чем заполнен пост у нас в канале - по журналу видно, ушла картинка или только текст."""
@@ -224,10 +335,24 @@ class ParsBot:
             return "текст без картинки"
         return "без текста и картинки"
 
-    async def _boost(self, message: Message) -> None:
-        if await self.promo.push(message):
+    async def _boost(self, dest: Destination, message: Message) -> None:
+        """Продвижение и реакции по настройкам адресата: у клиента своё число просмотров и свой флаг реакций."""
+        if await self.promo.push(message, dest.views):
             self.stats["forwarded"] += 1
-        self.reactions.schedule(message)
+        if not dest.reactions:
+            log.info("Реакции: у %s они выключены - пост в порядок накрутки не ставлю.", dest.label)
+            return
+        self.reactions.schedule(message, on_added=self._reactions_note(dest.tenant_id))
+
+    def _reactions_note(self, tenant_id: int):
+        """Замер сервиса по посту клиента идёт в базу: кабинет показывает число, а не «может быть»."""
+        if not tenant_id or self.store is None:
+            return None
+
+        async def note(added: int) -> None:
+            await self.store.note_reactions(tenant_id, added)
+
+        return note
 
     # ==== диагностика ====
 
@@ -392,8 +517,13 @@ class ParsBot:
             return "Пропущенного нет: всё свежее у доноров уже лежит в каналах."
         done = 0
         for category, message in todo[:limit]:
+            dest = Destination(
+                target=category.target,
+                name=category.target_name,
+                label=f"тема «{category.name}» (догон)",
+            )
             try:
-                await self._single(message, category)
+                await self._single(message, [dest])
                 done += 1
             except Exception as exc:  # noqa: BLE001 - один пост не должен рвать догон
                 self.stats["errors"] += 1

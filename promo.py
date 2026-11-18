@@ -14,7 +14,8 @@ class Promoter:
         self.client = client
         self.cfg = cfg
 
-    async def push(self, message) -> bool:
+    async def push(self, message, views: Optional[int] = None) -> bool:
+        """Продвинуть пост: `views` - число этого клиента, без него - сколько стоит в PROMO_VIEWS."""
         if not self.cfg.promo_enabled:
             return False
 
@@ -27,7 +28,7 @@ class Promoter:
             log.error("Не удалось переслать пост промо-боту: %s: %s", type(exc).__name__, exc)
             return False
 
-        await self._send_views()
+        await self._send_views(self.cfg.promo_views if views is None else views)
         return True
 
     async def _dialog(self, limit: int = 12) -> List:
@@ -88,15 +89,16 @@ class Promoter:
                 return index, flat[index]
         return None
 
-    async def _send_views(self) -> None:
-        if not self.cfg.promo_views:
-            log.warning("Промо-бот: PROMO_VIEWS пуст - количество просмотров не отправлял.")
+    async def _send_views(self, views: int) -> None:
+        """Число уходит тем же способом, что и всегда: сообщением промо-боту, затем ответ в журнал."""
+        if not views:
+            log.warning("Промо-бот: просмотров 0 - число не отправлял, пост идёт без накрутки.")
             return
 
         await asyncio.sleep(self.cfg.promo_delay)
         try:
-            await call(self.client.send_message, self.cfg.promo_bot, str(self.cfg.promo_views))
-            log.info("Промо-боту отправлено количество просмотров: %s.", self.cfg.promo_views)
+            await call(self.client.send_message, self.cfg.promo_bot, str(views))
+            log.info("Промо-боту отправлено количество просмотров: %s.", views)
         except Exception as exc:  # noqa: BLE001
             log.error("Количество просмотров не отправилось: %s: %s", type(exc).__name__, exc)
             return

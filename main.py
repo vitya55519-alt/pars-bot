@@ -8,6 +8,7 @@ from pyrogram import Client, idle
 from pyrogram.errors import FloodWait, SessionExpired, SessionRevoked, Unauthorized
 
 from ai import AiRewriter
+from clients import Clients, SYNC_SECONDS
 from config import Config, ConfigError
 from handlers import ParsBot
 from panel import Panel
@@ -38,6 +39,16 @@ async def start_panel(panel_client: Client, panel: Panel, owner_id: int, account
             return False
 
 
+async def clients_loop(clients: Clients, every: int = SYNC_SECONDS) -> None:
+    """Клиентскую часть обслуживаем фоном: подписки и проверки прав не должны мешать постам."""
+    while True:
+        try:
+            await clients.sync()
+        except Exception as exc:  # noqa: BLE001 - без клиентов личный режим работает как раньше
+            log.error("Клиенты не обслужены (%s: %s) - повторю через %s сек.", type(exc).__name__, exc, every)
+        await asyncio.sleep(every)
+
+
 async def amain(cfg: Config) -> None:
     session = aiohttp.ClientSession()
     client = Client(
@@ -51,11 +62,16 @@ async def amain(cfg: Config) -> None:
     bot = ParsBot(client, cfg, AiRewriter(cfg, session), registry, session)
 
     store = None
+    clients = None
+    sync = None
     if cfg.clients_enabled:
         try:
             store = await Store.connect(cfg.database_url)
+            clients = Clients(client, store)
+            bot.attach(store, clients)
         except Exception as exc:  # noqa: BLE001 - без базы бот остаётся управляющим панелем
             log.error("База клиентов не подключилась (%s: %s) - кабинеты выключены, личный режим работает.", type(exc).__name__, exc)
+            store = clients = None
 
     panel_client = None
     panel = None
@@ -91,11 +107,14 @@ async def amain(cfg: Config) -> None:
 
         log.info("Настройки:\n%s", cfg.describe())
         log.info("Готов - жду новые посты от доноров.")
+        sync = asyncio.create_task(clients_loop(clients)) if clients else None
         await idle()
     except (Unauthorized, SessionExpired, SessionRevoked) as exc:
         log.error("Сессия недействительна (%s). Нужно создать SESSION_STRING заново: python make_session.py", type(exc).__name__)
         raise SystemExit(1)
     finally:
+        if sync:
+            sync.cancel()
         if store:
             await store.close()
         await session.close()

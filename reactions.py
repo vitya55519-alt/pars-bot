@@ -8,8 +8,11 @@
 поменяют, в журнале станет видно ответ сервиса.
 
 После заказа бот сам читает реакции под постом (через 20 минут и через два
-часа) и пишет в журнал конкретное число: только так видно, отвечает сервис или
-заказ ушёл в пустоту.
+часа) и пишет в журнал конкретное число. Число реакций считается и ДО заказа:
+без него «одна реакция под постом» может оказаться подписчиком, а не сервисом.
+Сравнение двух чисел - единственный честный ответ на вопрос «идут реакции или
+нет»: в журнале и в кабинете появляется «сервис добавил 3» или «сервис не
+добавил ничего».
 
 Заказ бывает и ручной: из панели приходят ссылкой на пост, Reactor проверяет,
 что аккаунт этот пост видит, ставит его в ту же очередь - и по завершении сам
@@ -119,20 +122,44 @@ def count_reactions(message) -> str:
     return " ".join(parts) + (f" (всего {total})" if len(parts) > 1 else "")
 
 
+def reactions_total(message) -> int:
+    """Одно число реакций под постом: только сравнив два числа, видно, работал ли сервис."""
+    items = list(getattr(getattr(message, "reactions", None), "reactions", None) or [])
+    return sum(int(getattr(item, "count", 0) or 0) for item in items)
+
+
+def verdict(baseline: int, total: int) -> str:
+    """Итог заказа человеческим языком: сколько сервис добавил сверх того, что уже было."""
+    if baseline < 0 or total < 0:
+        return "сравнить не с чем"
+    added = total - baseline
+    if added > 0:
+        return f"сервис добавил {added}"
+    if added == 0:
+        return "сервис не добавил ничего"
+    return f"реакций стало меньше на {-added}"
+
+
+def baseline_word(baseline: int) -> str:
+    return f"до заказа было {baseline}" if baseline >= 0 else "до заказа не измерено"
+
+
 class ReactionsError(Exception):
     pass
 
 
 Notifier = Callable[[str], Awaitable[None]]
+DeltaNotifier = Callable[[int], Awaitable[None]]
 
 
 @dataclass
 class Entry:
-    """Один будущий заказ в очереди: пост, способ, как он туда попал, и кому доложить о результате."""
+    """Один будущий заказ в порядке: пост, способ, как он туда попал, и кому доложить о результате."""
 
     link: str
     manual: bool = False
     on_done: Optional[Notifier] = field(default=None, repr=False)
+    on_added: Optional[DeltaNotifier] = field(default=None, repr=False)
 
     def __str__(self) -> str:
         return short(self.link)
@@ -152,6 +179,8 @@ class Reactor:
         self.last_link = ""
         self.last_error = ""
         self.last_reply = ""
+        self.last_baseline = -1
+        self.last_verdict = ""
         self.measures: List[str] = []
         self.check_delays = CHECK_DELAYS
         self.wait = PERMIT_WAIT
@@ -163,8 +192,12 @@ class Reactor:
         self._worker: asyncio.Task | None = None
         self._checks: Set[asyncio.Task] = set()
 
-    def schedule(self, message) -> None:
-        """Автозаказ: у канала в порядке держится один, самый свежий его пост."""
+    def schedule(self, message, on_added: Optional[DeltaNotifier] = None) -> None:
+        """Автозаказ: у канала в порядке держится один, самый свежий его пост.
+
+        `on_added` - callback клиента: сколько реакций добавил сервис по замеру
+        «до/после». Без него живёт только журнал, с ним - цифра в кабинете.
+        """
         if not self.enabled:
             return
 
@@ -182,7 +215,7 @@ class Reactor:
         old = self._queue.get(username)
         if old:
             log.info("Реакции: %s уже ждёт заказа - ставлю вместо него %s.", short(old.link), short(link))
-        self._queue[username] = Entry(link)
+        self._queue[username] = Entry(link, on_added=on_added)
         self._queue.move_to_end(username)
         self._ensure_worker()
 
@@ -216,7 +249,8 @@ class Reactor:
             f"Пост {short(link)} поставил в очередь на бесплатные реакции.\n"
             f"Заказов перед ним: {ahead}. {self.eta_line()}.\n"
             f"Сам заказ занимает {human(self.wait)}: сервис требует, чтобы страница была открыта всё это время.\n"
-            f"О результате напишу сюда сам, а реакции под постом пересчитаю {self.measure_phrase()}."
+            f"О результате напишу сюда сам, а реакции под постом пересчитаю {self.measure_phrase()} "
+            "и сравню с тем, что было до заказа."
         )
 
     async def _see_post(self, username: str, message_id: int) -> None:
@@ -293,8 +327,8 @@ class Reactor:
             if entry is None:
                 continue
             try:
-                body = await self.order(entry.link)
-                await self._tell(entry, self._done_text(entry.link, body))
+                body = await self.order(entry.link, entry.on_added)
+                await self._tell(entry, self._done_text(entry.link, body, self.last_baseline))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - реакции не должны влиять на публикацию
@@ -303,11 +337,12 @@ class Reactor:
                 log.warning("Реакции: заказ для %s не отправился (%s).", entry.link, self.last_error)
                 await self._tell(entry, f"⚠ Реакции для {short(entry.link)} не заказались: {self.last_error}")
 
-    def _done_text(self, link: str, body: str) -> str:
+    def _done_text(self, link: str, body: str, baseline: int = -1) -> str:
         return (
             f"✅ Заказ реакций ушёл: {short(link)} - сервис ответил «{body or 'пусто'}».\n"
-            f"Начало накрутки 0-15 минут. Реакции под постом пересчитаю {self.measure_phrase()} - "
-            "числа будут в «🩺 Проверка»."
+            f"{baseline_word(baseline).capitalize()}.\n"
+            f"Начало накрутки 0-15 минут, {self.measure_phrase()} посчитаю заново - "
+            "по разнице двух чисел и будет видно, добавил ли сервис что-то."
         )
 
     def measure_phrase(self) -> str:
@@ -324,16 +359,38 @@ class Reactor:
         except Exception as exc:  # noqa: BLE001 - доклад не должен рвать очередь
             log.warning("Реакции: о результате заказа не доложил (%s).", type(exc).__name__)
 
-    async def order(self, link: str) -> str:
+    async def order(self, link: str, on_added: Optional[DeltaNotifier] = None) -> str:
         token, key = await self._permission()
+        self.last_baseline = await self._total(link)
         body = await self._send(link, token, key)
         self.ordered += 1
         self.last_link = link
         self.last_error = ""
         self.last_reply = body
-        log.info("Реакции: заказ на %s отправлен (старт 0-15 минут), сервис ответил «%s».", link, body or "пусто")
-        self._watch(link)
+        log.info(
+            "Реакции: заказ на %s отправлен (старт 0-15 минут), сервис ответил «%s», %s.",
+            link,
+            body or "пусто",
+            baseline_word(self.last_baseline),
+        )
+        self._watch(link, self.last_baseline, on_added)
         return body
+
+    async def _total(self, link: str) -> int:
+        """Точка отсчёта: сколько реакций под постом прямо перед заказом.
+
+        Без неё «одна реакция» нераспознать - её мог оставить подписчик, а
+        сервис не поставить ни одной. Снятие не отменяет заказ: не удалось -
+        честно скажем «сравнить не с чем», вместо выдуманного числа.
+        """
+        if self.client is None:
+            return -1
+        try:
+            _, total = await self.snapshot(link)
+        except Exception as exc:  # noqa: BLE001 - базовое число не повод не заказывать
+            log.info("Реакции: число до заказа не снять (%s) - заказ всё равно уйдёт.", type(exc).__name__)
+            return -1
+        return total
 
     async def _send(self, link: str, token: str, key: str) -> str:
         """Обрыв соединения у сервиса бывает часто - без повтора пост терял заказ молча."""
@@ -353,19 +410,25 @@ class Reactor:
                 log.warning("Реакции: форма не дошла, попытка %s из %s (%s).", attempt, FORM_ATTEMPTS, type(exc).__name__)
         raise ReactionsError(f"сервис не принял форму ({type(last).__name__})")
 
-    def _watch(self, link: str) -> None:
-        """Замер вместо гаданий: читаем реакции под этим же постом позже."""
+    def _watch(self, link: str, baseline: int = -1, on_added: Optional[DeltaNotifier] = None) -> None:
+        """Замер вместо гаданий: читаем реакции под этим же постом и сравниваем с «до»."""
         if self.client is None:
             return
         for delay in self.check_delays:
-            task = asyncio.create_task(self._measure(link, delay))
+            task = asyncio.create_task(self._measure(link, delay, baseline, on_added))
             self._checks.add(task)
             task.add_done_callback(self._checks.discard)
 
-    async def _measure(self, link: str, delay: float) -> None:
+    async def _measure(
+        self, link: str, delay: float, baseline: int = -1, on_added: Optional[DeltaNotifier] = None
+    ) -> None:
         try:
             await asyncio.sleep(delay)
-            line = f"{short(link)} через {human(delay)}: {await self.count(link)}"
+            shown, total = await self.snapshot(link)
+            self.last_verdict = verdict(baseline, total)
+            line = f"{short(link)} через {human(delay)}: {shown} - {baseline_word(baseline)}, {self.last_verdict}"
+            if on_added is not None and baseline >= 0 and total >= 0:
+                await self._report_added(on_added, total - baseline, link)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - замер не должен влиять на заказы
@@ -374,14 +437,26 @@ class Reactor:
         del self.measures[MEASURE_KEEP:]
         log.info("Реакции: замер - %s.", line)
 
-    async def count(self, link: str) -> str:
+    async def _report_added(self, on_added: DeltaNotifier, added: int, link: str) -> None:
+        """Дельта заказа - клиенту в базу: кабинету нужно конкретное число, а не «работает/нет»."""
+        try:
+            await on_added(added)
+        except Exception as exc:  # noqa: BLE001 - запись клиенту не рвёт замер
+            log.warning("Реакции: итог заказа для %s не записан (%s).", short(link), type(exc).__name__)
+
+    async def snapshot(self, link: str) -> Tuple[str, int]:
+        """Что под постом сейчас: надпись для человека и число для сравнения «до/после»."""
         username, message_id = parse_link(link)
         if not message_id:
-            return "ссылка непонятна"
+            return "ссылка непонятна", -1
         message = await call(self.client.get_messages, username, message_id)
         if message is None:
-            return "поста там нет"
-        return count_reactions(message)
+            return "поста там нет", -1
+        return count_reactions(message), reactions_total(message)
+
+    async def count(self, link: str) -> str:
+        text, _ = await self.snapshot(link)
+        return text
 
     async def _permission(self):
         """Пять минут ждём честно - сервис выдаёт ключ сам, когда время выйдет."""
@@ -411,12 +486,13 @@ class Reactor:
     def describe(self) -> str:
         state = f"включены, заказ раз в {human(self.cfg.reactions_interval)}" if self.enabled else "выключены"
         done = f", отправлено {self.ordered}" if self.ordered else ""
+        result = f", {self.last_verdict}" if self.last_verdict else ""
         queue = f", в очереди {len(self._queue)}" if self._queue else ""
         manual = sum(1 for entry in self._queue.values() if entry.manual)
         hand = f", из них ручных {manual}" if manual else ""
         fails = f", сбоев {self.failed}" if self.failed else ""
         skipped = f", пропущено {self.skipped}" if self.skipped else ""
-        return f"Реакции: {state}{done}{queue}{hand}{fails}{skipped}"
+        return f"Реакции: {state}{done}{result}{queue}{hand}{fails}{skipped}"
 
     def report(self) -> str:
         """Показывает очередь и замеры в панели: без журнала видно, дошли ли реакции до поста."""

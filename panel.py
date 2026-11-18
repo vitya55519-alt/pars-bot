@@ -17,6 +17,7 @@ from ai import cut
 from cabinet import Cabinet
 from config import VIEWS_LIMIT
 from registry import RegistryError
+from store import StoreError
 from utils import TEXT_LIMIT, call, chunks, markup
 
 log = logging.getLogger("panel")
@@ -57,7 +58,14 @@ HELP = (
     "промо-боту после каждой новой публикации. Сохраняется в склад, перезапуск не сбрасывает.\n"
     "12) «🩺 Проверка» - бот смотрит последние сообщения у доноров, пускает ли его в канал "
     "и сколько постов не дошло, а заодно считает реакции под свежими постами канала. "
-    "«⤵️ Догнать пропущенное» публикует их тем же маршрутом.\n\n"
+    "«⤵️ Догнать пропущенное» публикует их тем же маршрутом.\n"
+    "13) «💰 Заявки на оплату» - очередь клиентов, которые написали сумму, но ещё не "
+    "получили деньги на баланс. Проверил поступление - жми «✔ Начислить»: сумма ложится "
+    "один раз, повторная кнопка уже ничего не добавит. Не нашёл платёж - «✖ Не нашёл», "
+    "тогда у клиента в истории заявка станет отклонённой, а баланс не изменится.\n"
+    "14) «👥 Клиенты» - все кабинеты одной таблицей: тариф, баланс и когда у человека "
+    "выходил последний пост. Если клиент перевёл мимо заявки, нажми «💵 Начислить» и "
+    "напиши сумму - она попадёт ему на баланс, и тариф он купит сам.\n\n"
     "Ловим любой пост донора, в котором есть текст: с картинкой - картинкой, альбом - "
     "пачкой карточек, без картинки - текстом. Картинки идут по своим номерам, ничего "
     "не скачивается. У поста с видео или документом переносим только текст. Пост без "
@@ -84,6 +92,7 @@ class Panel:
         self.registry = registry
         self.bot = bot
         self.cabinet = Cabinet(client, cfg, store) if store else None
+        self.store = store
         self.owner = 0
         self.account = "аккаунт"
         self.awaiting: Tuple[str, int] = ("", 0)
@@ -199,6 +208,19 @@ class Panel:
             await self._diagnose(query)
         elif key == "catchup":
             await self._catch_up(query)
+        elif key in ("money", "mpay", "mno", "clients", "credit"):
+            if self.store is None:
+                await call(query.answer, "Базы клиентов нет (DATABASE_URL не задан) - заявок на оплату тоже нет.", show_alert=True)
+                return
+            if key == "money":
+                await self._money_view(query)
+            elif key in ("mpay", "mno"):
+                await self._decide_topup(query, arg, accept=key == "mpay")
+            elif key == "clients":
+                await self._clients_view(query)
+            else:
+                self.awaiting = ("credit", arg)
+                await self._show(query, "credit", arg, flash="Жду сумму")
         else:
             await call(query.answer, "Такой кнопки нет - нажми «Меню».")
 
@@ -255,6 +277,77 @@ class Panel:
         self.notice = result
         await self._show(query, "main", flash="Готово")
 
+    async def _money_view(self, query, flash: str = "") -> None:
+        """Очередь заявок: платёж проверяешь ты, начисление - одна кнопка, повторить её уже нельзя."""
+        if flash:
+            self.notice = flash  # подсказка Telegram исчезает через секунду, а результат должен остаться на экране
+        rows = await self.store.pending_topups()
+        lines = ["💰 Заявки на пополнение", ""]
+        if rows:
+            lines.append("Проверь поступление и нажми «✔ Начислить» - сумма ляжет клиенту на баланс один раз.")
+            lines.append("Время заявок - в UTC, как в журнале Railway.")
+            lines.append("")
+            for row in rows[:10]:
+                lines.append(
+                    f"№{row['id']} · клиент {row['tenant_id']} ({row.get('target') or 'канал не указан'}) · "
+                    f"{row['amount_rub']} ₽ · заявил {self._moment(row.get('created_at'))}"
+                )
+            if len(rows) > 10:
+                lines.append(f"...и ещё {len(rows) - 10}")
+        else:
+            lines.append("Очередь пуста: никто из клиентов денег ещё не заявлял.")
+        buttons = [
+            [(f"✔ Начислить {row['amount_rub']} ₽ (№{row['id']})", f"mpay|{row['id']}"), ("✖ Не нашёл", f"mno|{row['id']}")]
+            for row in rows[:10]
+        ]
+        buttons.append([("👥 Клиенты", "clients"), ("⬅️ Меню", "main")])
+        await self._edit(query, cut(self._with_notice("\n".join(lines)), TEXT_LIMIT), markup(*buttons))
+        await call(query.answer, flash[:TEXT_LIMIT])
+
+    async def _decide_topup(self, query, payment_id: int, accept: bool) -> None:
+        try:
+            if accept:
+                row = await self.store.confirm_topup(payment_id)
+                flash = (
+                    f"✅ Начислил {row['amount_rub']} ₽ клиенту {row['tenant_id']} - "
+                    "теперь он купит тариф у себя в кабинете."
+                )
+            else:
+                tenant_id = await self.store.reject_topup(payment_id)
+                flash = f"✅ Заявку №{payment_id} убрал, денег не начислял (клиент {tenant_id})."
+        except StoreError as exc:
+            flash = f"⚠ {exc}"
+        await self._money_view(query, flash=flash)
+
+    async def _clients_view(self, query, flash: str = "") -> None:
+        """Клиенты одним экраном: тариф, баланс и последний пост - по нему сразу видно, идёт ли у человека."""
+        tenants = await self.store.list_tenants()
+        lines = [f"👥 Клиенты: {len(tenants)}", ""]
+        if tenants:
+            lines.append("«💵 Начислить» - если человек перевёл без заявки.")
+            lines.append("")
+            for tenant in tenants[:15]:
+                plan = f"тариф ещё {tenant.days_left()} дн." if tenant.active() else "без тарифа"
+                lines.append(
+                    f"{tenant.id} · {tenant.target_title or tenant.target or 'канал не указан'} · "
+                    f"{plan} · {tenant.balance} ₽ · {tenant.last_post_phrase()}"
+                    f"{'' if tenant.target_ok else ' · ⚠ нет доступа к каналу'}"
+                )
+            if len(tenants) > 15:
+                lines.append(f"...и ещё {len(tenants) - 15}")
+        else:
+            lines.append("Кабинетов пока никто не открывал.")
+        buttons = [[(f"💵 Начислить {tenant.id}", f"credit|{tenant.id}")] for tenant in tenants[:15]]
+        buttons.append([("💰 Заявки", "money"), ("⬅️ Меню", "main")])
+        await self._edit(query, cut(self._with_notice("\n".join(lines)), TEXT_LIMIT), markup(*buttons))
+        await call(query.answer, flash[:TEXT_LIMIT])
+
+    @staticmethod
+    def _moment(value) -> str:
+        """Время заявки в человеческом виде: база отдаёт datetime, а в тестах бывает строка."""
+        fmt = getattr(value, "strftime", None)
+        return fmt("%d.%m %H:%M") if callable(fmt) else str(value or "?")
+
     async def _apply_text(self, message, kind: str, topic_id: int, text: str) -> None:
         registry = self.registry
         try:
@@ -281,13 +374,25 @@ class Panel:
                 number = await registry.save_views(text)
                 self.notice = f"✅ Просмотры: {number}. Такое число бот отправит промо-боту после каждой публикации."
                 screen = ("main", 0)
+            elif kind == "credit":
+                digits = "".join(char for char in text if char.isdigit())
+                if not digits:
+                    raise ValueError("Нужна сумма цифрами, например 600.")
+                tenant = await self.store.credit(topic_id, int(digits))
+                self.notice = (
+                    f"✅ Клиенту {topic_id} начислено {digits} ₽, на балансе {tenant.balance} ₽ -"
+                    "тариф он купит сам в кабинете."
+                )
+                screen = ("main", 0)
             else:
                 category = await registry.rename_category(topic_id, text[:NAME_LIMIT])
                 self.notice = self._category_notice(category, f"Переименовал в «{category.name}»")
                 screen = ("cat", topic_id)
-        except ValueError as exc:
+        except (ValueError, StoreError) as exc:
             self.notice = f"⚠ {exc}"
             screen = self._fail_screen(kind, topic_id)
+            if kind == "credit":
+                self.awaiting = ("credit", topic_id)  # сумму можно написать сразу, без нового нажатия
         except RegistryError as exc:
             self.notice = f"⚠ {exc}"
             screen = self._fail_screen(kind, topic_id)
@@ -307,6 +412,8 @@ class Panel:
             return ("react", 0)
         if kind in ("channel", "group", "group_rename"):
             return ("main", 0)
+        if kind == "credit":
+            return ("credit", topic_id)
         return ("cat", topic_id)
 
     def _notifier(self, chat_id: int):
@@ -348,7 +455,22 @@ class Panel:
             return self._views_view()
         if kind == "react":
             return self._react_view()
+        if kind == "credit":
+            return self._credit_view(topic_id)
         return self._main_view()
+
+    def _credit_view(self, tenant_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+        return (
+            cut(
+                self._with_notice(
+                    f"Клиент {tenant_id}: напиши сумму цифрами, например 600.\n\n"
+                    "Она попадёт ему на баланс, и тариф он купит сам в своём кабинете - "
+                    "так начисление видно и у тебя в журнале, и у него в истории платежей."
+                ),
+                TEXT_LIMIT,
+            ),
+            markup([("⬅️ Отмена", "clients")]),
+        )
 
     def _main_view(self) -> Tuple[str, InlineKeyboardMarkup]:
         registry = self.registry
@@ -374,12 +496,16 @@ class Panel:
             lines.append("Замечания:\n- " + "\n- ".join(problems[:5]))
 
         toggle = ("▶ Пуск", "start") if registry.paused else ("⏸ Пауза", "pause")
+        clients = getattr(self.bot, "clients", None)
+        if clients:
+            lines.append(f"Кабинеты: {clients.tenants_total}, с действующим тарифом {clients.tenants_active}")
         reactions_toggle = (
             ("🎭 Реакции: выключить", "reactions")
             if self.bot.reactions.enabled
             else ("🎭 Реакции: включить", "reactions")
         )
         views = f"{self.cfg.promo_views}" if self.cfg.promo_views else "не задано"
+        money = [[("💰 Заявки на оплату", "money"), ("👥 Клиенты", "clients")]] if self.store else []
         return (
             cut(self._with_notice("🤖 АвтоПост\n" + "\n".join(lines)), TEXT_LIMIT),
             markup(
@@ -388,6 +514,7 @@ class Panel:
                 [toggle, ("❓ Как это работает", "help")],
                 [reactions_toggle, ("🎯 Реакция на пост", "react")],
                 [(f"👁 Просмотров: {views}", "views"), ("🩺 Проверка", "check")],
+                *money,
                 [("✏️ Переименовать склад", "group_rename")],
             ),
         )
@@ -442,6 +569,14 @@ class Panel:
             ),
         )
 
+    def _clients_note(self) -> str:
+        """Клиентская часть в статусе: когда проверяли кабинеты и что не открывается.
+
+        Без базы строки нет - владельцу не показываются несуществующие клиенты.
+        """
+        clients = getattr(self.bot, "clients", None)
+        return f"\n{clients.report()}" if clients else ""
+
     def _status_view(self) -> Tuple[str, InlineKeyboardMarkup]:
         stats = self.bot.stats
         stored = self.registry.views
@@ -456,7 +591,7 @@ class Panel:
                 f"{' - сервис ответил ' + self.bot.reactions.last_reply if self.bot.reactions.last_reply else ''}\n"
                 f"{self.bot.reactions.report()}\n"
                 f"Поймано: {stats['caught']} · опубликовано: {stats['published']} · "
-                f"в промо: {stats['forwarded']} · сбоев: {stats['errors']}"
+                f"в промо: {stats['forwarded']} · сбоев: {stats['errors']}{self._clients_note()}"
             )
         )
         return (

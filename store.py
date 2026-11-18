@@ -73,6 +73,9 @@ class Tenant:
     balance: int = 0
     plan_until: Optional[datetime.datetime] = None
     agreed: bool = False
+    last_post_id: int = 0
+    last_post_at: Optional[datetime.datetime] = None
+    reactions_added: Optional[int] = None
 
     def active(self, now: Optional[datetime.datetime] = None) -> bool:
         if self.plan_until is None:
@@ -87,6 +90,28 @@ class Tenant:
 
     def price(self, kind: str) -> int:
         return PLANS[kind]["price"]
+
+    def reactions_phrase(self) -> str:
+        """Ответ про реакции по последнему заказу этого клиента - без догадок, по замеру."""
+        if self.reactions_added is None:
+            return "ждём первый замер"
+        if self.reactions_added > 0:
+            return f"по последнему заказу сервис добавил {self.reactions_added}"
+        return "по последнему заказу сервис не добавил ничего"
+
+    def last_post_phrase(self, now: Optional[datetime.datetime] = None) -> str:
+        """Как давно у клиента вышел последний пост - главный признак «идёт или не идёт»."""
+        if self.last_post_at is None:
+            return "постов ещё не было"
+        moment = now or datetime.datetime.now(datetime.timezone.utc)
+        minutes = int((moment - self.last_post_at).total_seconds() // 60)
+        if minutes < 1:
+            return "только что"
+        if minutes < 60:
+            return f"{minutes} мин назад"
+        if minutes < 60 * 24:
+            return f"{minutes // 60} ч назад"
+        return f"{minutes // (60 * 24)} дн назад"
 
     def renew(self, kind: str, now: Optional[datetime.datetime] = None) -> int:
         """Сколько стоит продление и на какую дату отодвигается тариф.
@@ -111,6 +136,13 @@ class StoreError(Exception):
     pass
 
 
+def check_topup(amount: int) -> int:
+    """Рамку суммы держим одну и ту же и в кабинете, и в панели: иначе клиенту запрещают то, что можно себе."""
+    if not MIN_TOPUP <= amount <= MAX_TOPUP:
+        raise StoreError(f"Сумму нужно написать от {MIN_TOPUP} до {MAX_TOPUP} ₽.")
+    return amount
+
+
 class Store:
     def __init__(self, pool):
         self.pool = pool
@@ -131,6 +163,8 @@ class Store:
     async def _migrate(self) -> None:
         async with self.pool.acquire() as con:
             await con.execute(SCHEMA)
+            for statement in MIGRATIONS:
+                await con.execute(statement)
 
     # ==== клиенты ====
 
@@ -186,6 +220,37 @@ class Store:
                 enabled,
             )
 
+    async def set_target_ok(self, tenant_id: int, ok: bool, title: str = "") -> None:
+        """Отметка «доступ подтверждён»: её снимает проверка, а не человек, - иначе враньё в кабинете."""
+        async with self.pool.acquire() as con:
+            if title:
+                await con.execute(
+                    "UPDATE tenants SET target_ok = $2, target_title = $3, updated_at = now() WHERE id = $1",
+                    tenant_id,
+                    ok,
+                    title,
+                )
+            else:
+                await con.execute(
+                    "UPDATE tenants SET target_ok = $2, updated_at = now() WHERE id = $1", tenant_id, ok
+                )
+
+    async def note_publish(self, tenant_id: int, message_id: int) -> None:
+        """Пост вышел: помним номер и время - по «сколько назад» человек видит, что автопилот жив."""
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE tenants SET last_post_id = $2, last_post_at = now(), updated_at = now() WHERE id = $1",
+                tenant_id,
+                message_id,
+            )
+
+    async def note_reactions(self, tenant_id: int, added: int) -> None:
+        """Итог заказа реакций для этого клиента: сколько сервис добавил сверх прежнего числа."""
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE tenants SET reactions_added = $2, updated_at = now() WHERE id = $1", tenant_id, added
+            )
+
     # ==== деньги и тариф ====
 
     async def add_balance(self, tenant_id: int, amount: int, note: str = "") -> Tenant:
@@ -232,8 +297,7 @@ class Store:
 
     async def request_topup(self, tenant_id: int, amount: int) -> int:
         """Заявка на оплату: денег ещё не видели, но очередь на подтверждение уже стоит."""
-        if not MIN_TOPUP <= amount <= MAX_TOPUP:
-            raise StoreError(f"Сумму нужно написать от {MIN_TOPUP} до {MAX_TOPUP} ₽.")
+        check_topup(amount)
         async with self.pool.acquire() as con:
             row = await con.fetchrow(
                 "INSERT INTO payments (tenant_id, kind, amount_rub, status, note) "
@@ -243,6 +307,13 @@ class Store:
             )
         log.info("Клиент %s заявил оплату %s ₽ (заявка %s).", tenant_id, amount, row["id"])
         return int(row["id"])
+
+    async def credit(self, tenant_id: int, amount: int, note: str = "начислено из панели") -> Tenant:
+        """Начислить вручную: клиент перевёл без заявки, а сумму ту же надо проверить."""
+        check_topup(amount)
+        tenant = await self.add_balance(tenant_id, amount, note)
+        log.info("Клиенту %s начислено %s ₽ вручную.", tenant_id, amount)
+        return tenant
 
     async def list_payments(self, tenant_id: int, limit: int = 10) -> List[dict]:
         async with self.pool.acquire() as con:
@@ -254,8 +325,49 @@ class Store:
             )
         return [dict(row) for row in rows]
 
-    # ==== доноры ====
+    async def pending_topups(self, limit: int = 20) -> List[dict]:
+        """Очередь на твоё подтверждение: человек заявил сумму, деньги ещё не видел никто."""
+        async with self.pool.acquire() as con:
+            rows = await con.fetch(
+                "SELECT p.id, p.tenant_id, p.amount_rub, p.created_at, t.target, t.balance_rub "
+                "FROM payments p JOIN tenants t ON t.id = p.tenant_id "
+                "WHERE p.status = 'pending' ORDER BY p.id LIMIT $1",
+                limit,
+            )
+        return [dict(row) for row in rows]
 
+    async def confirm_topup(self, payment_id: int) -> dict:
+        """Начислить: заявка закрывается одной строкой, сумма ложится на баланс ровно один раз."""
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow(
+                "UPDATE payments SET status = 'done', note = 'начислено из панели' "
+                "WHERE id = $1 AND status = 'pending' RETURNING tenant_id, amount_rub",
+                payment_id,
+            )
+            if row is None:
+                raise StoreError("Эта заявка уже разобрана - обнови экран.")
+            await con.execute(
+                "UPDATE tenants SET balance_rub = balance_rub + $2, updated_at = now() WHERE id = $1",
+                row["tenant_id"],
+                row["amount_rub"],
+            )
+        log.info("Клиенту %s начислено %s ₽ по заявке %s.", row["tenant_id"], row["amount_rub"], payment_id)
+        return dict(row)
+
+    async def reject_topup(self, payment_id: int) -> int:
+        """Платежа не нашли: заявку гасим, денег не начисляем - клиент увидит статус в истории."""
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow(
+                "UPDATE payments SET status = 'rejected', note = 'платёж не найден' "
+                "WHERE id = $1 AND status = 'pending' RETURNING tenant_id",
+                payment_id,
+            )
+        if row is None:
+            raise StoreError("Этой заявки уже нет в очереди.")
+        log.info("Заявка %s отклонена (клиент %s).", payment_id, row["tenant_id"])
+        return int(row["tenant_id"])
+
+    # ==== доноры ====
     async def list_donors(self, tenant_id: int) -> List[Donor]:
         async with self.pool.acquire() as con:
             rows = await con.fetch("SELECT ref, chat_id, title FROM donors WHERE tenant_id = $1 ORDER BY ref", tenant_id)
@@ -268,7 +380,7 @@ class Store:
         async with self.pool.acquire() as con:
             count = await con.fetchval("SELECT count(*) FROM donors WHERE tenant_id = $1", tenant_id)
             if count >= MAX_DONORS:
-                raise StoreError(f"Больше {MAX_DONORS} доноров на одного клиента нельзя - убери старый.")
+                raise StoreError(f"Больше {MAX_DONORS} каналов-источников нельзя - убери лишний.")
             await con.execute(
                 "INSERT INTO donors (tenant_id, ref) VALUES ($1, $2) ON CONFLICT (tenant_id, ref) DO NOTHING",
                 tenant_id,
@@ -298,6 +410,30 @@ class Store:
                 """,
                 chat_id,
             )
+        return [_tenant(row) for row in rows]
+
+    async def active_donor_chats(self) -> List[int]:
+        """Какие каналы ловить по-клиентски: те же условия, что у маршрута выше."""
+        async with self.pool.acquire() as con:
+            rows = await con.fetch(
+                """
+                SELECT DISTINCT d.chat_id FROM donors d JOIN tenants t ON t.id = d.tenant_id
+                WHERE d.chat_id IS NOT NULL AND t.target_ok AND t.target <> ''
+                  AND t.plan_until IS NOT NULL AND t.plan_until > now()
+                """
+            )
+        return [int(row["chat_id"]) for row in rows]
+
+    async def unbound_refs(self) -> List[str]:
+        """Ссылки источников, которых ещё нет в Telegram: по ним аккаунт подписывается сам."""
+        async with self.pool.acquire() as con:
+            rows = await con.fetch("SELECT DISTINCT ref FROM donors WHERE chat_id IS NULL ORDER BY ref")
+        return [row["ref"] for row in rows]
+
+    async def targets_to_check(self) -> List[Tenant]:
+        """Каналы клиентов, где доступ ещё не подтверждён: проверка ставит отметку, а не человек."""
+        async with self.pool.acquire() as con:
+            rows = await con.fetch("SELECT * FROM tenants WHERE target <> '' AND target_ok = FALSE ORDER BY id")
         return [_tenant(row) for row in rows]
 
     # ==== лимит дня ====
@@ -340,6 +476,9 @@ CREATE TABLE IF NOT EXISTS tenants (
     balance_rub INT NOT NULL DEFAULT 0,
     plan_until TIMESTAMPTZ,
     agreed_at TIMESTAMPTZ,
+    last_post_id BIGINT,
+    last_post_at TIMESTAMPTZ,
+    reactions_added INT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -374,6 +513,15 @@ CREATE TABLE IF NOT EXISTS day_usage (
 """
 
 
+# Колонки, которых не было в первой версии схемы. IF NOT EXISTS переживает любой
+# возраст базы: старая база доживёт до них сама, при следующем запуске.
+MIGRATIONS = (
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS last_post_id BIGINT",
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS last_post_at TIMESTAMPTZ",
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS reactions_added INT",
+)
+
+
 def _tenant(row) -> Tenant:
     return Tenant(
         id=int(row["id"]),
@@ -386,4 +534,7 @@ def _tenant(row) -> Tenant:
         balance=int(row["balance_rub"] or 0),
         plan_until=row["plan_until"],
         agreed=row["agreed_at"] is not None,
+        last_post_id=int(row["last_post_id"] or 0),
+        last_post_at=row["last_post_at"],
+        reactions_added=row["reactions_added"],
     )

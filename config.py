@@ -56,14 +56,18 @@ def _flag(name: str, default: bool = True) -> bool:
     return raw not in ("0", "off", "no", "false", "нет", "выкл", "выключено")
 
 
-def parse_views(raw: str) -> int:
-    """Число просмотров из строки пользователя: пробелы и точки не мешают, ноль и потолок - нет."""
+def parse_views(raw: str, low: int = 1) -> int:
+    """Число просмотров из строки пользователя: пробелы и точки не мешают, ноль и потолок - нет.
+
+    Кабинет клиента вызывает с low=0: там «ноль просмотров» - осознанный выбор
+    человека («накручивать не надо»), а не ошибка ввода.
+    """
     digits = re.sub(r"\D", "", str(raw or ""))
     if not digits:
         raise ValueError("Напиши одно число - сколько просмотров добавлять, например 1000.")
     value = int(digits)
-    if not 1 <= value <= VIEWS_LIMIT:
-        raise ValueError(f"Просмотров должно быть от 1 до {VIEWS_LIMIT} - больше не даёт сервис.")
+    if not low <= value <= VIEWS_LIMIT:
+        raise ValueError(f"Просмотров должно быть от {low} до {VIEWS_LIMIT} - больше не даёт сервис.")
     return value
 
 
