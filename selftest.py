@@ -548,6 +548,7 @@ async def main():
     await check_diagnose()
     await check_text_posts()
     await check_manual_reaction()
+    await check_liveness_signals()
 
     print(f"\nПроверок: {len(CHECKS)}, неудач: {len(FAILED)}")
     if FAILED:
@@ -1552,6 +1553,7 @@ def check_startup_wiring() -> None:
         "await start_panel" in source,
     )
     check("панель не перекрывает остальных", "panel_live" not in source, "panel_live")
+    check("ловля постов докладывает о себе сама", "asyncio.create_task(bot.heartbeat())" in source, "heartbeat")
 
 
 async def check_panel_login_flood():
@@ -3048,6 +3050,132 @@ async def check_money():
     query = tap("money", owner)
     await plain.on_button(client, query)
     check("старая кнопка без базы не роняет панель", "DATABASE_URL" in query.answers[-1][0], str(query.answers))
+
+
+async def check_liveness_signals():
+    """Живой журнал вместо тишины: видно, доходят ли посты, и что делать, если Telegram отозвал вход."""
+    print("\n[30] Доклад о ловле постов и об отзыве сессии")
+    import logging
+
+    import main as main_module
+    from clients import Clients
+    from pyrogram.errors import AuthKeyDuplicated
+
+    cfg = make_cfg()
+    world = build_world(cfg)
+    client = world["client"]
+    bot, registry, ai = await make_bot(world)
+
+    lines: List[str] = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    handler = Grab()
+    pars_log = logging.getLogger("pars")
+    pars_log.addHandler(handler)
+    old_level = pars_log.level
+    pars_log.setLevel(logging.INFO)
+
+    real_sleep = asyncio.sleep
+    waits: List[int] = []
+
+    def armed_sleep():
+        """Первый sleep отпускаем сразу, второй вешаем до отмены: один виток цикла за раз."""
+        state = {"n": 0}
+
+        async def fake_sleep(seconds):
+            waits.append(int(seconds))
+            state["n"] += 1
+            if state["n"] > 1:
+                await asyncio.Event().wait()
+            await real_sleep(0)
+
+        return fake_sleep
+
+    async def run_once(coro):
+        asyncio.sleep = armed_sleep()
+        task = asyncio.create_task(coro)
+        try:
+            await real_sleep(0.05)
+        finally:
+            task.cancel()
+            asyncio.sleep = real_sleep
+            await real_sleep(0)
+
+    original_me = client.get_me
+    try:
+        # ---- посты идут: считаем их, никаких проверок аккаунта не нужно ----
+        bot.stats["seen"] = 3
+        bot.stats["published"] = 1
+        lines.clear()
+        waits.clear()
+        await run_once(bot.heartbeat(every=60))
+        report = "\n".join(lines)
+        check("виток heartbeat считает сообщения и публикации",
+              "сообщений от источников 3" in report and "опубликовано постов 1" in report, report[:200])
+        check("когда посты идут, аккаунт попусту не дёргаем", "Аккаунт" not in report, report[:200])
+        check("heartbeat спит заданный интервал", waits[:1] == [60], str(waits[:3]))
+
+        # ---- тишина, но аккаунт отвечает ----
+        bot.stats["seen"] = 0
+        bot.stats["published"] = 0
+        lines.clear()
+        waits.clear()
+        await run_once(bot.heartbeat(every=60))
+        report = "\n".join(lines)
+        check("пустое окно видно в журнале", "не пришло ни одного сообщения" in report, report[:200])
+        check("и сказано, что аккаунт жив", "Аккаунт отвечает" in report, report[:200])
+
+        # ---- тишина, потому что Telegram отозвал ключ сессии ----
+        async def dead_me():
+            raise AuthKeyDuplicated()
+
+        client.get_me = dead_me
+        lines.clear()
+        waits.clear()
+        await run_once(bot.heartbeat(every=60))
+        report = "\n".join(lines)
+        check("отзыв сессии назван своим именем", "Аккаунт не отвечает Telegram (AuthKeyDuplicated)" in report,
+              report[:250])
+        check("и сказано, что делать человеку",
+              "make_session.py" in report and "SESSION_STRING" in report, report[:250])
+        client.get_me = original_me
+
+        # ---- кабинеты: отозванная сессия не должна стучаться каждые пять минут ----
+        class DyingClients:
+            def __init__(self):
+                self.tries = 0
+
+            async def sync(self):
+                self.tries += 1
+                raise AuthKeyDuplicated()
+
+        dying = DyingClients()
+        waits.clear()
+        lines.clear()
+        await run_once(main_module.clients_loop(dying, every=300))
+        report = "\n".join(lines)
+        check("один отзыв - одно сообщение в журнале", report.count("Аккаунт не отвечает Telegram") == 1, report[:250])
+        check("повтор не через пять минут, а через час", waits[:1] == [3600], str(waits[:3]))
+
+        # ---- пустая клиентская очередь не дёргает Telegram вовсе ----
+        calls: List[int] = []
+
+        async def counting_me():
+            calls.append(1)
+            return await original_me()
+
+        client.get_me = counting_me
+        quiet = Clients(client, MemoryStore())
+        confirmed = await quiet.check_targets()
+        client.get_me = original_me
+        check("проверять нечего - запроса к Telegram нет", confirmed == 0 and not calls, str(calls))
+    finally:
+        pars_log.setLevel(old_level)
+        pars_log.removeHandler(handler)
+        asyncio.sleep = real_sleep
 
 
 async def _raises_store(action, *args):

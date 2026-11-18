@@ -35,6 +35,8 @@ TELEGRAM_ALBUM_LIMIT = 10
 LOOKBACK = 10
 REACTIONS_LOOKBACK = 10
 CATCH_UP_LIMIT = 10
+# как часто говорим в журнал, доходят ли до нас сообщения: молчание неотличимо от «нечего ловить»
+HEARTBEAT_SECONDS = 900
 WRITING_STATUSES = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
 # носители, которые мы по file_id не переносим: у такого поста в канал пойдёт только текст
 OTHER_MEDIA = ("video", "animation", "document", "audio", "voice", "video_note", "sticker")
@@ -96,7 +98,7 @@ class ParsBot:
         self._seen_groups: "OrderedDict[str, None]" = OrderedDict()
         self._sent_posts: "OrderedDict[str, None]" = OrderedDict()
         self.started = utc_now()
-        self.stats = {"caught": 0, "published": 0, "forwarded": 0, "errors": 0}
+        self.stats = {"caught": 0, "published": 0, "forwarded": 0, "errors": 0, "seen": 0}
         self.last_publish = ""
         self.store = None
         self.clients = None
@@ -151,6 +153,38 @@ class ParsBot:
             return f"постов с текстом не нашли (последнее сообщение {self._ago(history[-1])})"
         return f"последний пост {self._ago(posts[-1])}"
 
+    async def heartbeat(self, every: int = HEARTBEAT_SECONDS) -> None:
+        """Раз в 15 минут пишем в журнал, доходят ли до нас сообщения от источников.
+
+        Пустой журнал невозможно отличить от «источники не публикуют» - именно так и
+        выглядел отзыв сессии Telegram. Поэтому считаем сами, а если не пришло ничего,
+        проверяем одним запросом, отвечает ли аккаунт.
+        """
+        minutes = max(1, every // 60)
+        before = {"seen": 0, "published": 0}
+        while True:
+            await asyncio.sleep(every)
+            seen = self.stats["seen"] - before["seen"]
+            published = self.stats["published"] - before["published"]
+            before = {"seen": self.stats["seen"], "published": self.stats["published"]}
+            if seen or published:
+                log.info("За %s мин: сообщений от источников %s, опубликовано постов %s.", minutes, seen, published)
+                continue
+            log.info("За %s мин от каналов-источников не пришло ни одного сообщения - проверяю аккаунт.", minutes)
+            try:
+                await self.client.get_me()  # без обёртки call: ждать лимит здесь некому
+            except Exception as exc:  # noqa: BLE001 - смысл ровно в том, какая это ошибка
+                log.error(
+                    "Аккаунт не отвечает Telegram (%s): ловли постов не будет, пока не обновишь вход - "
+                    "python make_session.py --window, затем новый SESSION_STRING в Railway.",
+                    type(exc).__name__,
+                )
+            else:
+                log.warning(
+                    "Аккаунт отвечает, но сообщений не было: либо источники молчали, либо Telegram не присылает нам "
+                    "обновления - увидим на следующем посте."
+                )
+
     def _remember(self, store: "OrderedDict[str, None]", key: str) -> None:
         """Память на этот запуск: пачки карточек и уже отправленные посты, не больше cache_size."""
         store[key] = None
@@ -158,6 +192,7 @@ class ParsBot:
             store.popitem(last=False)
 
     async def on_message(self, client, message: Message) -> None:
+        self.stats["seen"] += 1
         dests = await self._dests(message)
         if not dests:
             return

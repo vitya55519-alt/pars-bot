@@ -5,17 +5,28 @@ import sys
 import aiohttp
 from dotenv import load_dotenv
 from pyrogram import Client, idle
-from pyrogram.errors import FloodWait, SessionExpired, SessionRevoked, Unauthorized
+from pyrogram.errors import (
+    AuthKeyDuplicated,
+    AuthKeyUnregistered,
+    FloodWait,
+    SessionExpired,
+    SessionRevoked,
+    Unauthorized,
+)
 
 from ai import AiRewriter
 from clients import Clients, SYNC_SECONDS
 from config import Config, ConfigError
-from handlers import ParsBot
+from handlers import HEARTBEAT_SECONDS, ParsBot
 from panel import Panel
 from registry import Registry, RegistryError
 from store import Store
 
 log = logging.getLogger("pars")
+
+# Telegram сказал, что этот ключ сессии больше не живой: долбить его каждые пять минут нельзя
+SESSION_ERRORS = (AuthKeyDuplicated, AuthKeyUnregistered, SessionExpired, SessionRevoked, Unauthorized)
+SESSION_RETRY_SECONDS = 3600
 
 
 async def start_panel(panel_client: Client, panel: Panel, owner_id: int, account_name: str) -> bool:
@@ -45,9 +56,24 @@ async def start_panel(panel_client: Client, panel: Panel, owner_id: int, account
 
 async def clients_loop(clients: Clients, every: int = SYNC_SECONDS) -> None:
     """Клиентскую часть обслуживаем фоном: подписки и проверки прав не должны мешать постам."""
+    session_dead = False
     while True:
         try:
             await clients.sync()
+            session_dead = False
+        except SESSION_ERRORS as exc:
+            # Отозванная сессия - не повод стучаться в Telegram каждые пять минут:
+            # пишем один раз, что делать, и отступаем на час.
+            if not session_dead:
+                log.error(
+                    "Аккаунт не отвечает Telegram (%s): кабинеты клиентов стоят, и ловля постов под вопросом. "
+                    "Нужен новый вход: python make_session.py --window, затем обнови SESSION_STRING в Railway. "
+                    "Пробую снова через час, чтобы не злить Telegram.",
+                    type(exc).__name__,
+                )
+                session_dead = True
+            await asyncio.sleep(max(every, SESSION_RETRY_SECONDS))
+            continue
         except Exception as exc:  # noqa: BLE001 - без клиентов личный режим работает как раньше
             log.error("Клиенты не обслужены (%s: %s) - повторю через %s сек.", type(exc).__name__, exc, every)
         await asyncio.sleep(every)
@@ -117,7 +143,11 @@ async def amain(cfg: Config) -> None:
         log.info("Настройки:\n%s", cfg.describe())
         log.info("Готов - жду новые посты из каналов-источников.")
         sync = asyncio.create_task(clients_loop(clients)) if clients else None
-        await idle()
+        beat = asyncio.create_task(bot.heartbeat())
+        try:
+            await idle()
+        finally:
+            beat.cancel()
     except (Unauthorized, SessionExpired, SessionRevoked) as exc:
         log.error("Сессия недействительна (%s). Нужно создать SESSION_STRING заново: python make_session.py", type(exc).__name__)
         raise SystemExit(1)

@@ -117,9 +117,13 @@ class Clients:
 
     async def check_targets(self) -> int:
         """Каналы клиентов без подтверждения: смотрим права и ставим честную отметку."""
+        waiting = await self.store.targets_to_check()
+        if not waiting:
+            return 0
+        # лишний запрос к Telegram на пустом месте не нужен: он и выдавал отзыв сессии
         me = await call(self.client.get_me)
         confirmed = 0
-        for tenant in await self.store.targets_to_check():
+        for tenant in waiting:
             ref = tenant.target_id or tenant.target
             try:
                 member = await call(self.client.get_chat_member, ref, me.id)
