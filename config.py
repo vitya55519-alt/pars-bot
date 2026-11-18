@@ -94,7 +94,7 @@ class Config:
     ai_prompt: str = DEFAULT_PROMPT
     ai_max_tokens: int = 2000
     ai_thinking: str = "disabled"
-    rewrite_default: bool = True
+    rewrite_default: bool = False
     ai_timeout: int = 90
     ai_retries: int = 3
     ai_retry_delay: int = 5
@@ -114,6 +114,16 @@ class Config:
     database_url: str = ""
     worker_contact: str = ""
     payment_details: str = ""
+
+    @property
+    def ai_enabled(self) -> bool:
+        """Общий выключатель нейросети: REWRITE=0 - и ни один пост не уходит через MiniMax.
+
+        Кнопка «✏️ Текст» у канала при этом не ломается: она по-прежнему хранит выбор
+        человека, просто он не действует, пока общая настройка выключена. Включишь
+        REWRITE=1 - вернётся прежний выбор по каждому каналу и клиенту.
+        """
+        return self.rewrite_default
 
     @property
     def promo_enabled(self) -> bool:
@@ -150,7 +160,7 @@ class Config:
             ai_prompt=_text("AI_SYSTEM_PROMPT", DEFAULT_PROMPT),
             ai_max_tokens=int(_number("AI_MAX_TOKENS", 2000)),
             ai_thinking=thinking_mode(_text("AI_THINKING")),
-            rewrite_default=_flag("REWRITE", True),
+            rewrite_default=_flag("REWRITE", False),
             ai_timeout=int(_number("AI_TIMEOUT", 90)),
             ai_retries=int(_number("AI_RETRIES", 3)),
             ai_retry_delay=int(_number("AI_RETRY_DELAY", 5)),
@@ -194,14 +204,16 @@ class Config:
             else "кабинетов нет: DATABASE_URL не задан - работает только твоя панель"
         )
         thinking = "размышления вслух выключены" if self.ai_thinking == "disabled" else "размышления вслух включены"
-        if not self.minimax_api_key:
+        if not self.ai_enabled:
+            ai = "REWRITE=0 - к текстам нейросеть не подключаем вообще"
+        elif not self.minimax_api_key:
             ai = "ключа MINIMAX_API_KEY нет - публикуем оригинальный текст"
         else:
             ai = f"{self.ai_model} ({thinking}), попыток: {self.ai_retries}, пауза: {self.ai_retry_delay} сек"
         rewrite = (
-            "переписывает нейросеть (по умолчанию, у каждого канала своё)"
+            "переписывает нейросеть там, где включено (REWRITE=1)"
             if self.rewrite_default
-            else "своими словами автора, без нейросети (по умолчанию, у каждого канала своё)"
+            else "везде текст автора, как в источнике (REWRITE=0 - нейросеть не работает ни у одного канала)"
         )
         return (
             f"Группа, где лежит список каналов: {group}\n"

@@ -300,6 +300,11 @@ class ParsBot:
 
     async def _rewritten(self, message: Message, dests: List[Destination], author: str) -> str:
         """Переписанный текст считаем только если он кому-то нужен: лишний запрос к ИИ - лишние деньги."""
+        if not self.cfg.ai_enabled:
+            # REWRITE=0 - общий выключатель: ни одного обращения к MiniMax, даже если
+            # у канала переписывание осталось включённым с прежних времён.
+            log.info("Нейросеть выключена переменной REWRITE - публикуем текст автора без запросов к ИИ.")
+            return ""
         if not any(dest.rewrite for dest in dests):
             log.info("Переписывание выключено у всех адресатов - публикуем текст автора.")
             return ""

@@ -74,6 +74,10 @@ class AiRewriter:
         return body
 
     async def rewrite(self, text: str) -> str:
+        if not self.cfg.ai_enabled:
+            # Общий выключатель REWRITE=0: запрос к MiniMax не уходит ни при каких
+            # настройках канала - выбор человека сохранён и заработает вместе с REWRITE=1.
+            return cut(text)
         if not self.cfg.minimax_api_key:
             log.warning("MINIMAX_API_KEY пуст -> публикуем оригинальный текст.")
             return cut(text)

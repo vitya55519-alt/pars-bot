@@ -463,6 +463,9 @@ def make_cfg(**kwargs):
         management_chat=None,
         promo_bot="promo_bot",
         minimax_api_key="",
+        # тестовые миры живут с включённой нейросетью: почти все проверки механики
+        # поста идут через рерайт. Отдельный блок [4в] проверяет REWRITE=0.
+        rewrite_default=True,
         ai_retries=3,
         ai_retry_delay=0,
         album_wait=0,
@@ -526,6 +529,7 @@ async def main():
     await check_album()
     await check_flood_and_ai()
     await check_ai_clean_answer()
+    await check_ai_switched_off()
     await check_commands()
     await check_live_and_delete()
     await check_promo_flow()
@@ -1151,6 +1155,108 @@ async def check_ai_clean_answer():
     older = Message(client, 79, world["donor_sport_1"], text="пост до старта",
                     date=naive_now() - datetime.timedelta(minutes=5))
     check("старый текстовый пост дублем не выгоняет", bot._unverifiable(older) is True, str(bot._unverifiable(older)))
+
+
+async def check_ai_switched_off():
+    print("\n[4в] REWRITE=0: рабочая механика «пост -> просмотры -> реакции» без нейросети")
+    import logging
+    import os
+
+    from ai import AiRewriter
+    from cabinet import Cabinet
+
+    # ==== по умолчанию нейросети в боте нет ====
+    bare = Config(api_id=1, api_hash="h", session_string="1s")
+    check("без REWRITE нейросеть выключена", bare.ai_enabled is False, str(bare.ai_enabled))
+    check("и новый канал ждёт текст автора", bare.rewrite_default is False, str(bare.rewrite_default))
+
+    real_env = dict(os.environ)
+    try:
+        os.environ.update({"API_ID": "1", "API_HASH": "h", "SESSION_STRING": "1s"})
+        os.environ.pop("REWRITE", None)
+        check("переменной нет - Config.load выключает нейросеть", Config.load().ai_enabled is False)
+        os.environ["REWRITE"] = "1"
+        check("REWRITE=1 возвращает нейросеть", Config.load().ai_enabled is True)
+        os.environ["REWRITE"] = "выкл"
+        check("REWRITE=выкл снова выключает", Config.load().ai_enabled is False)
+    finally:
+        os.environ.clear()
+        os.environ.update(real_env)
+
+    # ==== механика без ИИ: публикация, просмотры, реакции ====
+    lines = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    handler = Grab()
+    pars_log = logging.getLogger("pars")
+    old_level = pars_log.level
+    pars_log.addHandler(handler)
+    pars_log.setLevel(logging.INFO)
+
+    session = FakeSession([
+        FakeResponse(200, text='{"data": "kluch123"}'),
+        FakeResponse(200, text="OK"),
+        FakeResponse(200, text="OK"),
+    ])
+    cfg = make_cfg(
+        minimax_api_key="ключ",
+        rewrite_default=False,
+        promo_views=700,
+        promo_delay=0,
+        reactions_enabled=True,
+    )
+    world = build_world(cfg)
+    client = world["client"]
+    stub = StubAI("переписанный текст")
+    bot, registry, _ = await make_bot(world, ai=stub, session=session)
+    bot.reactions.wait = 0
+    bot.reactions.poll = 0
+    bot.reactions.permit_limit = 0.01
+    try:
+        await bot.on_message(
+            client, Message(client, 81, world["donor_other"], caption="текст автора", photo=Photo("off1"))
+        )
+        await asyncio.sleep(0.05)
+    finally:
+        pars_log.setLevel(old_level)
+        pars_log.removeHandler(handler)
+
+    report = "\n".join(lines)
+    check("с ключом внутри, но без запросов к ИИ", stub.calls == 0 and "Рерайт завершён" not in report, str(stub.calls))
+    check("в канал уходит текст автора", client.posted[0].caption == "текст автора", client.posted[0].caption[:60])
+    check("пост встал в нужный канал", client.posted[0].chat.id == world["yumor"].id, str(client.posted[0].chat.id))
+    check("журнал объясняет, почему без нейросети", "REWRITE" in report, [line for line in lines if "REWRITE" in line][:1])
+    check("просмотры ушли промо-боту", len(client.forwarded) == 1, str(client.forwarded))
+    check("реакции заказаны без ИИ", bot.reactions.ordered == 1, bot.reactions.last_error)
+    check("сбоев в цепочке нет", bot.stats["errors"] == 0, str(bot.stats["errors"]))
+
+    # ==== выбор человека сохраняется, а слова честные ====
+    off_cfg = make_cfg(bot_token="900:AAstub", minimax_api_key="ключ", rewrite_default=False)
+    off_world = build_world(off_cfg)
+    off_client = off_world["client"]
+    off_bot, off_registry, _ = await make_bot(off_world)
+    panel = Panel(off_client, off_cfg, off_registry, off_bot)
+    check("меню называет общий выключатель", "REWRITE" in panel.ai_line(), panel.ai_line())
+    await off_registry.toggle_category_rewrite(21)
+    view, _ = panel._category_view(21)
+    check("выбор канала сохранён", off_registry.rewrite_for(off_registry.categories[21]) is True,
+          str(off_registry.rewrite_for(off_registry.categories[21])))
+    check("но экран канала говорит, что ИИ выключен", "REWRITE" in view and "текст автора" in view, view[:300])
+    status, _ = panel._status_view()
+    check("статус: текст для новых каналов - словами автора", "словами автора" in status, [l for l in status.splitlines() if "Текст" in l][:1])
+
+    quiet = FakeSession([FakeResponse(200, {"choices": [{"message": {"content": "ответ, который не нужен"}}]})])
+    out = await AiRewriter(off_cfg, quiet).rewrite("пост автора")
+    check("даже прямой вызов ИИ при REWRITE=0 молчит", not quiet.calls and out == "пост автора", str(len(quiet.calls)))
+
+    cab = Cabinet(off_client, off_cfg, MemoryStore())
+    tenant = await cab.store.ensure_tenant(5001)
+    check("в кабинете выбор клиента описан честно", "нейросеть выключена" in cab._text_line(tenant), cab._text_line(tenant))
+    check("кнопка кабинета остаётся переключателем выбора", cab._text_cell(tenant)[0] == "✏️ Текст: переписывает ИИ",
+          cab._text_cell(tenant)[0])
 
 
 async def check_commands():
@@ -2684,7 +2790,8 @@ async def check_cabinet():
     await panel.on_button(client, tap("chome"))
     check("заявка без подтверждения помечена", "ждёт проверки" in text(), text()[-260:])
     check("настроенному клиенту не предлагают запуск", "Всё настроено" in text() and "cresult" in cells(), text()[-260:])
-    check("обещание сервиса читается в кабинете", "переписывает" in text() and "просмотры и реакции" in text(), text()[:300])
+    check("обещание сервиса читается в кабинете",
+          "Текст поста:" in text() and "просмотры и реакции" in text() and "Бот читает каналы" in text(), text()[:300])
     check("кабинет даёт все четыре шага кнопками", {"cdonors", "cchannel", "cviews", "cplans"} <= set(cells()), str(cells()))
     check("и помощь с кнопками документов", {"cguide", "cdoc|1", "cdoc|2"} <= set(cells()), str(cells()))
 
