@@ -13,15 +13,13 @@ import datetime
 import logging
 from typing import Dict, List, Optional, Tuple
 
+import legal
 from ai import cut
 from config import VIEWS_LIMIT, parse_views
 from store import MAX_DONORS, MAX_POSTS_PER_DAY, MIN_TOPUP, PLANS, StoreError, Tenant, parse_ref
 from utils import TEXT_LIMIT, call, markup
 
 log = logging.getLogger("cabinet")
-
-AGREEMENT_URL = "https://telegra.ph/Polzovatelskoe-soglashenie-08-01-39"
-PRIVACY_URL = "https://telegra.ph/Politika-konfidencialnosti-08-01-83"
 
 # 0 - не ошибка ввода, а осознанный выбор человека: просмотры не накручивать
 VIEWS_PRESETS = (0, 500, 1000, 2000, 5000)
@@ -89,7 +87,6 @@ class Cabinet:
         "cresult": "result",
         "cguide": "guide",
         "cboost": "reactions",
-        "cdocs": "docs",
     }
 
     def __init__(self, client, cfg, store):
@@ -162,6 +159,8 @@ class Cabinet:
                 return
             self.awaiting[user_id] = ("sum", 0)
             await self._show(query, "sum")
+        elif key == "cdoc":
+            await self._send_document(query, int(arg or 0))
         elif key == "cdel":
             await self._remove_donor(query, int(arg or 0))
         elif key == "creactions":
@@ -174,6 +173,15 @@ class Cabinet:
             await self._show(query, "plans")
         else:
             await call(query.answer, "Такой кнопки нет - нажми «⬅️ Кабинет».")
+
+    async def _send_document(self, query, kind: int) -> None:
+        """Документ приходит отдельными сообщениями: длинный текст не влезает в одно, а терять куски нельзя."""
+        title, pages = legal.document(kind)
+        await call(query.answer, title)
+        for index, page in enumerate(pages):
+            text = f"{title}\n\n{page}" if index == 0 else page
+            buttons = markup([("⬅️ Кабинет", "chome")]) if index == len(pages) - 1 else None
+            await call(self.client.send_message, query.message.chat.id, cut(text, TEXT_LIMIT), reply_markup=buttons)
 
     async def _remove_donor(self, query, position: int) -> None:
         donors = await self.store.list_donors(query.from_user.id)
@@ -377,7 +385,8 @@ class Cabinet:
                 "запрещена, сервис не поставит ни одной - это настройка канала, изменить её\n"
                 "бот не может: канал → Изменить → Реакции.\n\n"
                 "Как устроено:\n"
-                "Сервис принимает один заказ в час, поэтому в очереди держится один самый\n"
+                "Заказы идут раз в 5 минут; если сервис отказывает словами про лимит\n"
+                "или час, бот сам делает паузу до часа. В очереди держится один самый\n"
                 "свежий пост канала. Сам заказ идёт около 6 минут: столько сервис требует,\n"
                 "чтобы страница была открыта.\n\n"
                 "Как проверить, что работает:\n"
@@ -405,7 +414,7 @@ class Cabinet:
                 "✨ Реакции - бесплатная накрутка реакций, включается и выключается.\n"
                 "📊 Результат - видно, работает ли всё сейчас и что нажать, если нет.\n"
                 "4️⃣ Тариф - цена, баланс, оплата и срок подписки.\n"
-                "📄 Документы - соглашение и политика конфиденциальности.\n\n"
+                "📄 Соглашение и 🔒 Политика - документы сервиса, читаются прямо в боте.\n\n"
                 f"Рабочий аккаунт, которого нужно добавить в администраторы: {self.worker}\n\n"
                 "Дальше ничего нажимать не нужно: посты выходят сами, как только у источника\n"
                 "появляется новый текст. Проверить - кнопка «📊 Результат».",
@@ -435,7 +444,8 @@ class Cabinet:
                 [(f"Купить неделю {PLANS['week']['price']} ₽", "cbuy|week")],
                 [(f"Купить месяц {PLANS['month']['price']} ₽", "cbuy|month")],
                 [("💳 Пополнить баланс", "ctopup")],
-                [("📄 Документы", "cdocs"), ("📊 Результат", "cresult")],
+                [("📄 Соглашение", "cdoc|1"), ("🔒 Политика", "cdoc|2")],
+                [("📊 Результат", "cresult")],
                 [("⬅️ Кабинет", "chome")],
             )
 
@@ -448,21 +458,15 @@ class Cabinet:
                 "и напишу тебе в этот чат.",
             ), markup([("🆘 Помощь", "cguide")], [("⬅️ Кабинет", "chome")])
 
-        if kind == "docs":
-            return self._notice(
-                user_id,
-                "Документы сервиса:\n\n"
-                f"Пользовательское соглашение: {AGREEMENT_URL}\n"
-                f"Политика конфиденциальности: {PRIVACY_URL}\n\n"
-                "Оплачивая тариф, ты соглашаешься с обоими.",
-            ), markup([("⬅️ Кабинет", "chome")])
-
         if kind == "agree":
             return (
-                "Перед оплатой - документы сервиса.\n\n"
-                f"Пользовательское соглашение: {AGREEMENT_URL}\n"
-                f"Политика конфиденциальности: {PRIVACY_URL}",
-                markup([("✅ Принимаю условия", "cagree")], [("📄 Читать позже", "cdocs")], [("⬅️ Кабинет", "chome")]),
+                "Перед оплатой - документы сервиса.\n"
+                "Прочитай их кнопками ниже: соглашение и политика конфиденциальности.",
+                markup(
+                    [("📄 Соглашение", "cdoc|1"), ("🔒 Политика", "cdoc|2")],
+                    [("✅ Принимаю условия", "cagree")],
+                    [("⬅️ Кабинет", "chome")],
+                ),
             )
 
         return await self._home_view(user_id, tenant, now)
@@ -504,7 +508,8 @@ class Cabinet:
             *rows,
             [("1️⃣ Откуда брать посты", "cdonors"), ("2️⃣ Куда публиковать", "cchannel")],
             [("3️⃣ Просмотры", "cviews"), ("4️⃣ Тариф", "cplans")],
-            [("🆘 Помощь", "cguide"), ("📄 Документы", "cdocs")],
+            [("🆘 Помощь", "cguide")],
+            [("📄 Соглашение", "cdoc|1"), ("🔒 Политика", "cdoc|2")],
         )
 
     def _payment_line(self, row: dict) -> str:

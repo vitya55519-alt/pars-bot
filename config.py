@@ -91,7 +91,7 @@ class Config:
     promo_views: int = 0
     promo_delay: int = 3
     reactions_enabled: bool = True
-    reactions_interval: int = 3600
+    reactions_interval: int = 300
     reactions_timeout: int = 30
     reactions_email: str = ""
     album_wait: float = 2.0
@@ -146,7 +146,7 @@ class Config:
             promo_views=int(_number("PROMO_VIEWS", 0)),
             promo_delay=int(_number("PROMO_DELAY", 3)),
             reactions_enabled=_flag("REACTIONS", True),
-            reactions_interval=max(60, int(_number("REACTIONS_INTERVAL", 3600))),
+            reactions_interval=max(60, int(_number("REACTIONS_INTERVAL", 300))),
             reactions_timeout=int(_number("REACTIONS_TIMEOUT", 30)),
             reactions_email=_text("REACTIONS_EMAIL"),
             album_wait=_number("ALBUM_WAIT", 2.0),

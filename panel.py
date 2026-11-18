@@ -1,8 +1,9 @@
-"""Управление донорами кнопками в твоём боте.
+"""Управление каналами и источниками постов кнопками в твоём боте.
 
 Бот работает в одном процессе с юзерботом, поэтому нажимает действия прямо
 через реестр: список по-прежнему живёт в группе с темами, но руками в ней
-ничего писать не нужно. Служебных сообщений в чате не появляется.
+ничего писать не нужно. Настройки канала (просмотры, реакции) бот записывает
+служебным сообщением в его тему - после перезапуска они восстанавливаются сами.
 """
 
 import logging
@@ -13,6 +14,7 @@ from pyrogram.errors import MessageNotModified
 from pyrogram.handlers import CallbackQueryHandler, MessageHandler
 from pyrogram.types import BotCommand, InlineKeyboardMarkup
 
+import legal
 from ai import cut
 from cabinet import Cabinet
 from config import VIEWS_LIMIT
@@ -35,51 +37,52 @@ HELP = (
     "Бот создаст форум-группу, ты в ней владелец - там живёт весь список.\n"
     "1) «➕ Новый канал» - напиши название своего канала, куда постить. "
     "Тема с таким же названием создаётся сама.\n"
-    "2) Открой канал и нажми «➕ Донор» - пришли @юзернейм или ссылку https://t.me/... "
-    "Сколько ссылок в одном сообщении, столько доноров и добавится.\n"
-    "3) Кнопка 🗑 под донором - убрать его из списка.\n"
+    "2) Открой канал в «🗂 Мои каналы» и нажми «📡 Добавить источник» - пришли @юзернейм "
+    "или ссылку https://t.me/... канала, откуда брать посты. Сколько ссылок в одном "
+    "сообщении, столько источников и добавится.\n"
+    "3) Кнопка ✖ под источником - отключить его: посты оттуда больше не ловим.\n"
     "4) «✏️ Переименовать» - если название темы должно отличаться от названия канала.\n"
-    "5) «🗑 Убрать канал целиком» - удалить тему и всех её доноров (спросит подтверждение).\n"
+    "5) «🗑 Убрать канал» - удалить тему и все её источники (спросит подтверждение).\n"
     "6) «✏️ Переименовать склад» - сменить название группы, где живёт список.\n"
     "7) «🔄 Обновить список» - перечитать группу заново.\n"
     "8) «⏸ Пауза» - посты ловим, но не публикуем. «▶ Пуск» - снова работаем.\n"
-    "9) «🎭 Реакции» - включаются и выключаются бесплатно накручивать реакции "
-    "на свежие посты. Сервис даёт один заказ в час на всех, поэтому очередь держит "
-    "по одному заказу на канал и всегда самый свежий его пост - старые посты тем же "
-    "заказом не повторяются. Через 20 минут и через два часа после заказа бот сам "
-    "пересчитывает реакции под постом - числа видны в «🩺 Проверка» и в «📊 Статус».\n"
+    "9) «👁 Просмотры» и «🎭 Реакции» внутри каждого канала - свои у каждого: сколько "
+    "просмотров добавлять на пост и ставить ли бесплатные реакции. Реакции сервис "
+    "принимает раз в 5 минут; если он отказывает словами про лимит или час, бот сам "
+    "делает паузу до часа. В очереди держится один самый свежий пост канала - старые "
+    "посты тем же заказом не повторяются. Через 20 минут и через два часа после заказа "
+    "бот сам пересчитывает реакции под постом - числа видны в «🩺 Проверка» и «ℹ️ Статус».\n"
     "10) «🎯 Реакция на пост» - заказать реакции вручную: после кнопки пришли ссылку "
     "https://t.me/канал/номер. Сначала бот сам откроет этот пост своим аккаунтом: "
     "не увидит - заказ не потратит. Увидит - поставит в общую очередь, но ручной заказ "
-    "идёт раньше свежих постов, и новый пост канала его не вытеснит. Окно сервиса одно "
-    "в час, поэтому часть времени уходит на ожидание. О результате бот напишет сюда сам, "
-    "реакции пересчитает через 20 минут и через 2 часа.\n"
-    "11) «👁 Просмотров» - напиши число от 1 до 10000: столько просмотров бот отправит "
-    "промо-боту после каждой новой публикации. Сохраняется в склад, перезапуск не сбрасывает.\n"
-    "12) «🩺 Проверка» - бот смотрит последние сообщения у доноров, пускает ли его в канал "
-    "и сколько постов не дошло, а заодно считает реакции под свежими постами канала. "
-    "«⤵️ Догнать пропущенное» публикует их тем же маршрутом.\n"
-    "13) «💰 Заявки на оплату» - очередь клиентов, которые написали сумму, но ещё не "
+    "идёт раньше свежих постов, и новый пост канала его не вытеснит. О результате бот "
+    "напишет сюда сам, реакции пересчитает через 20 минут и через 2 часа.\n"
+    "11) «🩺 Проверка» - бот смотрит последние сообщения у источников, пускает ли его "
+    "в канал и сколько постов не дошло, а заодно считает реакции под свежими постами "
+    "канала. «⤵️ Догнать пропущенное» публикует их тем же маршрутом.\n"
+    "12) «💰 Заявки на оплату» - очередь клиентов, которые написали сумму, но ещё не "
     "получили деньги на баланс. Проверил поступление - жми «✔ Начислить»: сумма ложится "
     "один раз, повторная кнопка уже ничего не добавит. Не нашёл платёж - «✖ Не нашёл», "
     "тогда у клиента в истории заявка станет отклонённой, а баланс не изменится.\n"
-    "14) «👥 Клиенты» - все кабинеты одной таблицей: тариф, баланс и когда у человека "
+    "13) «👥 Клиенты» - все кабинеты одной таблицей: тариф, баланс и когда у человека "
     "выходил последний пост. Если клиент перевёл мимо заявки, нажми «💵 Начислить» и "
-    "напиши сумму - она попадёт ему на баланс, и тариф он купит сам.\n\n"
-    "Ловим любой пост донора, в котором есть текст: с картинкой - картинкой, альбом - "
+    "напиши сумму - она попадёт ему на баланс, и тариф он купит сам.\n"
+    "14) «📄 Соглашение» и «🔒 Политика» - документы сервиса прямо в боте: "
+    "пользовательское соглашение и политика конфиденциальности.\n\n"
+    "Ловим любой пост источника, в котором есть текст: с картинкой - картинкой, альбом - "
     "пачкой карточек, без картинки - текстом. Картинки идут по своим номерам, ничего "
     "не скачивается. У поста с видео или документом переносим только текст. Пост без "
-    "текста не публикуем - перепечатывать нечего. Если донор - группа, а не канал, "
+    "текста не публикуем - перепечатывать нечего. Если источник - группа, а не канал, "
     "берём только посты самого чата: переписку в канал не пишем.\n"
     "Текстовый пост после рерайта в канале не опознать, поэтому «Догнать» берёт из них "
     "только то, что вышло уже после запуска бота; такие посты видны в «Проверке» отдельной "
     "строкой «текстовых до запуска не проверить».\n\n"
-    "Список хранится в группе с темами (тема = канал, ссылки в теме = доноры), "
+    "Список хранится в группе с темами (тема = канал, ссылки в теме = источники), "
     "поэтому после перезапуска всё восстанавливается само."
 )
 
 NO_GROUP = (
-    "Группы-хранилища пока нет - в ней живёт список доноров.\n\n"
+    "Группы-хранилища пока нет - в ней живёт список каналов и источников.\n\n"
     "Нажми «🏛 Создать группу» и напиши её название (например «АвтоПост»). "
     "Бот создаст форум-группу сам, ты в ней владелец - руками ничего настраивать не нужно.\n\n"
     "Если группа уже есть и ты в ней владелец - нажми «🔄 Обновить список»."
@@ -177,12 +180,16 @@ class Panel:
                 "group_rename": ("group_rename", 0),
             }[key]
             await self._show(query, key, arg)
-        elif key == "views":
-            if arg:
-                await self._apply_views(query, str(arg))
+        elif key == "cv":
+            if len(parts) > 2 and parts[2].isdigit():
+                await self._apply_category_views(query, arg, parts[2])
             else:
-                self.awaiting = ("views", 0)
-                await self._show(query, "views")
+                self.awaiting = ("cviews", arg)
+                await self._show(query, "cviews", arg)
+        elif key == "cr":
+            await self._toggle_category_reactions(query, arg)
+        elif key == "doc":
+            await self._send_document(query, arg)
         elif key == "react":
             self.awaiting = ("react_link", 0)
             await self._show(query, "react")
@@ -193,15 +200,6 @@ class Panel:
             self.registry.paused = key == "pause"
             self.notice = "Пауза: посты ловлю, но не публикую." if self.registry.paused else "Работаю дальше."
             await self._show(query, "main", flash=self.notice)
-        elif key == "reactions":
-            reactor = self.bot.reactions
-            reactor.enabled = not reactor.enabled
-            self.notice = (
-                "Реакции включил: каждый новый пост ставлю в очередь на бесплатный заказ."
-                if reactor.enabled
-                else "Реакции выключил - заказы не отправляю, посты публикуются как раньше."
-            )
-            await self._show(query, "main", flash=self.notice[:TEXT_LIMIT])
         elif key == "update":
             await self._rebuild(query)
         elif key == "check":
@@ -227,27 +225,53 @@ class Panel:
     async def _remove(self, query, topic_id: int, message_id: int) -> None:
         removed = await self.registry.remove_donor(message_id)
         names = ", ".join(donor.name for donor in removed)
-        self.notice = f"Убрал донора: {names}."
+        self.notice = f"✖ Отключил источник: {names}."
         await self._show(query, "cat", topic_id, flash=self.notice)
 
     async def _remove_category(self, query, topic_id: int) -> None:
         category = await self.registry.remove_category(topic_id)
-        self.notice = f"✅ Убрал канал «{category.name}» и его тему - его доноры больше не ловятся."
+        self.notice = f"✅ Убрал канал «{category.name}» и его тему - его источники больше не ловятся."
         await self._show(query, "topics", flash=self.notice)
 
-    async def _apply_views(self, query, raw: str) -> None:
+    async def _apply_category_views(self, query, topic_id: int, raw: str) -> None:
         try:
-            number = await self.registry.save_views(raw)
+            number = await self.registry.save_category_views(topic_id, raw)
         except ValueError as exc:
             self.notice = f"⚠ {exc}"
-            await self._show(query, "views")
+            await self._show(query, "cviews", topic_id)
             return
         except RegistryError as exc:
             self.notice = f"⚠ {exc}"
-            await self._show(query, "main")
+            await self._show(query, "cat", topic_id)
             return
-        self.notice = f"✅ Просмотры: {number}. Такое число бот отправит промо-боту после каждой публикации."
-        await self._show(query, "main", flash=str(number)[:TEXT_LIMIT])
+        self.notice = f"✅ Просмотры канала «{self._name(topic_id)}»: {number} на каждый пост."
+        await self._show(query, "cat", topic_id, flash=str(number))
+
+    async def _toggle_category_reactions(self, query, topic_id: int) -> None:
+        try:
+            enabled = await self.registry.toggle_category_reactions(topic_id)
+        except RegistryError as exc:
+            self.notice = f"⚠ {exc}"
+            await self._show(query, "cat", topic_id)
+            return
+        name = self._name(topic_id)
+        self.notice = (
+            f"🎭 Реакции канала «{name}» включены - каждый новый пост встанет в очередь."
+            if enabled
+            else f"🎭 Реакции канала «{name}» выключены - посты выходят без накрутки реакций."
+        )
+        if enabled and not self.bot.reactions.enabled:
+            self.notice += "\n⚠ Реакции выключены полностью (переменная REACTIONS) - заказы не пойдут, пока не включишь её."
+        await self._show(query, "cat", topic_id, flash=self.notice[:TEXT_LIMIT])
+
+    async def _send_document(self, query, kind: int) -> None:
+        """Документ приходит отдельными сообщениями: длинный текст не влезает в одно, а терять куски нельзя."""
+        title, pages = legal.document(kind)
+        await call(query.answer, title)
+        for index, page in enumerate(pages):
+            text = f"{title}\n\n{page}" if index == 0 else page
+            buttons = markup([("⬅️ Меню", "main")]) if index == len(pages) - 1 else None
+            await call(self.client.send_message, query.message.chat.id, cut(text, TEXT_LIMIT), reply_markup=buttons)
 
     async def _rebuild(self, query) -> None:
         await call(query.answer, "Перечитываю группу...")
@@ -353,7 +377,7 @@ class Panel:
         try:
             if kind == "donor":
                 added = await registry.add_donor(topic_id, cut(text, DONOR_LIMIT))
-                self.notice = "✅ Добавил доноров: " + ", ".join(donor.name for donor in added)
+                self.notice = "✅ Добавил источники: " + ", ".join(donor.name for donor in added)
                 screen = ("cat", topic_id)
             elif kind == "react_link":
                 self.notice = await self.bot.reactions.request(cut(text, LINK_LIMIT), self._notifier(message.chat.id))
@@ -370,10 +394,10 @@ class Panel:
                 name = await registry.rename_storage_group(text)
                 self.notice = f"✅ Склад теперь называется «{name}». Доноры и темы не изменились."
                 screen = ("main", 0)
-            elif kind == "views":
-                number = await registry.save_views(text)
-                self.notice = f"✅ Просмотры: {number}. Такое число бот отправит промо-боту после каждой публикации."
-                screen = ("main", 0)
+            elif kind == "cviews":
+                number = await registry.save_category_views(topic_id, text)
+                self.notice = f"✅ Просмотры канала «{self._name(topic_id)}»: {number} на каждый пост."
+                screen = ("cat", topic_id)
             elif kind == "credit":
                 digits = "".join(char for char in text if char.isdigit())
                 if not digits:
@@ -406,8 +430,8 @@ class Panel:
 
     def _fail_screen(self, kind: str, topic_id: int) -> Tuple[str, int]:
         """После отказа возвращаемся к тому экрану, где просили ввод, - чтобы можно было написать снова."""
-        if kind == "views":
-            return ("views", 0)
+        if kind == "cviews":
+            return ("cviews", topic_id)
         if kind == "react_link":
             return ("react", 0)
         if kind in ("channel", "group", "group_rename"):
@@ -451,8 +475,8 @@ class Panel:
             return self._drop_view(topic_id)
         if kind == "group_rename":
             return self._rename_group_view()
-        if kind == "views":
-            return self._views_view()
+        if kind == "cviews":
+            return self._category_views_view(topic_id)
         if kind == "react":
             return self._react_view()
         if kind == "credit":
@@ -483,7 +507,7 @@ class Panel:
         stats = self.bot.stats
         lines = [
             f"Группа: «{registry.group_name}»",
-            f"Каналов: {len(registry.categories)} · доноров: {registry.donor_count}",
+            f"Каналов: {len(registry.categories)} · источников: {registry.donor_count}",
             f"Состояние: {'⏸ пауза - не публикую' if registry.paused else '▶ работаю'}",
             self.bot.reactions.describe(),
             (
@@ -499,23 +523,17 @@ class Panel:
         clients = getattr(self.bot, "clients", None)
         if clients:
             lines.append(f"Кабинеты: {clients.tenants_total}, с действующим тарифом {clients.tenants_active}")
-        reactions_toggle = (
-            ("🎭 Реакции: выключить", "reactions")
-            if self.bot.reactions.enabled
-            else ("🎭 Реакции: включить", "reactions")
-        )
-        views = f"{self.cfg.promo_views}" if self.cfg.promo_views else "не задано"
         money = [[("💰 Заявки на оплату", "money"), ("👥 Клиенты", "clients")]] if self.store else []
         return (
             cut(self._with_notice("🤖 АвтоПост\n" + "\n".join(lines)), TEXT_LIMIT),
             markup(
-                [("📂 Каналы и доноры", "topics"), ("➕ Новый канал", "channel")],
+                [("🗂 Мои каналы", "topics"), ("➕ Новый канал", "channel")],
                 [("🔄 Обновить список", "update"), ("ℹ️ Статус", "status")],
                 [toggle, ("❓ Как это работает", "help")],
-                [reactions_toggle, ("🎯 Реакция на пост", "react")],
-                [(f"👁 Просмотров: {views}", "views"), ("🩺 Проверка", "check")],
+                [("🎯 Реакция на пост", "react"), ("🩺 Проверка", "check")],
                 *money,
                 [("✏️ Переименовать склад", "group_rename")],
+                [("📄 Соглашение", "doc|1"), ("🔒 Политика", "doc|2")],
             ),
         )
 
@@ -524,13 +542,13 @@ class Panel:
         if not categories:
             text = "Каналов пока нет. Нажми «➕ Новый канал» и напиши название своего канала."
         else:
-            lines = [f"Каналы ({len(categories)}):"]
+            lines = [f"🗂 Мои каналы ({len(categories)}):"]
             for index, category in enumerate(categories, start=1):
                 where = category.target_name or category.problem or "канал не определён"
-                lines.append(f"{index}. «{category.name}» - {len(category.donors)} дон. -> {where}")
+                lines.append(f"{index}. «{category.name}» - {len(category.donors)} ист. -> {where}")
             text = "\n".join(lines)
 
-        rows = [[(f"{category.name} · {len(category.donors)}", f"cat|{category.topic_id}")] for category in categories[:20]]
+        rows = [[(f"{category.name} · {len(category.donors)} ист.", f"cat|{category.topic_id}")] for category in categories[:20]]
         return (
             cut(self._with_notice(text), TEXT_LIMIT),
             markup(*rows, [("➕ Новый канал", "channel")], [("⬅️ Меню", "main")]),
@@ -541,31 +559,46 @@ class Panel:
         if category is None:
             return (
                 self._with_notice("Этого канала уже нет в списке."),
-                markup([("📂 Каналы и доноры", "topics")], [("⬅️ Меню", "main")]),
+                markup([("🗂 Мои каналы", "topics")], [("⬅️ Меню", "main")]),
             )
 
         donors = list(category.donors.values())
         where = category.target_name or category.problem or "канал не определён"
-        lines = [f"Канал: «{category.name}»", f"Публикуем в: {where}", ""]
+        views = self.registry.views_for(category)
+        reactions = self.registry.reactions_for(category)
+        lines = [
+            f"📢 Канал «{category.name}»",
+            "",
+            f"📤 Куда идут посты: {where}",
+            f"👁 Просмотров на пост: {views if views else 'не накручиваем (0)'}",
+            f"🎭 Реакции: {'вкл' if reactions else 'выкл'}",
+            "",
+        ]
         if donors:
-            lines.append(f"Доноры ({len(donors)}) - нажми 🗑, чтобы убрать:")
+            lines.append(f"📥 Откуда берём посты - источники ({len(donors)}):")
             lines += [f"• {donor.name} ({donor.link})" for donor in donors[:10]]
             if len(donors) > 10:
                 lines.append(f"...и ещё {len(donors) - 10}")
+            lines.append("Нажми ✖ под источником, чтобы отключить его.")
         else:
-            lines.append("Доноров пока нет - нажми «➕ Донор» и пришли ссылку на канал.")
+            lines.append("📥 Откуда берём посты: пока ни одного источника.")
+            lines.append("Нажми «📡 Добавить источник» и пришли ссылку на канал.")
+        if category.problem:
+            lines.append(f"⚠ {category.problem}")
 
         rows = [
-            [(f"🗑 {donor.name[:28]}", f"del|{topic_id}|{donor.message_id}") for donor in group]
+            [(f"✖ {donor.name[:28]}", f"del|{topic_id}|{donor.message_id}") for donor in group]
             for group in chunks(donors[:MAX_DONOR_BUTTONS], 2)
         ]
+        reactions_cell = ("🎭 Реакции: вкл" if reactions else "🎭 Реакции: выкл", f"cr|{topic_id}")
         return (
             cut(self._with_notice("\n".join(lines)), TEXT_LIMIT),
             markup(
                 *rows,
-                [("➕ Донор", f"add|{topic_id}"), ("✏️ Переименовать", f"rename|{topic_id}")],
-                [("🗑 Убрать канал целиком", f"drop|{topic_id}")],
-                [("📂 Все каналы", "topics"), ("⬅️ Меню", "main")],
+                [("📡 Добавить источник", f"add|{topic_id}"), ("✏️ Переименовать", f"rename|{topic_id}")],
+                [("👁 Просмотры", f"cv|{topic_id}"), reactions_cell],
+                [("🗑 Убрать канал", f"drop|{topic_id}")],
+                [("🗂 Все каналы", "topics"), ("⬅️ Меню", "main")],
             ),
         )
 
@@ -580,11 +613,16 @@ class Panel:
     def _status_view(self) -> Tuple[str, InlineKeyboardMarkup]:
         stats = self.bot.stats
         stored = self.registry.views
+        default_line = (
+            f"Просмотры по умолчанию: {stored} (для новых каналов; свои числа - в «🗂 Мои каналы»)"
+            if stored
+            else "Просмотры по умолчанию: не записаны - беру из переменной PROMO_VIEWS"
+        )
         text = (
             self._with_notice(
                 f"{self.cfg.describe()}\n"
                 f"Группа: {self.registry.group_name or 'не найдена'}\n"
-                f"Просмотры в складе: {stored if stored else 'не записаны - беру из переменной PROMO_VIEWS'}\n"
+                f"{default_line}\n"
                 f"Последняя публикация: {self.bot.last_publish or 'ещё не было'}\n"
                 f"{self.bot.reactions.describe()}\n"
                 f"Последний заказ реакций: {self.bot.reactions.last_link or 'ещё не уходил'}"
@@ -597,9 +635,8 @@ class Panel:
         return (
             cut(text, TEXT_LIMIT),
             markup(
-                [("👁 Просмотров", "views"), ("🎯 Реакция на пост", "react")],
-                [("🩺 Проверка", "check"), ("🔄 Обновить список", "update")],
-                [("⬅️ Меню", "main")],
+                [("🎯 Реакция на пост", "react"), ("🩺 Проверка", "check")],
+                [("🔄 Обновить список", "update"), ("⬅️ Меню", "main")],
             ),
         )
 
@@ -608,7 +645,8 @@ class Panel:
         name = category.name if category else "категория"
         return (
             cut(
-                f"Канал: «{name}»\n\nПришли ссылку на донора: @юзернейм или https://t.me/канал.\n"
+                f"Канал «{name}»: откуда берём посты.\n\n"
+                "Пришли ссылку на источник: @юзернейм или https://t.me/канал.\n"
                 "Можно несколько ссылок в одном сообщении - добавятся все.",
                 TEXT_LIMIT,
             ),
@@ -652,7 +690,7 @@ class Panel:
         donors = len(category.donors) if category else 0
         return (
             cut(
-                f"Канал: «{self._name(topic_id)}»\n\nУбрать его целиком? Тема и {donors} донор(ов) "
+                f"Канал: «{self._name(topic_id)}»\n\nУбрать его целиком? Тема и {donors} источник(ов) "
                 "исчезнут из списка, посты оттуда ловиться не будут. Отменить нельзя.\n\n"
                 "Посты, уже опубликованные в канале, остаются.",
                 TEXT_LIMIT,
@@ -674,20 +712,29 @@ class Panel:
             markup([("⬅️ Отмена", "main")]),
         )
 
-    def _views_view(self) -> Tuple[str, InlineKeyboardMarkup]:
-        current = self.cfg.promo_views
+    def _category_views_view(self, topic_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+        category = self.registry.categories.get(topic_id)
+        name = category.name if category else "?"
+        current = self.registry.views_for(category) if category else self.cfg.promo_views
+        shown = f"{current} на каждый пост" if current else "не накручиваем (0)"
         lines = [
-            f"Сейчас: {current if current else 'не задано'} просмотров на каждый пост.",
+            f"Канал «{name}»: просмотры на каждый пост.",
+            f"Сейчас: {shown}.",
             "",
-            f"Напиши одно число от 1 до {VIEWS_LIMIT} - столько просмотров бот будет отправлять промо-боту "
-            "сразу после публикации поста. Или выбери готовое кнопкой.",
+            f"Напиши одно число от 0 до {VIEWS_LIMIT} - столько просмотров бот добавит "
+            "каждому новому посту этого канала. Ноль - не накручивать. Или выбери кнопкой.",
             "",
-            "Число сохраняется в склад, поэтому остаётся таким же после перезапуска.",
+            "Число сохраняется в тему канала и остаётся таким же после перезапуска.",
         ]
-        presets = [(f"{count}", f"views|{count}") for count in (500, 1000, 2000, 5000)]
+        presets = [(f"{count}", f"cv|{topic_id}|{count}") for count in (500, 1000, 2000, 5000)]
         return (
             cut(self._with_notice("\n".join(lines)), TEXT_LIMIT),
-            markup(presets[:2], presets[2:], [("⬅️ Отмена", "main")]),
+            markup(
+                presets[:2],
+                presets[2:],
+                [("0 - не накручивать", f"cv|{topic_id}|0")],
+                [("⬅️ Отмена", f"cat|{topic_id}")],
+            ),
         )
 
     def _react_view(self) -> Tuple[str, InlineKeyboardMarkup]:
@@ -696,21 +743,20 @@ class Panel:
         lines = [
             "Ручной заказ реакций на конкретный пост."
             if reactor.enabled
-            else "Реакции сейчас выключены - включи их, иначе заказ не уйдёт.",
+            else "Реакции выключены полностью (переменная REACTIONS в Railway) - заказ не уйдёт.",
             "",
             "Пришли ссылку на пост: https://t.me/канал/номер (или просто t.me/канал/номер).",
             "Сначала бот откроет этот пост своим аккаунтом: не увидит его - заказ не потратит.",
             "Ручной заказ идёт раньше очереди свежих постов и новым постом не вытесняется.",
-            "Окно сервиса одно в час, поэтому ждать можно дольше самого заказа.",
+            "Заказы идут раз в 5 минут; если сервис откажет словами про лимит - пауза до часа.",
             "",
             reactor.describe(),
             "Ждут заказа:",
             *reactor.queue_lines(),
         ]
-        rows = [] if reactor.enabled else [("🎭 Реакции: включить", "reactions")]
         return (
             cut(self._with_notice("\n".join(lines)), TEXT_LIMIT),
-            markup(*rows, [("⬅️ Отмена", "main")]),
+            markup([("⬅️ Отмена", "main")]),
         )
 
     def _name(self, topic_id: int) -> str:

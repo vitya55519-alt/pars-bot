@@ -162,6 +162,7 @@ class FakeClient:
         self.replies = []
         self.deleted = []
         self.sent = []
+        self.sent_messages = []
         self.topic_posts = []
         self.edits = []
         self.commands = []
@@ -311,6 +312,8 @@ class FakeClient:
         thread = kwargs.get("message_thread_id")
         self.topic_posts.append((chat, text, thread))
         message = Message(self, 1000 + len(self.sent), await self.get_chat(chat), text=text, thread=thread)
+        message.reply_markup = kwargs.get("reply_markup")
+        self.sent_messages.append(message)
         if thread:
             self.group_messages.append(message)
         return message
@@ -357,6 +360,10 @@ class FakeClient:
 
     async def edit_message_text(self, chat, message_id, text, reply_markup=None, **kwargs):
         self.edits.append((chat, message_id, text, reply_markup))
+        chat_id = getattr(chat, "id", chat)
+        for message in self.group_messages:
+            if message.chat.id == chat_id and message.id == message_id:
+                message.text = text
         return Message(self, message_id, await self.get_chat(chat), text=text)
 
     async def set_bot_commands(self, commands, *args, **kwargs):
@@ -519,6 +526,7 @@ async def main():
     await check_reactions()
     await check_reaction_measure()
     await check_views()
+    await check_legal()
     await check_signature()
     await check_store()
     await check_cabinet()
@@ -1288,9 +1296,14 @@ async def check_panel():
     check("чужая кнопка не исполняется", client.edits == [] and "Доступ" in wrong.answers[0][0], str(wrong.answers))
 
     await panel.on_button(client, press("cat|21"))
-    check("экран канала показывает доноров", "Доноры (2)" in last_edit(), last_edit()[:90])
+    check("экран канала показывает источники", "источники (2)" in last_edit(), last_edit()[:120])
+    check("экран канала говорит, куда идут посты", "Куда идут посты" in last_edit() and "Спорт" in last_edit(), last_edit()[:160])
+    check("экран канала показывает просмотры и реакции", "Просмотров на пост" in last_edit() and "🎭 Реакции:" in last_edit(), last_edit()[:200])
+    check("у канала свои кнопки настроек", "cv|21" in last_buttons() and "cr|21" in last_buttons(), str(last_buttons()))
+    check("источник отключается кнопкой ✖", "del|21|1" in last_buttons(), str(last_buttons()))
     await panel.on_button(client, press("topics"))
     check("список каналов назван", "Спорт" in last_edit() and "Юмор" in last_edit(), last_edit()[:90])
+    check("список каналов считает источники", "ист." in last_edit(), last_edit()[:120])
     await panel.on_button(client, press("status"))
     check("статус описывает настройки", "Промо-бот" in last_edit() and "promo_bot" in last_edit(), last_edit()[:90])
     await panel.on_button(client, press("help"))
@@ -1300,7 +1313,7 @@ async def check_panel():
     check("донор убран кнопкой", world["donor_sport_1"].id not in registry.categories[21].donors)
     check("сообщение со ссылкой удалено", 1 in client.deleted, str(client.deleted))
     check("убранное не перечитывает группу", rebuilt == [], str(rebuilt))
-    check("экран подтверждает удаление", "Убрал донора" in last_edit(), last_edit()[:80])
+    check("экран подтверждает отключение", "Отключил источник" in last_edit(), last_edit()[:80])
     await panel.on_button(client, press("del|21|999"))
     check("несуществующий донор - понятный отказ", "уже нет" in last_edit(), last_edit()[:80])
 
@@ -1310,7 +1323,7 @@ async def check_panel():
     check("донор добавлен из бота", new_donor.id in registry.categories[21].donors)
     check("маршрут появился", registry.routes.get(new_donor.id) == 21, str(registry.routes))
     check("ссылка записана в тему группы", client.topic_posts[-1] == (group.id, "https://t.me/donor_run", 21), str(client.topic_posts[-1]))
-    check("ответ подтверждает добавление", "Добавил доноров" in last_reply()[1], last_reply()[1][:80])
+    check("ответ подтверждает добавление", "Добавил источники" in last_reply()[1], last_reply()[1][:80])
 
     await panel.on_button(client, press("add|21"))
     await panel.on_message(client, Message(client, 5005, owner, text="привет"))
@@ -1369,6 +1382,17 @@ async def check_panel():
     check("название записано в Telegram", client.titled[-1] == (group.id, "АвтоПост"), str(client.titled))
     check("переименование подтверждено", "Склад теперь называется" in last_reply()[1], last_reply()[1][:90])
     check("переименование склада не трогает темы", client.topic_edits and client.topic_deletes == [21], str(client.topic_deletes))
+
+    await panel.on_button(client, press("main"))
+    check("в меню есть кнопки документов", "doc|1" in last_buttons() and "doc|2" in last_buttons(), str(last_buttons()))
+    check("общих кнопок просмотров и реакций больше нет", "views" not in last_buttons() and "reactions" not in last_buttons(), str(last_buttons()))
+    sent_before = len(client.sent)
+    await panel.on_button(client, press("doc|1"))
+    check("соглашение приходит сообщением", len(client.sent) > sent_before and "Пользовательское соглашение" in client.sent[sent_before][1],
+          str(client.sent[sent_before:])[:120])
+    doc_markup = client.sent_messages[-1].reply_markup
+    doc_cells = [] if doc_markup is None else [b.callback_data for row in doc_markup.inline_keyboard for b in row]
+    check("у последней страницы документа есть возврат в меню", "main" in doc_cells, str(doc_cells))
 
     lonely = FakeClient()
     boss = lonely.add_user(User(777, "Витя"))
@@ -1601,6 +1625,25 @@ async def check_reactions():
     link = live_session.calls[1][2]["link"] if len(live_session.calls) > 1 else ""
     check("после публикации заказ встаёт в очередь", link.startswith("https://t.me/yumor_ch/"), str(link))
 
+    check("по умолчанию заказ раз в 5 минут", Config(api_id=1, api_hash="h", session_string="s").reactions_interval == 300,
+          str(Config(api_id=1, api_hash="h", session_string="s").reactions_interval))
+
+    refused = reactor([permit(), FakeResponse(200, text="Лимит: один заказ в час, подождите")])
+    refused.schedule(published)
+    await asyncio.sleep(0.05)
+    check(
+        "отказ про лимит откладывает следующую пробу на час",
+        refused.failed == 1 and refused._next_slot - time.monotonic() > 3500,
+        f"{refused.last_error} / {refused._next_slot - time.monotonic():.0f}",
+    )
+    plain = reactor([permit(), FakeResponse(502, text="Bad Gateway")])
+    plain.schedule(published)
+    await asyncio.sleep(0.05)
+    check("обычный сбой окно не трогает", plain.failed == 1 and plain._next_slot - time.monotonic() < 60,
+          f"{plain.last_error} / {plain._next_slot - time.monotonic():.0f}")
+    check("отказ без разрешения тоже не час", silent._next_slot - time.monotonic() < 60,
+          str(silent._next_slot - time.monotonic()))
+
     panel_cfg = make_cfg(bot_token="900:AAstub", reactions_enabled=True)
     panel_world = build_world(panel_cfg)
     panel_bot, panel_registry, _ = await make_bot(panel_world)
@@ -1618,13 +1661,18 @@ async def check_reactions():
     rows = pclient.replies[-1][2].inline_keyboard
     cells = [button.callback_data for row in rows for button in row]
     check("меню рассказывает про реакции", "Реакции: включены" in body, body[:120])
-    check("в меню есть кнопка реакций", "reactions" in cells, str(cells))
+    check("общей кнопки реакций больше нет", "reactions" not in cells, str(cells))
 
-    await panel.on_button(pclient, press("reactions"))
-    body = pclient.edits[-1][2]
-    check("кнопка выключает реакции", panel_bot.reactions.enabled is False and "Реакции: выключены" in body, body[:120])
-    await panel.on_button(pclient, press("reactions"))
-    check("кнопка снова включает реакции", panel_bot.reactions.enabled is True and "Реакции: включены" in pclient.edits[-1][2], pclient.edits[-1][2][:120])
+    await panel.on_button(pclient, press("cat|22"))
+    check("канал показывает свои реакции", "🎭 Реакции: вкл" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
+    await panel.on_button(pclient, press("cr|22"))
+    check("кнопка выключает реакции канала", panel_registry.categories[22].reactions is False
+          and "выключены" in pclient.edits[-1][2], pclient.edits[-1][2][:160])
+    check("другой канал не тронут", panel_registry.reactions_for(panel_registry.categories[21]) is True,
+          str(panel_registry.categories[21].reactions))
+    await panel.on_button(pclient, press("cr|22"))
+    check("кнопка снова включает реакции канала", panel_registry.categories[22].reactions is True
+          and "включены" in pclient.edits[-1][2], pclient.edits[-1][2][:160])
     await panel.on_button(pclient, press("status"))
     check("статус показывает очередь реакций", "Реакции:" in pclient.edits[-1][2] and "smmnakrutka" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
 
@@ -1700,7 +1748,7 @@ async def check_reaction_measure():
 
 
 async def check_views():
-    print("\n[13] 👁 Число просмотров из кнопки панели")
+    print("\n[13] 👁 Просмотры и реакции - свои у каждого канала")
     from config import VIEWS_LIMIT, parse_views
 
     def rejects(raw):
@@ -1734,26 +1782,65 @@ async def check_views():
     registry = Registry(client, cfg)
     await registry.rebuild()
     check("в складе числа нет - остаётся переменная", registry.views == 0 and cfg.promo_views == 1000, str(registry.views))
+    check("канал без своей настройки берёт число по умолчанию", registry.views_for(registry.categories[21]) == 1000,
+          str(registry.views_for(registry.categories[21])))
 
-    number = await registry.save_views("3000")
-    check("число применено сразу", number == 3000 and cfg.promo_views == 3000, str(cfg.promo_views))
-    check("записано в общую тему склада", client.topic_posts[-1] == (group.id, "Просмотры: 3000", 1), str(client.topic_posts[-1]))
+    client.group_messages.append(Message(client, 6, group, text="Просмотры: 3000", thread=1))
+    await registry.rebuild()
+    check("число по умолчанию прочитано из общей темы", registry.views == 3000 and cfg.promo_views == 3000, str(registry.views))
+    check("каналы без своих настроек берут новое число", registry.views_for(registry.categories[21]) == 3000,
+          str(registry.views_for(registry.categories[21])))
+
+    number = await registry.save_category_views(21, "144")
+    check("свои просмотры канала применены", number == 144 and registry.views_for(registry.categories[21]) == 144, str(number))
+    check("другой канал не тронут", registry.views_for(registry.categories[22]) == 3000,
+          str(registry.views_for(registry.categories[22])))
+    check("настройка записана в тему канала", client.topic_posts[-1] == (group.id, "Просмотры: 144", 21), str(client.topic_posts[-1]))
     check("служебная строка не стала донором", registry.donor_count == 3, str(registry.donor_count))
 
     await registry.rebuild()
-    check("перезапуск берёт число из склада", registry.views == 3000 and cfg.promo_views == 3000, str(registry.views))
-    await registry.save_views("2000")
+    check("свои просмотры пережили перечитку", registry.views_for(registry.categories[21]) == 144,
+          str(registry.views_for(registry.categories[21])))
+    await registry.save_category_views(21, "2000")
     check("второй раз то же сообщение правится", client.edits[-1][2] == "Просмотры: 2000", str(client.edits[-1][2]))
-    check("служебных сообщений не плодится", sum(1 for _, text, _ in client.topic_posts if "Просмотры" in text) == 1,
+    check("служебных сообщений не плодится",
+          sum(1 for _, text, thread in client.topic_posts if "Просмотры" in text and thread == 21) == 1,
           str([post for post in client.topic_posts if "Просмотры" in post[1]]))
-    check("плохое число не меняет настройку", (await _raises(registry.save_views, "0")) and cfg.promo_views == 2000, str(cfg.promo_views))
+    check("плохое число не меняет настройку",
+          (await _raises(registry.save_category_views, 21, "много")) and registry.views_for(registry.categories[21]) == 2000,
+          str(registry.views_for(registry.categories[21])))
+    check("ноль - осознанный выбор канала", await registry.save_category_views(21, "0") == 0
+          and registry.views_for(registry.categories[21]) == 0, str(registry.views_for(registry.categories[21])))
 
-    live_cfg = make_cfg(promo_views=1000, promo_delay=0, reactions_enabled=False)
+    enabled = await registry.toggle_category_reactions(22)
+    check("реакции канала включились", enabled is True and registry.reactions_for(registry.categories[22]) is True, str(enabled))
+    check("флаг записан в тему канала", client.topic_posts[-1] == (group.id, "Реакции: вкл", 22), str(client.topic_posts[-1]))
+    await registry.rebuild()
+    check("флаг реакций пережил перечитку", registry.reactions_for(registry.categories[22]) is True,
+          str(registry.reactions_for(registry.categories[22])))
+    await registry.toggle_category_reactions(22)
+    check("повторное нажатие выключает", registry.reactions_for(registry.categories[22]) is False,
+          str(registry.reactions_for(registry.categories[22])))
+    check("правится то же сообщение темы", client.edits[-1][2] == "Реакции: выкл", str(client.edits[-1][2]))
+    await registry.save_category_views(22, "500")
+    check("в сообщении оба поля канала", client.edits[-1][2] == "Просмотры: 500\nРеакции: выкл", str(client.edits[-1][2]))
+    await registry.rebuild()
+    check("оба поля восстановились после перечитки",
+          registry.views_for(registry.categories[22]) == 500 and registry.reactions_for(registry.categories[22]) is False,
+          f"{registry.views_for(registry.categories[22])} / {registry.reactions_for(registry.categories[22])}")
+
+    live_cfg = make_cfg(promo_views=1000, promo_delay=0, reactions_enabled=True)
     live = build_world(live_cfg)
     bot, live_registry, _ = await make_bot(live)
-    await live_registry.save_views("4500")
+    bot.reactions.wait = 0
+    bot.reactions.poll = 0
+    bot.reactions.permit_limit = 0.01
+    bot.reactions.check_delays = ()
+    await live_registry.save_category_views(22, "4500")
+    await live_registry.toggle_category_reactions(22)  # включены по умолчанию -> выключаем этому каналу
     await bot.on_message(live["client"], Message(live["client"], 61, live["donor_other"], caption="пост", photo=Photo("v1")))
-    check("промо-бот получает число из панели", ("promo_bot", "4500") in live["client"].sent, str(live["client"].sent[-1]))
+    check("промо-бот получает число канала", ("promo_bot", "4500") in live["client"].sent, str(live["client"].sent[-1]))
+    check("выключенные реакции канала не ставят пост в очередь", len(bot.reactions._queue) == 0, str(list(bot.reactions._queue)))
 
     panel_cfg = make_cfg(bot_token="900:AAstub", promo_views=1000, promo_delay=0, reactions_enabled=False)
     panel_world = build_world(panel_cfg)
@@ -1767,33 +1854,69 @@ async def check_views():
     def press(data):
         return Query(pclient, data, owner.id, Message(pclient, 9002, owner, text="меню"))
 
+    def panel_buttons():
+        keyboard = pclient.edits[-1][3]
+        return [] if keyboard is None else [b.callback_data for row in keyboard.inline_keyboard for b in row]
+
     await panel.on_message(pclient, Message(pclient, 9001, owner, text="/start"))
     cells = [button.callback_data for row in pclient.replies[-1][2].inline_keyboard for button in row]
-    check("в меню есть кнопка просмотров", "views" in cells, str(cells))
-    check("меню показывает текущее число", "👁 Просмотров: 1000" in str(pclient.replies[-1][2]), str(pclient.replies[-1][2])[:120])
+    check("общей кнопки просмотров больше нет", "views" not in cells, str(cells))
+    check("в меню есть «Мои каналы»", "topics" in cells, str(cells))
 
-    await panel.on_button(pclient, press("views"))
+    await panel.on_button(pclient, press("cat|21"))
+    check("экран канала показывает число по умолчанию", "Просмотров на пост: 1000" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
+    check("у канала своя кнопка просмотров", "cv|21" in panel_buttons(), str(panel_buttons()))
+
+    await panel.on_button(pclient, press("cv|21"))
     body = pclient.edits[-1][2]
-    check("экран объясняет диапазон", f"от 1 до {VIEWS_LIMIT}" in body, body[:160])
-    check("экран показывает текущее число", "Сейчас: 1000 просмотров" in body, body[:80])
+    check("экран объясняет диапазон", f"от 0 до {VIEWS_LIMIT}" in body, body[:160])
+    check("экран показывает текущее число", "Сейчас: 1000 на каждый пост" in body, body[:100])
 
-    await panel.on_message(pclient, Message(pclient, 9003, owner, text="3500"))
-    check("введённое число применено", panel_cfg.promo_views == 3500 and panel_registry.views == 3500, str(panel_cfg.promo_views))
-    check("панель это подтверждает", "Просмотры: 3500" in pclient.replies[-1][1], str(pclient.replies[-1][1][:80]))
-
-    await panel.on_button(pclient, press("views"))
-    await panel.on_message(pclient, Message(pclient, 9004, owner, text="много"))
-    check("не число - подсказка, старое значение целое", "Напиши одно число" in pclient.replies[-1][1] and panel_cfg.promo_views == 3500,
+    await panel.on_message(pclient, Message(pclient, 9003, owner, text="144"))
+    check("введённое число применено к каналу", panel_registry.views_for(panel_registry.categories[21]) == 144,
+          str(panel_registry.views_for(panel_registry.categories[21])))
+    check("другой канал остался при своём", panel_registry.views_for(panel_registry.categories[22]) == 1000,
+          str(panel_registry.views_for(panel_registry.categories[22])))
+    check("панель это подтверждает", "Просмотры канала" in pclient.replies[-1][1] and "144" in pclient.replies[-1][1],
           str(pclient.replies[-1][1][:80]))
 
-    await panel.on_button(pclient, press("views|2000"))
-    check("готовая кнопка ставит число", panel_cfg.promo_views == 2000 and panel_registry.views == 2000, str(panel_cfg.promo_views))
-    await panel.on_button(pclient, press(f"views|{VIEWS_LIMIT + 1}"))
-    check("кнопка выше потолка отклонена", panel_cfg.promo_views == 2000 and "Просмотров должно быть" in pclient.edits[-1][2],
+    await panel.on_button(pclient, press("cv|21"))
+    await panel.on_message(pclient, Message(pclient, 9004, owner, text="много"))
+    check("не число - подсказка, старое значение целое",
+          "Напиши одно число" in pclient.replies[-1][1] and panel_registry.views_for(panel_registry.categories[21]) == 144,
+          str(pclient.replies[-1][1][:80]))
+
+    await panel.on_button(pclient, press("cv|21|2000"))
+    check("готовая кнопка ставит число", panel_registry.views_for(panel_registry.categories[21]) == 2000,
+          str(panel_registry.views_for(panel_registry.categories[21])))
+    await panel.on_button(pclient, press(f"cv|21|{VIEWS_LIMIT + 1}"))
+    check("кнопка выше потолка отклонена",
+          panel_registry.views_for(panel_registry.categories[21]) == 2000 and "Просмотров должно быть" in pclient.edits[-1][2],
           pclient.edits[-1][2][:80])
+    await panel.on_button(pclient, press("cv|21|0"))
+    check("ноль кнопкой - не накручивать", panel_registry.views_for(panel_registry.categories[21]) == 0,
+          str(panel_registry.views_for(panel_registry.categories[21])))
 
     await panel.on_button(pclient, press("status"))
-    check("статус показывает число склада", "Просмотры в складе: 2000" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
+    check("статус показывает число по умолчанию", "Просмотры по умолчанию" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
+
+
+async def check_legal():
+    print("\n[27] Документы сервиса: соглашение и политика прямо в боте")
+    import legal
+
+    check("в соглашении назван сервис", legal.SERVICE in legal.AGREEMENT, legal.SERVICE)
+    check("в политике назван сервис", legal.SERVICE in legal.PRIVACY, legal.SERVICE)
+    check("у обоих документов есть дата редакции", legal.EDITION in legal.AGREEMENT and legal.EDITION in legal.PRIVACY, legal.EDITION)
+    for kind in (1, 2):
+        title, pages = legal.document(kind)
+        raw = legal.DOCS[kind][1]
+        check(f"документ {kind} разбит на страницы", bool(pages) and bool(title), str(len(pages)))
+        check(f"страницы документа {kind} не длиннее лимита", all(len(page) <= legal.PAGE_LIMIT for page in pages),
+              str([len(page) for page in pages]))
+        check(f"нарезка документа {kind} ничего не потеряла",
+              "".join(raw.split()) == "".join("".join(pages).split()),
+              f"{len(''.join(raw.split()))} / {len(''.join(''.join(pages).split()))}")
 
 
 async def _raises(action, *args):
@@ -2347,7 +2470,7 @@ async def check_cabinet():
     check("без согласия покупка не идёт", store.tenants[petr.id].plan_until is None and "cagree" in cells(), str(cells()))
     await panel.on_button(client, tap("ctopup"))
     check("пополнение тоже просит согласие", "cagree" in cells(), str(cells()))
-    check("в согласии есть оба документа", "Polzovatelskoe-soglashenie" in text() and "konfidencialnosti" in text(), text()[:250])
+    check("в согласии есть обе кнопки документов", "cdoc|1" in cells() and "cdoc|2" in cells(), str(cells()))
     await panel.on_button(client, tap("cagree"))
     check("согласие записано", store.tenants[petr.id].agreed is True, str(store.tenants[petr.id].agreed))
     await panel.on_button(client, tap("cbuy|week"))
@@ -2372,10 +2495,18 @@ async def check_cabinet():
     check("настроенному клиенту не предлагают запуск", "Всё настроено" in text() and "cresult" in cells(), text()[-260:])
     check("обещание сервиса читается в кабинете", "переписывает" in text() and "просмотры и реакции" in text(), text()[:300])
     check("кабинет даёт все четыре шага кнопками", {"cdonors", "cchannel", "cviews", "cplans"} <= set(cells()), str(cells()))
-    check("и помощь с документами", {"cguide", "cdocs"} <= set(cells()), str(cells()))
+    check("и помощь с кнопками документов", {"cguide", "cdoc|1", "cdoc|2"} <= set(cells()), str(cells()))
 
-    await panel.on_button(client, tap("cdocs"))
-    check("документы всегда под рукой", "Пользовательское соглашение" in text(), text()[:140])
+    sent_before = len(client.sent)
+    await panel.on_button(client, tap("cdoc|1"))
+    check("соглашение читается прямо в боте",
+          any("Пользовательское соглашение" in text for _, text in client.sent[sent_before:]),
+          str(client.sent[sent_before:])[:120])
+    sent_before = len(client.sent)
+    await panel.on_button(client, tap("cdoc|2"))
+    check("политика тоже приходит сообщением",
+          any("Политика конфиденциальности" in text for _, text in client.sent[sent_before:]),
+          str(client.sent[sent_before:])[:120])
     await panel.on_button(client, tap("cdonors", ivan))
     check("у второго клиента свой пустой список", "Сейчас в списке: 0 из 10" in text(), text()[:240])
     await panel.on_button(client, tap("chome", ivan))

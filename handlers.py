@@ -169,6 +169,8 @@ class ParsBot:
                         target=category.target,
                         name=category.target_name,
                         label=f"тема «{category.name}»",
+                        views=self.registry.views_for(category),
+                        reactions=self.registry.reactions_for(category),
                     )
                 )
         for tenant in await self._tenants(message.chat.id):
@@ -521,6 +523,8 @@ class ParsBot:
                 target=category.target,
                 name=category.target_name,
                 label=f"тема «{category.name}» (догон)",
+                views=self.registry.views_for(category),
+                reactions=self.registry.reactions_for(category),
             )
             try:
                 await self._single(message, [dest])

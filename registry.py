@@ -25,6 +25,8 @@ GROUP_TITLE_LIMIT = 42
 MANAGER_STATUSES = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
 VIEWS_RE = re.compile(r"просмотры\s*[:=]\s*(\d{1,5})", re.I)
 VIEWS_TEXT = "Просмотры: {}"
+REACTIONS_RE = re.compile(r"реакции\s*[:=]\s*(вкл|выкл)", re.I)
+REACTIONS_TEXT = "Реакции: {}"
 PUBLIC_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{4,31})", re.I)
 PRIVATE_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/c/(\d{4,20})", re.I)
 INVITE_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:\+|joinchat/)\S+", re.I)
@@ -71,6 +73,10 @@ class Category:
     target: Optional[ChatRef] = None
     target_name: str = ""
     problem: str = ""
+    # свои настройки канала: None значит «не задано» - берётся значение по умолчанию
+    views: Optional[int] = None
+    reactions: Optional[bool] = None
+    settings_message: Optional[int] = None
 
     @property
     def donor_names(self) -> List[str]:
@@ -80,6 +86,9 @@ class Category:
         where = self.target_name or self.problem or "канал не определён"
         donors = ", ".join(self.donor_names) or "нет доноров"
         return f"Тема «{self.name}» -> {where}\n    доноры: {donors}"
+
+    def settings_line(self, views: int, reactions: bool) -> str:
+        return f"    просмотры: {views} · реакции: {'вкл' if reactions else 'выкл'}"
 
 
 class Registry:
@@ -97,7 +106,6 @@ class Registry:
         self.ready = False
         self.last_error = ""
         self.views = 0
-        self.views_message: Optional[int] = None
         self.unreadable: List[str] = []
         self.suppressed: Set[int] = set()
         self._titles: Dict[str, ChatRef] = {}
@@ -203,8 +211,29 @@ class Registry:
             if getattr(message, "service", False):
                 continue
             text = message.text or message.caption or ""
-            if text:
-                await self._absorb(text, message.id, category)
+            if not text:
+                continue
+            if self._absorb_settings(text, message.id, category):
+                continue
+            await self._absorb(text, message.id, category)
+
+    @staticmethod
+    def _absorb_settings(text: str, message_id: int, category: Category) -> bool:
+        """Служебное сообщение темы хранит свои просмотры и реакции канала: побеждает самое свежее."""
+        views_match = VIEWS_RE.search(text)
+        reactions_match = REACTIONS_RE.search(text)
+        if not views_match and not reactions_match:
+            return False
+        if message_id <= (category.settings_message or 0):
+            return True
+        category.settings_message = message_id
+        if views_match:
+            value = int(views_match.group(1))
+            if 0 <= value <= VIEWS_LIMIT:
+                category.views = value
+        if reactions_match:
+            category.reactions = reactions_match.group(1).casefold() == "вкл"
+        return True
 
     async def _absorb(self, text: str, message_id: int, category: Category) -> List[Donor]:
         added: List[Donor] = []
@@ -217,9 +246,8 @@ class Registry:
         return added
 
     async def _read_views(self) -> None:
-        """Служебное сообщение в общей теме склада хранит число просмотров: переменная Railway его не переживает."""
+        """Служебное сообщение в общей теме склада хранит просмотры по умолчанию для новых каналов."""
         self.views = 0
-        self.views_message = None
         found_id = 0
         found_value = 0
         try:
@@ -237,9 +265,8 @@ class Registry:
 
         if 1 <= found_value <= VIEWS_LIMIT:
             self.views = found_value
-            self.views_message = found_id
             if self.cfg.promo_views != found_value:
-                log.info("Просмотры из склада: %s (в переменной было %s).", found_value, self.cfg.promo_views)
+                log.info("Просмотры по умолчанию из склада: %s (в переменной было %s).", found_value, self.cfg.promo_views)
                 self.cfg.promo_views = found_value
 
     async def _open(self, ref: ChatRef, message_id: int) -> Optional[Donor]:
@@ -421,29 +448,54 @@ class Registry:
             log.info("Группа-хранилище теперь называется «%s».", clean)
         return self.group_name
 
-    async def save_views(self, raw: str) -> int:
-        """Записывает число просмотров в служебное сообщение склада - оно переживёт перезапуск Railway."""
-        number = parse_views(raw)
-        self._need_group()
-        text = VIEWS_TEXT.format(number)
+    def views_for(self, category: Category) -> int:
+        """Просмотры канала: своё число из темы, иначе значение по умолчанию."""
+        return category.views if category.views is not None else self.cfg.promo_views
+
+    def reactions_for(self, category: Category) -> bool:
+        """Реакции канала: свой флаг из темы, иначе общая настройка REACTIONS."""
+        return category.reactions if category.reactions is not None else self.cfg.reactions_enabled
+
+    async def save_category_views(self, topic_id: int, raw: str) -> int:
+        """Свои просмотры канала: число живёт служебным сообщением в его теме и переживает перезапуск."""
+        number = parse_views(raw, low=0)
+        category = self._category(topic_id)
         async with self.lock:
-            self.views = number
-            self.cfg.promo_views = number
-            try:
-                if self.views_message:
-                    await call(self.client.edit_message_text, self.group_id, self.views_message, text)
-                else:
-                    posted = await call(
-                        self.client.send_message, self.group_id, text, message_thread_id=GENERAL_TOPIC_ID
-                    )
-                    self.views_message = int(getattr(posted, "id", 0) or 0)
-            except Exception as exc:  # noqa: BLE001 - общая тема склада могла быть скрыта
-                raise RegistryError(
-                    f"Применил {number}, но в склад записать не вышло ({type(exc).__name__}) - "
-                    "после перезапуска возьмётся число из переменной PROMO_VIEWS."
-                ) from exc
-            log.info("Просмотры для промо-бота: %s (записано в склад).", number)
+            category.views = number
+            await self._write_settings(category)
+        log.info("Просмотры канала «%s»: %s (записано в тему).", category.name, number)
         return number
+
+    async def toggle_category_reactions(self, topic_id: int) -> bool:
+        """Свои реакции канала: вкл/выкл только для него, остальные каналы не трогаются."""
+        category = self._category(topic_id)
+        async with self.lock:
+            category.reactions = not self.reactions_for(category)
+            await self._write_settings(category)
+        log.info("Реакции канала «%s»: %s.", category.name, "вкл" if category.reactions else "выкл")
+        return category.reactions
+
+    async def _write_settings(self, category: Category) -> None:
+        """Одно служебное сообщение на тему: в нём только то, что задано явно."""
+        lines = []
+        if category.views is not None:
+            lines.append(VIEWS_TEXT.format(category.views))
+        if category.reactions is not None:
+            lines.append(REACTIONS_TEXT.format("вкл" if category.reactions else "выкл"))
+        text = "\n".join(lines)
+        try:
+            if category.settings_message:
+                await call(self.client.edit_message_text, self.group_id, category.settings_message, text)
+            else:
+                posted = await call(
+                    self.client.send_message, self.group_id, text, message_thread_id=category.topic_id
+                )
+                category.settings_message = int(getattr(posted, "id", 0) or 0)
+        except Exception as exc:  # noqa: BLE001 - тему могли скрыть или удалить руками
+            raise RegistryError(
+                f"Применил, но в склад записать не вышло ({type(exc).__name__}) - "
+                "после перезапуска настройка канала возьмётся по умолчанию."
+            ) from exc
 
     async def add_donor(self, topic_id: int, text: str) -> List[Donor]:
         """Пишем ссылку в тему - и она сразу становится донором."""
@@ -544,7 +596,10 @@ class Registry:
     def summary(self) -> str:
         if not self.categories:
             return "В группе пока нет тем с донорами."
-        return "\n".join(f"  {category.describe()}" for category in self.categories.values())
+        return "\n".join(
+            f"  {category.describe()}\n{category.settings_line(self.views_for(category), self.reactions_for(category))}"
+            for category in self.categories.values()
+        )
 
     def problems(self) -> List[str]:
         found = [category.problem for category in self.categories.values() if category.problem]
