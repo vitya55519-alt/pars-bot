@@ -130,6 +130,8 @@ class Cabinet:
         self._input_version: Dict[int, int] = {}
         self.notice: Dict[int, str] = {}
         self.wizard: Dict[int, int] = {}
+        # последнее экранное сообщение в чате: при открытии нового окна прежнее удаляется
+        self.screens: Dict[int, int] = {}
 
     # ==== вход ====
 
@@ -151,7 +153,9 @@ class Cabinet:
         else:
             screen = await self._entry(user_id)
         body, buttons = await self._view(user_id, screen)
-        await call(message.reply, cut(body, TEXT_LIMIT), reply_markup=buttons)
+        sent = await call(message.reply, cut(body, TEXT_LIMIT), reply_markup=buttons)
+        if sent is not None:
+            await self._forget_screen(user_id, sent.id)
 
     async def on_button(self, query) -> None:
         try:
@@ -349,7 +353,9 @@ class Cabinet:
                 await call(message.reply, cut(note, TEXT_LIMIT))
             return
         body, buttons = await self._view(user_id, screen)
-        await call(message.reply, cut(body, TEXT_LIMIT), reply_markup=buttons)
+        sent = await call(message.reply, cut(body, TEXT_LIMIT), reply_markup=buttons)
+        if sent is not None:
+            await self._forget_screen(user_id, sent.id)
 
     async def _apply(self, user_id: int, kind: str, text: str) -> None:
         if kind == "channel":
@@ -809,6 +815,15 @@ class Cabinet:
 
     # ==== вывод ====
 
+    async def _forget_screen(self, chat_id: int, keep: int) -> None:
+        """В чате живёт одно окно: прежнее экранное сообщение удаляем, чтобы старые кнопки не плодились."""
+        previous, self.screens[chat_id] = self.screens.get(chat_id), keep
+        if previous and previous != keep:
+            try:
+                await call(self.client.delete_messages, chat_id, previous)
+            except Exception as exc:  # noqa: BLE001 - окно могли удалить и без нас, это не повод портить экран
+                log.debug("Прежний экран %s удалить не удалось: %s", previous, type(exc).__name__)
+
     async def _show(self, query, kind: str, flash: str = "") -> None:
         text, buttons = await self._view(query.from_user.id, kind)
         try:
@@ -821,6 +836,7 @@ class Cabinet:
             )
         except MessageNotModified:
             pass
+        await self._forget_screen(query.message.chat.id, query.message.id)
         await call(query.answer, flash[:180])
 
     def _back_to(self, query) -> str:

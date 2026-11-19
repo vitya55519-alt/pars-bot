@@ -71,6 +71,8 @@ class Panel:
         self.notice = ""
         # сколько постов тема выложила сегодня: читается перед экраном лимита, None - ещё не читали
         self.posts_today: Optional[int] = None
+        # последнее экранное сообщение в чате: при открытии нового окна прежнее удаляется
+        self.screens: Dict[int, int] = {}
 
     def setup(self) -> None:
         self.client.add_handler(MessageHandler(self.on_message, filters.private))
@@ -116,7 +118,9 @@ class Panel:
 
         command = text.split()[0].split("@")[0].lower() if text else ""
         body, buttons = self._view("help" if command == "/help" else "main")
-        await call(message.reply, body, reply_markup=buttons)
+        sent = await call(message.reply, body, reply_markup=buttons)
+        if sent is not None:
+            await self._forget_screen(message.chat.id, sent.id)
 
     async def on_button(self, client, query) -> None:
         if query.from_user.id not in self.admins:
@@ -492,7 +496,9 @@ class Panel:
                 await call(message.reply, cut(note, TEXT_LIMIT))
             return
         body, buttons = self._view(*screen)
-        await call(message.reply, body, reply_markup=buttons)
+        sent = await call(message.reply, body, reply_markup=buttons)
+        if sent is not None:
+            await self._forget_screen(message.chat.id, sent.id)
 
     def _fail_screen(self, kind: str, topic_id: int) -> Tuple[str, int]:
         """После отказа возвращаемся к тому экрану, где просили ввод, - чтобы можно было написать снова."""
@@ -912,6 +918,15 @@ class Panel:
 
     # ==== вывод ====
 
+    async def _forget_screen(self, chat_id: int, keep: int) -> None:
+        """В чате живёт одно окно: прежнее экранное сообщение удаляем, чтобы старые кнопки не плодились."""
+        previous, self.screens[chat_id] = self.screens.get(chat_id), keep
+        if previous and previous != keep:
+            try:
+                await call(self.client.delete_messages, chat_id, previous)
+            except Exception as exc:  # noqa: BLE001 - окно могли удалить и без нас, это не повод портить экран
+                log.debug("Прежний экран %s удалить не удалось: %s", previous, type(exc).__name__)
+
     async def _show(self, query, kind: str, topic_id: int = 0, flash: str = "", page: int = 0) -> None:
         text, buttons = self._view(kind, topic_id, page)
         await self._edit(query, text, buttons)
@@ -925,3 +940,4 @@ class Panel:
             )
         except MessageNotModified:
             pass
+        await self._forget_screen(message.chat.id, message.id)

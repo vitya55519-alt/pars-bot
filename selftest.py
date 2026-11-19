@@ -584,6 +584,7 @@ async def main():
     await check_store()
     await check_cabinet()
     await check_cabinet_launch()
+    await check_one_window()
     await check_tenants()
     await check_clients_sync()
     await check_money()
@@ -4067,6 +4068,76 @@ async def check_cabinet_navigation(panel, client, store, nina):
     finally:
         finish.set()
         store.set_views = original_views
+
+
+async def check_one_window():
+    print("\n[31] Одно окно: при открытии нового прежнее исчезает")
+    cfg = make_cfg(bot_token="900:AAstub")
+    world = build_world(cfg)
+    client = world["client"]
+    bot, registry, _ = await make_bot(world)
+    store = MemoryStore()
+    panel = Panel(client, cfg, registry, bot, store)
+    panel.setup()
+    await panel.start(777, "Фогель")
+    owner = client.add_user(User(777, "Витя"))
+    petr = client.add_user(User(5001, "Пётр"))
+
+    def press(data, user=owner, message_id=9100):
+        return Query(client, data, user.id, Message(client, message_id, user, text="меню"))
+
+    # ---- панель владельца ----
+    await panel.on_message(client, Message(client, 9101, owner, text="/start"))
+    first = panel.screens[owner.id]
+    check("окно запуска владельца запомнено", first == 9000 + len(client.replies), str(first))
+    check("прежнего окна ещё нет - ничего не удалено", not client.deleted, str(client.deleted))
+
+    await panel.on_button(client, press("settings|22", message_id=9102))
+    check("новое окно по кнопке удаляет прежнее", first in client.deleted, str(client.deleted))
+    check("актуальным стало сообщение с нажатой кнопкой", panel.screens[owner.id] == 9102, str(panel.screens))
+
+    deleted_now = len(client.deleted)
+    await panel.on_button(client, press("rename|22", message_id=9102))
+    check("перерисовка того же окна ничего не удаляет", len(client.deleted) == deleted_now, str(client.deleted[-3:]))
+
+    await panel.on_message(client, Message(client, 9103, owner, text="Фитнес"))
+    screen = panel.screens[owner.id]
+    check("после ввода текстом окно-подсказка удалено", 9102 in client.deleted, str(client.deleted[-3:]))
+    check("новое окно после ввода запомнено", screen == 9000 + len(client.replies), str(screen))
+
+    await panel.on_button(client, press("main", message_id=9104))
+    check("кнопка удаляет окно, присланное после ввода", screen in client.deleted, str(client.deleted[-3:]))
+
+    pages_before = len(client.sent_messages)
+    await panel.on_button(client, press("doc|1", message_id=9104))
+    sent = client.sent_messages[pages_before:]
+    check("страницы документа не удаляются как окно", not any(message.id in client.deleted for message in sent),
+          str(client.deleted[-3:]))
+    check("после документа актуальным остаётся экран", panel.screens[owner.id] == 9104, str(panel.screens))
+
+    client.delete_fails = True
+    try:
+        await panel.on_button(client, press("status", message_id=9105))
+        check("без права удаления старое окно экран всё равно открыт",
+              "Результат" in client.edits[-1][2] and panel.screens[owner.id] == 9105, client.edits[-1][2][:60])
+    finally:
+        client.delete_fails = False
+
+    # ---- кабинет клиента ----
+    cab = panel.cabinet
+    await panel.on_message(client, Message(client, 9106, petr, text="/start"))
+    first_c = cab.screens[petr.id]
+    check("окно запуска клиента запомнено", first_c == 9000 + len(client.replies), str(first_c))
+    await panel.on_button(client, press("cnext", user=petr, message_id=9107))
+    check("в кабинете новое окно удаляет прежнее", first_c in client.deleted, str(client.deleted[-3:]))
+    check("в кабинете окно - нажатое сообщение", cab.screens[petr.id] == 9107, str(cab.screens))
+    await panel.on_button(client, press("cset_target", user=petr, message_id=9107))
+    await panel.on_message(client, Message(client, 9108, petr, text="https://t.me/yumor_ch"))
+    check("ввод клиента убирает окно-подсказку", 9107 in client.deleted, str(client.deleted[-3:]))
+    check("новое окно клиента запомнено", cab.screens[petr.id] == 9000 + len(client.replies), str(cab.screens))
+    check("окна владельца и клиента не пересекаются",
+          panel.screens[owner.id] == 9105 and cab.screens[petr.id] != panel.screens[owner.id],
+          str((panel.screens, cab.screens)))
 
 
 async def check_tenants():
