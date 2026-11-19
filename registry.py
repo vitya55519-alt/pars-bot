@@ -539,7 +539,7 @@ class Registry:
         return category.reactions if category.reactions is not None else self.cfg.reactions_enabled
 
     def rewrite_for(self, category: Category) -> bool:
-        """Переписывать ли тексты этого канала: своё значение из темы, иначе общая настройка REWRITE."""
+        """Переписывать ли тексты этого канала: своё значение из темы, иначе общий дефолт REWRITE_DEFAULT."""
         return category.rewrite if category.rewrite is not None else self.cfg.rewrite_default
 
     async def save_category_views(self, topic_id: int, raw: str) -> int:

@@ -496,6 +496,7 @@ def make_cfg(**kwargs):
         minimax_api_key="",
         # тестовые миры живут с включённой нейросетью: почти все проверки механики
         # поста идут через рерайт. Отдельный блок [4в] проверяет REWRITE=0.
+        rewrite_switch=True,
         rewrite_default=True,
         ai_retries=3,
         ai_retry_delay=0,
@@ -1267,7 +1268,7 @@ async def check_ai_clean_answer():
     print("\n[4б] Ответ нейросети: монолог вырезается, параметр thinking не ломает запрос")
     import logging
 
-    from ai import MAX_OUTPUT, AiRewriter, answered_in_foreign_language, cut, strip_thinking
+    from ai import MAX_OUTPUT, AiRewriter, answered_in_foreign_language, cut, language_mismatch, strip_thinking
 
     monologue = "The user wants a rewritten sports post in Russian. " * 4
     with_tags = f"<think>{monologue}</think>\n\n«Зенит» выиграл"
@@ -1277,6 +1278,15 @@ async def check_ai_clean_answer():
     check("ответ латиницей отклоняется", answered_in_foreign_language(monologue))
     check("русский пост с латинскими названиями проходит",
           not answered_in_foreign_language("«Зенит» обыграл «Спартак» 2:1 в матче РПЛ"))
+    ru_source = "Русский оригинал поста про спорт и победу нашей команды в матче"
+    en_source = "Our team won the match yesterday and the fans are very happy about the result"
+    check("язык ответа сверяется с языком оригинала",
+          language_mismatch(ru_source, "The English-speaking model wrote a long answer about the football match")
+          and not language_mismatch(ru_source, "«Зенит» снова выиграл свой матч")
+          and language_mismatch(en_source, "Наша команда вчера выиграла матч, и болельщики очень довольны результатом")
+          and not language_mismatch(en_source, "The squad took the victory yesterday, and fans celebrate the outcome"),
+          "ожидалось: чужой язык отклоняется, свой проходит")
+    check("короткий оригинал не судим строго", not language_mismatch("короткий пост", "any short answer goes"))
     long_answer = cut("пост " * 2000)
     check("длинный ответ не режется до 1024", 1024 < len(long_answer) <= MAX_OUTPUT, str(len(long_answer)))
 
@@ -1296,6 +1306,26 @@ async def check_ai_clean_answer():
     out = await AiRewriter(cfg, only_mono).rewrite("пост автора")
     check("если в ответе только монолог - публикуем оригинал",
           out == "пост автора" and len(only_mono.calls) == 3, out[:60])
+
+    # ==== язык поста сохраняется: английский оригинал не переводится на русский ====
+    eng_source = "Our team won the match yesterday and the fans are very happy about the result"
+    eng_answer = "The squad took the victory yesterday, and supporters are thrilled with the outcome"
+    eng_session = FakeSession([FakeResponse(200, {"choices": [{"message": {"content": eng_answer}}]})])
+    out_eng = await AiRewriter(cfg, eng_session).rewrite(eng_source)
+    check("английский оригинал переписывается по-английски", out_eng == eng_answer, out_eng[:80])
+
+    ru_translation = "Наша команда вчера выиграла матч, и болельщики очень довольны этим результатом"
+    translate_session = FakeSession([FakeResponse(200, {"choices": [{"message": {"content": ru_translation}}]}) for _ in range(3)])
+    out_tr = await AiRewriter(cfg, translate_session).rewrite(eng_source)
+    check("перевод английского оригинала на русский отклоняется - публикуем оригинал",
+          out_tr == eng_source and len(translate_session.calls) == 3, out_tr[:80])
+
+    from config import DEFAULT_PROMPT
+
+    check("инструкция требует язык оригинала и живой человеческий текст",
+          "на том же языке" in DEFAULT_PROMPT and "Не переводи" in DEFAULT_PROMPT
+          and "как живой человек" in DEFAULT_PROMPT and "цеплять" in DEFAULT_PROMPT
+          and "шаблонных оборотов" in DEFAULT_PROMPT)
 
     # ==== человек выбирает, переписывать или нет ====
     cfg2 = make_cfg(promo_delay=0)
@@ -1381,11 +1411,20 @@ async def check_ai_switched_off():
     try:
         os.environ.update({"API_ID": "1", "API_HASH": "h", "SESSION_STRING": "1s"})
         os.environ.pop("REWRITE", None)
+        os.environ.pop("REWRITE_DEFAULT", None)
         check("переменной нет - Config.load выключает нейросеть", Config.load().ai_enabled is False)
         os.environ["REWRITE"] = "1"
-        check("REWRITE=1 возвращает нейросеть", Config.load().ai_enabled is True)
+        loaded = Config.load()
+        check("REWRITE=1 возвращает нейросеть", loaded.ai_enabled is True)
+        check("но новые темы по умолчанию ждут текст автора", loaded.rewrite_default is False, str(loaded.rewrite_default))
+        os.environ["REWRITE_DEFAULT"] = "1"
+        loaded = Config.load()
+        check("REWRITE_DEFAULT=1 включает переписывание по умолчанию",
+              loaded.ai_enabled is True and loaded.rewrite_default is True)
         os.environ["REWRITE"] = "выкл"
         check("REWRITE=выкл снова выключает", Config.load().ai_enabled is False)
+        os.environ.pop("REWRITE", None)
+        check("без REWRITE один REWRITE_DEFAULT нейросеть не включает", Config.load().ai_enabled is False)
     finally:
         os.environ.clear()
         os.environ.update(real_env)
@@ -1410,7 +1449,7 @@ async def check_ai_switched_off():
     ])
     cfg = make_cfg(
         minimax_api_key="ключ",
-        rewrite_default=False,
+        rewrite_switch=False,
         promo_views=700,
         promo_delay=0,
         reactions_enabled=True,
@@ -1441,7 +1480,7 @@ async def check_ai_switched_off():
     check("сбоев в цепочке нет", bot.stats["errors"] == 0, str(bot.stats["errors"]))
 
     # ==== выбор человека сохраняется, а слова честные ====
-    off_cfg = make_cfg(bot_token="900:AAstub", minimax_api_key="ключ", rewrite_default=False)
+    off_cfg = make_cfg(bot_token="900:AAstub", minimax_api_key="ключ", rewrite_switch=False, rewrite_default=False)
     off_world = build_world(off_cfg)
     off_client = off_world["client"]
     off_bot, off_registry, _ = await make_bot(off_world)

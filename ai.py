@@ -47,6 +47,24 @@ def answered_in_foreign_language(text: str) -> bool:
     return latin > 40 and latin > cyrillic
 
 
+def language_mismatch(source: str, answer: str) -> bool:
+    """Ответ должен быть на том же языке, что и оригинал.
+
+    Русский оригинал - латинский ответ не годится, английский оригинал - русский
+    ответ не годится. Короткие тексты и тексты на других языках не судим строго:
+    для них проверка молчит, чтобы не зарубить нормальный пост.
+    """
+    src_cyrillic = len(CYRILLIC_RE.findall(source))
+    src_latin = len(LATIN_RE.findall(source))
+    if src_cyrillic >= 20 and src_cyrillic > src_latin:
+        return answered_in_foreign_language(answer)
+    if src_latin > 40 and src_latin > src_cyrillic:
+        cyrillic = len(CYRILLIC_RE.findall(answer))
+        latin = len(LATIN_RE.findall(answer))
+        return cyrillic > 40 and cyrillic > latin
+    return False
+
+
 def clean(text: str) -> str:
     text = re.sub(r"^```[a-z]*\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE)
     text = re.sub(r"```", "", text)
@@ -112,7 +130,7 @@ class AiRewriter:
                         log.warning("ИИ attempt %s/%s: %s", attempt, self.cfg.ai_retries, reason)
                     else:
                         data = await resp.json(content_type=None)
-                        content, reason = self.parse(data)
+                        content, reason = self.parse(data, text)
                         if content:
                             return clean(content)
                         log.warning("ИИ attempt %s/%s: %s", attempt, self.cfg.ai_retries, reason)
@@ -132,7 +150,7 @@ class AiRewriter:
         log.warning("ИИ недоступен после %s попыток (%s) -> публикуем оригинальный текст.", self.cfg.ai_retries, reason)
         return cut(text)
 
-    def parse(self, data: dict):
+    def parse(self, data: dict, source: str = ""):
         # MiniMax отдаёт свой код ошибки прямо в теле ответа с HTTP 200.
         base_resp = data.get("base_resp") or {}
         if base_resp.get("status_code") not in (0, None):
@@ -150,8 +168,8 @@ class AiRewriter:
         content = strip_thinking(raw)
         if not content:
             return "", "в ответе только размышления модели - готового текста нет"
-        if answered_in_foreign_language(content):
-            return "", "модель ответила не по-русски"
+        if language_mismatch(source, content):
+            return "", "модель ответила на другом языке, не как в оригинале"
         return content, ""
 
 
