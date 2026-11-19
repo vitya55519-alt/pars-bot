@@ -10,6 +10,7 @@ import datetime
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import List
 
@@ -567,6 +568,10 @@ async def main():
     await check_promo_flow()
     await check_failures()
     await check_panel()
+    await check_panel_navigation()
+    await check_panel_inputs()
+    await check_panel_access_and_pause()
+    await check_panel_pagination()
     check_startup_wiring()
     await check_panel_login_flood()
     await check_reactions()
@@ -753,13 +758,17 @@ async def check_diagnose():
 
     await panel.on_button(panel_client, Query(panel_client, "check", owner.id, Message(panel_client, 5001, owner, text="x")))
     cells = [button.callback_data for row in panel_client.edits[-1][3].inline_keyboard for button in row]
-    check("кнопка «Проверка» отвечает текстом", "🩺 Проверка" in panel_client.edits[-1][2], panel_client.edits[-1][2][:80])
+    check("кнопка проверки отвечает отчётом по всем темам", "Проверка всех твоих тем" in panel_client.edits[-1][2], panel_client.edits[-1][2][:80])
     check("из проверки есть кнопка догона", "catchup" in cells, str(cells))
+    check("из проверки можно вернуться к результатам и в кабинет", {"status", "main"} <= set(cells), str(cells))
     await panel.on_button(panel_client, Query(panel_client, "catchup", owner.id, Message(panel_client, 5002, owner, text="x")))
     check("догон из панели публикует", len(panel_client.posted) == 1, str(panel_client.posted))
     check("панель отчиталась о догоне", "Догнал 1" in panel_client.edits[-1][2], panel_client.edits[-1][2][:120])
     main_cells = [button.callback_data for row in panel_client.edits[-1][3].inline_keyboard for button in row]
-    check("в меню появилась проверка", "check" in main_cells, str(main_cells))
+    check("после догона из меню доступны результаты", "status" in main_cells and "check" not in main_cells, str(main_cells))
+    await panel.on_button(panel_client, Query(panel_client, "status", owner.id, Message(panel_client, 5003, owner, text="x")))
+    result_cells = [button.callback_data for row in panel_client.edits[-1][3].inline_keyboard for button in row]
+    check("проверка доступна из результата", "check" in result_cells, str(result_cells))
 
 
 async def check_text_posts():
@@ -878,12 +887,21 @@ async def check_manual_reaction():
 
     await panel.on_message(client, Message(client, 9101, owner, text="/start"))
     cells = [button.callback_data for row in client.replies[-1][2].inline_keyboard for button in row]
-    check("в меню есть кнопка ручного заказа", "react" in cells, str(cells))
+    check("меню ведёт к результатам, а не прямо к ручному заказу", "status" in cells and "react" not in cells, str(cells))
+    await panel.on_button(client, press("status"))
+    cells = [button.callback_data for row in client.edits[-1][3].inline_keyboard for button in row]
+    check("результат ведёт к очереди реакций", "rstate" in cells, str(cells))
+    await panel.on_button(client, press("rstate"))
+    body = client.edits[-1][2]
+    cells = [button.callback_data for row in client.edits[-1][3].inline_keyboard for button in row]
+    check("экран заказов показывает очередь", "Очередь реакций:" in body and "заказов никто не ждёт" in body, body[-160:])
+    check("из очереди доступен ручной заказ и возврат", {"react", "status", "admin"} <= set(cells), str(cells))
 
     await panel.on_button(client, press("react"))
     body = client.edits[-1][2]
-    check("кнопка просит ссылку на пост", "Пришли ссылку на пост" in body, body[:120])
-    check("экран показывает очередь", "Ждут заказа" in body and "заказов никто не ждёт" in body, body[-120:])
+    check("кнопка просит ссылку на пост", "Пришли ссылку: https://t.me/канал/номер" in body, body[:160])
+    cells = [button.callback_data for row in client.edits[-1][3].inline_keyboard for button in row]
+    check("отмена ручного заказа возвращает к очереди", cells == ["rstate"], str(cells))
 
     await panel.on_message(client, Message(client, 9102, owner, text="https://t.me/yumor_ch/77"))
     body = client.replies[-1][1]
@@ -943,7 +961,8 @@ async def check_manual_reaction():
 
     await panel.on_button(client, press("react"))
     await panel.on_message(client, Message(client, 9105, owner, text="привет"))
-    check("панель после отказа снова просит ссылку", "Пришли ссылку на пост" in client.replies[-1][1], client.replies[-1][1][:120])
+    check("панель после отказа снова просит ссылку", "Пришли ссылку: https://t.me/канал/номер" in client.replies[-1][1]
+          and panel.awaiting.get(owner.id) == ("react_link", 0), client.replies[-1][1][:200])
 
     reactor._worker.cancel()
     # пока ждали окна сервиса, пост переехал из порядка в ручные: заказ не должен потеряться
@@ -1427,14 +1446,18 @@ async def check_ai_switched_off():
     off_client = off_world["client"]
     off_bot, off_registry, _ = await make_bot(off_world)
     panel = Panel(off_client, off_cfg, off_registry, off_bot)
-    check("меню называет общий выключатель", "REWRITE" in panel.ai_line(), panel.ai_line())
+    check("состояние ИИ объясняется без имени переменной", "нейросеть выключена" in panel.ai_line()
+          and "текст автора" in panel.ai_line() and "REWRITE" not in panel.ai_line(), panel.ai_line())
     await off_registry.toggle_category_rewrite(21)
-    view, _ = panel._category_view(21)
+    view, _ = panel._settings_view(21)
     check("выбор канала сохранён", off_registry.rewrite_for(off_registry.categories[21]) is True,
           str(off_registry.rewrite_for(off_registry.categories[21])))
-    check("но экран канала говорит, что ИИ выключен", "REWRITE" in view and "текст автора" in view, view[:300])
+    check("настройки честно объясняют сохранённый выбор при выключенном ИИ",
+          "текст автора" in view and "нейросеть выключена" in view and "Выбор переписывания сохранён" in view
+          and "REWRITE" not in view, view[:400])
     status, _ = panel._status_view()
-    check("статус: текст для новых каналов - словами автора", "словами автора" in status, [l for l in status.splitlines() if "Текст" in l][:1])
+    check("статус не выдаёт дефолты ИИ за результат", "Текст:" not in status and "нейросеть" not in status
+          and "текущего запуска" in status, status)
 
     quiet = FakeSession([FakeResponse(200, {"choices": [{"message": {"content": "ответ, который не нужен"}}]})])
     out = await AiRewriter(off_cfg, quiet).rewrite("пост автора")
@@ -1442,9 +1465,16 @@ async def check_ai_switched_off():
 
     cab = Cabinet(off_client, off_cfg, MemoryStore())
     tenant = await cab.store.ensure_tenant(5001)
-    check("в кабинете выбор клиента описан честно", "нейросеть выключена" in cab._text_line(tenant), cab._text_line(tenant))
-    check("кнопка кабинета остаётся переключателем выбора", cab._text_cell(tenant)[0] == "✏️ Текст: переписывает ИИ",
-          cab._text_cell(tenant)[0])
+    check("в кабинете сохранённый выбор не обещает работу нейросети",
+          tenant.rewrite and "текст автора" in cab._text_line(tenant)
+          and "нейросеть недоступна" in cab._text_line(tenant)
+          and "выбор переписывания сохранён" in cab._text_line(tenant), cab._text_line(tenant))
+    check("кнопка кабинета предлагает отключить выбранное переписывание",
+          cab._text_cell(tenant) == ("Оставить текст автора", "cretext"), str(cab._text_cell(tenant)))
+    await cab.store.set_rewrite(tenant.id, False)
+    check("после отключения кабинет показывает текст автора и обратный выбор",
+          cab._text_line(tenant) == "текст автора, без переписывания"
+          and cab._text_cell(tenant) == ("Выбрать переписывание", "cretext"), cab._text_line(tenant))
 
 
 async def check_commands():
@@ -1708,7 +1738,7 @@ async def check_panel():
     check("у бота два обработчика", len(client.handlers) == 5, str(len(client.handlers)))
 
     await panel.on_message(client, Message(client, 5002, owner, text="/start"))
-    check("меню знает группу и счётчики", "АвтоПост" in last_reply()[1] and "Твоих каналов: 2" in last_reply()[1], last_reply()[1][:90])
+    check("меню называет кабинет и число тем", "АвтоПост" in last_reply()[1] and "Тем: 2" in last_reply()[1], last_reply()[1][:90])
     cells = [button.callback_data for row in last_reply()[2].inline_keyboard for button in row]
     check("в меню есть кнопка списков", "topics" in cells, str(cells))
 
@@ -1719,17 +1749,25 @@ async def check_panel():
     check("чужая кнопка не исполняется", client.edits == [] and "Доступ" in wrong.answers[0][0], str(wrong.answers))
 
     await panel.on_button(client, press("cat|21"))
-    check("экран канала показывает, откуда берём посты", "Откуда берём посты" in last_edit() and "@donor_sport_1" in last_edit(), last_edit()[:200])
-    check("экран канала называет канал публикации", "Куда постим: Спорт" in last_edit() and "Тема в группе: «Спорт»" in last_edit(), last_edit()[:160])
-    check("экран канала показывает текст, просмотры и реакции", "Что делаем с текстом:" in last_edit() and "3. Просмотры:" in last_edit() and "4. Реакции:" in last_edit(), last_edit()[:300])
-    check("у канала свои кнопки настроек", "cv|21" in last_buttons() and "cr|21" in last_buttons() and "cw|21" in last_buttons(), str(last_buttons()))
-    check("у канала есть кнопка выбора адреса и кнопки названия", "target|21" in last_buttons() and "rename|21" in last_buttons(), str(last_buttons()))
-    check("источник отключается кнопкой ✖", "del|21|1" in last_buttons(), str(last_buttons()))
+    check("карточка темы считает источники", "Откуда брать посты: источников — 2" in last_edit(), last_edit()[:200])
+    check("карточка отделяет тему от канала публикации",
+          "Тема «Спорт»" in last_edit() and "\nКуда публиковать: Спорт\n" in last_edit(), last_edit()[:200])
+    check("карточка содержит только вложенные разделы и возврат",
+          set(last_buttons()) == {"target|21", "sources|21", "settings|21", "topics", "main"}, str(last_buttons()))
+    await panel.on_button(client, press("sources|21"))
+    check("источники перечислены отдельно", "@donor_sport_1" in last_edit(), last_edit()[:200])
+    check("источник отключается в разделе источников", "del|21|1" in last_buttons(), str(last_buttons()))
+    await panel.on_button(client, press("settings|21"))
+    check("настройки содержат текст, просмотры и реакции",
+          all(label in last_edit() for label in ("Текст:", "Просмотры:", "Реакции:")), last_edit()[:300])
+    check("у темы свои кнопки настроек и названия",
+          {"cv|21", "cr|21", "cw|21", "rename|21", "drop|21", "cat|21"} == set(last_buttons()), str(last_buttons()))
     await panel.on_button(client, press("topics"))
-    check("список каналов назван", "Спорт" in last_edit() and "@yumor_ch" in last_edit(), last_edit()[:200])
-    check("список каналов считает каналы", "канал(ов)" in last_edit(), last_edit()[:200])
+    check("список тем сохраняет их названия", "Спорт" in last_edit() and "Юмор @yumor_ch" in last_edit(), last_edit()[:200])
+    check("список тем показывает количество источников", "Источников: 2" in last_edit() and "Источников: 1" in last_edit(), last_edit()[:200])
     await panel.on_button(client, press("status"))
-    check("статус описывает настройки", "Промо-бот" in last_edit() and "promo_bot" in last_edit(), last_edit()[:90])
+    check("статус показывает публикации текущего запуска",
+          "текущего запуска" in last_edit() and "Опубликовано постов: 0" in last_edit(), last_edit()[:200])
     await panel.on_button(client, press("help"))
     check("помощь объясняет кнопки", "Как пользоваться" in last_edit(), last_edit()[:60])
 
@@ -1780,7 +1818,7 @@ async def check_panel():
           str(client.topic_posts[-3:]))
 
     await panel.on_button(client, press(f"target|{fitness_topic}"))
-    check("кнопка куда постить просит канал", "@юзернейм канала" in last_edit(), last_edit()[:140])
+    check("кнопка куда постить просит канал", "Пришли адрес своего канала" in last_edit(), last_edit()[:200])
     await panel.on_message(client, Message(client, 5014, owner, text="привет"))
     check("не канал для постов отклонён", "Нужен @юзернейм" in last_reply()[1], last_reply()[1][:120])
     await panel.on_button(client, press(f"target|{fitness_topic}"))
@@ -1797,7 +1835,8 @@ async def check_panel():
 
     await panel.on_button(client, press("pause"))
     check("пауза кнопкой", registry.paused is True and "пауза" in last_edit(), last_edit()[:80])
-    await bot.on_message(client, Message(client, 5010, world["donor_sport_1"], caption="текст", photo=Photo("pa1")))
+    # Этот источник ещё подключён: иначе проверка паузы прошла бы и без самой паузы.
+    await bot.on_message(client, Message(client, 5010, world["donor_sport_2"], caption="текст", photo=Photo("pa1")))
     check("на паузе не публикуем", not client.posted)
     await panel.on_button(client, press("start"))
     check("пуск кнопкой", registry.paused is False, last_edit()[:80])
@@ -1809,12 +1848,20 @@ async def check_panel():
     registry.rebuild = original_rebuild
 
     await panel.on_button(client, press("drop|21"))
-    check("убрать канал - сначала спрашивает", "Убрать его целиком" in last_edit() and client.topic_deletes == [], last_edit()[:90])
-    await panel.on_button(client, press("cat|21"))
+    check("удаление темы сначала требует подтверждения",
+          "Удалить тему «Спорт»?" in last_edit() and client.topic_deletes == []
+          and set(last_buttons()) == {"drop_yes|21", "settings|21"}, last_edit()[:200])
+    check("подтверждение обещает сохранить канал и посты",
+          "Канал Telegram и уже опубликованные посты останутся" in last_edit(), last_edit())
+    await panel.on_button(client, press("settings|21"))
     check("отмена ничего не удалила", client.topic_deletes == [] and 21 in registry.categories, str(client.topic_deletes))
+    await panel.on_button(client, press("drop|21"))
     await panel.on_button(client, press("drop_yes|21"))
     check("канал убран кнопкой", 21 not in registry.categories, str(list(registry.categories)))
     check("тема удалена в группе", client.topic_deletes == [21], str(client.topic_deletes))
+    check("удаление темы сохранило сам канал Telegram",
+          await client.get_chat(world["sport"].id) is world["sport"]
+          and "Сам канал Telegram и уже опубликованные посты остались" in last_edit(), last_edit())
     check("доноры убранного канала больше не ловятся",
           registry.route(world["donor_sport_2"].id) is None and registry.route(new_donor.id) is None,
           str(registry.routes))
@@ -1829,15 +1876,17 @@ async def check_panel():
     check("переименование группы не трогает темы каналов", client.topic_edits and client.topic_deletes == [21], str(client.topic_deletes))
 
     await panel.on_button(client, press("main"))
-    check("в меню есть кнопки документов", "doc|1" in last_buttons() and "doc|2" in last_buttons(), str(last_buttons()))
+    check("документы не перегружают главное меню", not {"doc|1", "doc|2"} & set(last_buttons()), str(last_buttons()))
     check("общих кнопок просмотров и реакций больше нет", "views" not in last_buttons() and "reactions" not in last_buttons(), str(last_buttons()))
+    await panel.on_button(client, press("help"))
+    check("документы доступны из помощи", {"doc|1", "doc|2"} <= set(last_buttons()), str(last_buttons()))
     sent_before = len(client.sent)
     await panel.on_button(client, press("doc|1"))
     check("соглашение приходит сообщением", len(client.sent) > sent_before and "Пользовательское соглашение" in client.sent[sent_before][1],
           str(client.sent[sent_before:])[:120])
     doc_markup = client.sent_messages[-1].reply_markup
     doc_cells = [] if doc_markup is None else [b.callback_data for row in doc_markup.inline_keyboard for b in row]
-    check("у последней страницы документа есть возврат в меню", "main" in doc_cells, str(doc_cells))
+    check("у последней страницы документа есть возврат в помощь и меню", set(doc_cells) == {"help", "main"}, str(doc_cells))
 
     lonely = FakeClient()
     boss = lonely.add_user(User(777, "Витя"))
@@ -1862,6 +1911,386 @@ async def check_panel():
     check("группа-хранилище создана кнопкой", lonely_registry.ready and lonely_registry.group_name == "АвтоПост", f"{lonely_registry.ready} {lonely_registry.group_name}")
     check("созданная группа - форум", bool(lonely.created_groups) and lonely.created_groups[-1].is_forum, str(lonely.created_groups[-1].is_forum) if lonely.created_groups else "нет")
     check("после создания видно меню", "АвтоПост" in lonely.replies[-1][1], lonely.replies[-1][1][:120])
+
+
+def panel_cells(keyboard):
+    return [] if keyboard is None else [button.callback_data for row in keyboard.inline_keyboard for button in row]
+
+
+def panel_registry_state(registry):
+    """Все поля реестра, включая вложенные настройки, кэши и состояние блокировки.
+
+    Клиент содержит executor и не копируется; его записи проверяются отдельно.
+    Форумы фейка сравниваются по полям, а не по идентичности объектов Chat.
+    """
+    state = dict(vars(registry))
+    state["client"] = id(registry.client)
+    state["cfg"] = (id(registry.cfg), vars(registry.cfg))
+    state["lock"] = (id(registry.lock), registry.lock.locked())
+    state["_forums"] = [vars(chat) for chat in registry._forums]
+    return deepcopy(state)
+
+
+async def check_panel_navigation():
+    print("\n[9а] Владелец: вложенные экраны и просмотр без изменения реестра")
+    cfg = make_cfg(bot_token="900:AAstub", promo_views=1379)
+    world = build_world(cfg)
+    client = world["client"]
+    bot, registry, _ = await make_bot(world)
+    await registry.save_category_views(21, "432")
+    await registry.toggle_category_rewrite(21)
+    await registry.toggle_category_reactions(21)
+    store = MemoryStore()
+    panel = Panel(client, cfg, registry, bot, store)
+    owner = client.add_user(User(777))
+    await panel.start(owner.id)
+    bot.stats.update(published=7, errors=2)
+    bot.last_publish = "Спорт, пост 123"
+    bot.clients = SimpleNamespace(report=lambda: "Кабинеты: проверены, активных 3")
+
+    before = panel_registry_state(registry)
+    writes = (list(client.topic_posts), list(client.deleted), list(client.topic_edits), list(client.topic_deletes))
+    expected = {
+        "main": {"topics", "channel", "status", "help", "admin"},
+        "topics": {"cat|21", "cat|22", "channel", "main"},
+        "cat|22": {"target|22", "sources|22", "settings|22", "topics", "main"},
+        "sources|22": {"add|22", "del|22|3", "cat|22"},
+        "settings|22": {"cw|22", "cv|22", "cr|22", "rename|22", "drop|22", "cat|22"},
+        "status": {"check", "rstate", "status", "topics", "main"},
+        "help": {"topics", "doc|1", "doc|2", "main"},
+        "admin": {"clients", "money", "pause", "check", "update", "rstate", "group_rename", "main"},
+        "rstate": {"react", "rstate", "status", "admin"},
+    }
+    for data, callbacks in expected.items():
+        query = Query(client, data, owner.id, Message(client, 9200, owner, text="меню"))
+        await panel.on_button(client, query)
+        assert query.answers == [("", False)], query.answers
+        body, keyboard = client.edits[-1][2:]
+        cells = panel_cells(keyboard)
+        check(f"вложенные кнопки и возврат: {data}", set(cells) == callbacks, str(cells))
+        check(f"просмотр не меняет ни одного поля Registry: {data}", panel_registry_state(registry) == before)
+        if data == "main":
+            check("главная не длиннее 500 символов и пяти кнопок", len(body) <= 500 and len(cells) <= 5, body)
+            check("главная без технических строк, денег и документов", not any(word in body.lower() for word in (
+                "rewrite", "promo_views", "promo_bot", "database_url", "api", "нейросет", "просмотр", "реакци",
+                "баланс", "₽", "заявк", "соглашени", "политик", "документ", "группа настроек",
+            )), body)
+        elif data == "topics":
+            labels = [button.text for row in keyboard.inline_keyboard for button in row]
+            check("список показывает имя темы, даже когда цель названа иначе",
+                  registry.categories[22].name in labels and registry.categories[22].name in body
+                  and registry.categories[22].target_name in body, body)
+        elif data == "cat|22":
+            category = registry.categories[22]
+            check("заголовок темы не заменяется именем целевого канала",
+                  body.splitlines()[0] == f"Тема «{category.name}»"
+                  and f"Куда публиковать: {category.target_name}" in body.splitlines(), body)
+        elif data == "status":
+            check("результат показывает факты и клиентский отчёт",
+                  all(part in body for part in ("текущего запуска", "Опубликовано постов: 7",
+                      "Последняя публикация: Спорт, пост 123", "Ошибок обработки: 2", "Кабинеты: проверены, активных 3")), body)
+            check("результат не содержит технических дефолтов", not any(part in body for part in (
+                "PROMO_VIEWS", "REWRITE", "1379", "Промо-бот", "нейросеть", "Текст:", "для новых каналов",
+            )), body)
+        elif data == "admin":
+            check("управление объясняет границы паузы и перезапуск", all(part in body for part in (
+                "ко всем твоим темам", "но не к кабинетам клиентов", "она не отменяет", "После перезапуска",
+                "публикации возобновляются",
+            )), body)
+    check("просмотр не записывает сообщения и не удаляет темы",
+          writes == (client.topic_posts, client.deleted, client.topic_edits, client.topic_deletes))
+    check("просмотр не меняет статистику публикаций", bot.stats["published"] == 7 and bot.stats["errors"] == 2)
+
+    import legal
+
+    for kind in (1, 2):
+        sent_before = len(client.sent_messages)
+        await panel.on_button(client, Query(client, f"doc|{kind}", owner.id, Message(client, 9201, owner, text="помощь")))
+        sent = client.sent_messages[sent_before:]
+        title, pages = legal.document(kind)
+        check(f"документ {kind} отправляется всеми страницами", len(sent) == len(pages) and title in sent[0].text)
+        check(f"документ {kind} возвращает в помощь и кабинет",
+              set(panel_cells(sent[-1].reply_markup)) == {"help", "main"})
+        check(f"страницы документа {kind} укладываются в Telegram", all(len(message.text) <= 4096 for message in sent))
+    check("документы не меняют реестр", panel_registry_state(registry) == before)
+
+    observation = "пост 123: сервис добавил 4; пост 124: сервис не добавил ничего"
+    measured = Panel._measured_text(observation)
+    check("замер не приписывает изменение счётчика сервису",
+          measured == "пост 123: число реакций выросло на 4; пост 124: изменение не зафиксировано", measured)
+    neutral = "пост 125: замера пока нет; заказ отправлен"
+    check("нейтральный результат замера остаётся прежним", Panel._measured_text(neutral) == neutral)
+    bot.reactions.report = lambda: observation
+    body, _ = panel._reactions_view()
+    check("очередь выводит замер без утверждения о доставке сервисом",
+          measured in body and "сервис добавил" not in body and "не позволяют установить" in body, body)
+
+    async def report():
+        return observation
+
+    bot.diagnose = report
+    await panel.on_button(client, Query(client, "check", owner.id, Message(client, 9202, owner, text="результат")))
+    check("диагностика также не приписывает дельту сервису",
+          measured in client.edits[-1][2] and "сервис добавил" not in client.edits[-1][2], client.edits[-1][2])
+
+
+async def check_panel_inputs():
+    print("\n[9б] Владелец: отмена, исправление ввода и изоляция администраторов")
+    from config import VIEWS_LIMIT
+
+    cfg = make_cfg(bot_token="900:AAstub", panel_admins=[778], promo_views=1000)
+    world = build_world(cfg)
+    client = world["client"]
+    bot, registry, _ = await make_bot(world)
+    panel = Panel(client, cfg, registry, bot)
+    owner, admin = client.add_user(User(777)), client.add_user(User(778))
+    await panel.start(owner.id)
+
+    async def tap(data, user=owner):
+        query = Query(client, data, user.id, Message(client, 9300, user, text="меню"))
+        await panel.on_button(client, query)
+        assert query.answers and not any(text.startswith("Ошибка:") for text, _ in query.answers), query.answers
+
+    async def say(text, user=owner):
+        await panel.on_message(client, Message(client, 9301, user, text=text))
+
+    prompts = {
+        "add|21": "sources|21", "channel": "topics", "rename|21": "settings|21",
+        "target|21": "cat|21", "group": "main", "group_rename": "admin",
+        "cv|21": "settings|21", "react": "rstate",
+    }
+    for data, back in prompts.items():
+        await tap(data)
+        cells = panel_cells(client.edits[-1][3])
+        check(f"ввод имеет правильную отмену: {data}", back in cells and owner.id in panel.awaiting, str(cells))
+        await tap(back)
+        check(f"кнопка отмены очищает ввод: {data}", owner.id not in panel.awaiting)
+
+    for destination in ("main", "help", "topics", "status", "admin", "rstate", "cat|21", "sources|21", "settings|21",
+                        "/start", "/help", "/help@owner_test_bot"):
+        await tap("rename|21")
+        before = panel_registry_state(registry)
+        if destination.startswith("/"):
+            await say(destination)
+            if destination.startswith("/help"):
+                check(f"команда открывает помощь: {destination}", "Как пользоваться" in client.replies[-1][1]
+                      and {"doc|1", "doc|2"} <= set(panel_cells(client.replies[-1][2])))
+        else:
+            await tap(destination)
+        check(f"навигация сбрасывает ожидание: {destination}", owner.id not in panel.awaiting)
+        await say("Это не новое название")
+        check(f"после отмены обычный текст не применяется: {destination}", panel_registry_state(registry) == before)
+
+    await tap("cv|21")
+    before = panel_registry_state(registry)
+    for raw in ("много", str(VIEWS_LIMIT + 1)):
+        await say(raw)
+        check(f"ошибка числа сохраняет ожидание и настройки: {raw}", panel.awaiting.get(owner.id) == ("cviews", 21)
+              and panel_registry_state(registry) == before, client.replies[-1][1])
+    await say("432")
+    check("ошибочное число можно исправить без нового нажатия", registry.categories[21].views == 432
+          and owner.id not in panel.awaiting)
+    before = panel_registry_state(registry)
+    await say("999")
+    check("успешный ввод применяется только один раз", panel_registry_state(registry) == before)
+    await tap("cv|21")
+    await tap("cv|21|2000")
+    check("пресет применяет число и очищает ожидание", registry.categories[21].views == 2000 and owner.id not in panel.awaiting)
+    before = panel_registry_state(registry)
+    await say("999")
+    check("после пресета обычный текст не меняет число", panel_registry_state(registry) == before)
+
+    await tap("rename|21", owner)
+    await tap("cv|22", admin)
+    check("два администратора имеют независимые ожидания", panel.awaiting == {777: ("rename", 21), 778: ("cviews", 22)}, str(panel.awaiting))
+    await tap("help", admin)
+    check("навигация второго администратора не отменяет ввод первого", panel.awaiting == {777: ("rename", 21)}, str(panel.awaiting))
+    await tap("cv|22", admin)
+    await say("не число", admin)
+    check("ошибка второго администратора сохраняет оба ожидания", panel.awaiting == {777: ("rename", 21), 778: ("cviews", 22)})
+    await say("Тема владельца", owner)
+    check("первый администратор не перехватывает чужой ввод", registry.categories[21].name == "Тема владельца"
+          and registry.categories[22].views is None and panel.awaiting == {778: ("cviews", 22)}, str(panel.awaiting))
+    await say("765", admin)
+    check("второй администратор исправляет своё число", registry.categories[22].views == 765
+          and registry.categories[21].views == 2000 and not panel.awaiting)
+    await registry.rebuild()
+    check("настройки обоих администраторов переживают перечитку", registry.categories[21].name == "Тема владельца"
+          and registry.categories[21].target == world["sport"].id
+          and registry.categories[21].views == 2000 and registry.categories[22].views == 765)
+
+    await tap("drop|21")
+    await tap("drop_yes|21")
+    for topic_id in (21, 999999):
+        for screen in ("cat", "sources", "settings"):
+            before = panel_registry_state(registry)
+            await tap(f"{screen}|{topic_id}")
+            check(f"отсутствующая тема открывается без ошибки: {screen}|{topic_id}",
+                  "Этой темы уже нет" in client.edits[-1][2] and panel_cells(client.edits[-1][3]) == ["topics"]
+                  and panel_registry_state(registry) == before, client.edits[-1][2])
+        for data in (f"cw|{topic_id}", f"cr|{topic_id}", f"cv|{topic_id}|500", f"drop_yes|{topic_id}"):
+            before = panel_registry_state(registry)
+            await tap(data)
+            check(f"старая кнопка отсутствующей темы безопасна: {data}",
+                  "темы уже нет" in client.edits[-1][2] and panel_registry_state(registry) == before,
+                  client.edits[-1][2])
+
+
+async def check_panel_access_and_pause():
+    print("\n[9в] Владелец: поддельные кнопки клиента и границы общей паузы")
+    from clients import Clients
+
+    cfg = make_cfg(bot_token="900:AAstub", promo_views=0, reactions_enabled=False)
+    world = build_world(cfg)
+    client = world["client"]
+    bot, registry, _ = await make_bot(world)
+    store = MemoryStore()
+    owner, customer = client.add_user(User(777)), client.add_user(User(5001))
+    target = client.add_chat(Chat(-10081, title="Канал клиента", username="client_panel_test"))
+    tenant = await store.ensure_tenant(customer.id)
+    await store.ensure_tenant(5002)
+    await store.set_target(customer.id, target.username, target.id, target.title)
+    await store.set_target_ok(customer.id, True)
+    await store.set_views(customer.id, 0)
+    await store.set_reactions(customer.id, False)
+    tenant.renew("week")
+    await store.add_donor(customer.id, world["donor_sport_1"].username)
+    await store.bind_donor(world["donor_sport_1"].username, world["donor_sport_1"].id)
+    await store.request_topup(5002, 600)
+    clients = Clients(client, store)
+    bot.attach(store, clients)
+    await clients.sync()
+    panel = Panel(client, cfg, registry, bot, store)
+    await panel.start(owner.id)
+
+    async def tap(data, user=owner, message_user=None):
+        query = Query(client, data, user.id, Message(client, 9400, message_user or user, text="меню"))
+        await panel.on_button(client, query)
+        assert query.answers and not any(text.startswith("Ошибка:") for text, _ in query.answers), query.answers
+        return query
+
+    await tap("rename|21")
+    before_registry = panel_registry_state(registry)
+    before_store = deepcopy(vars(store))
+    delegated = []
+    original = panel.cabinet.on_button
+
+    async def cabinet_button(query):
+        delegated.append((query.from_user.id, query.data))
+        await original(query)
+
+    panel.cabinet.on_button = cabinet_button
+    forged = (
+        "admin", "clients", "money", "pause", "start", "update", "catchup", "cw|21", "cr|21", "cv|21|2000",
+        "del|21|1", "drop_yes|21", "mpay|1", "mno|1", "credit|5002", "rename|21", "target|21",
+        "add|21", "channel", "group", "group_rename", "react",
+    )
+    try:
+        for data in forged:
+            # Даже сообщение владельца не даёт клиенту прав: проверяется автор callback.
+            query = await tap(data, customer, message_user=owner)
+            check(f"поддельная кнопка владельца безопасна: {data}", panel_registry_state(registry) == before_registry
+                  and vars(store) == before_store and panel.awaiting == {777: ("rename", 21)}
+                  and bool(query.answers), str(query.answers))
+    finally:
+        panel.cabinet.on_button = original
+    check("поддельные кнопки действительно прошли через Cabinet", delegated == [(customer.id, data) for data in forged])
+    await panel.on_message(client, Message(client, 9401, customer, text="900"))
+    check("клиентский текст после поддельной кнопки не меняет Registry и Store",
+          panel_registry_state(registry) == before_registry and vars(store) == before_store
+          and panel.awaiting == {777: ("rename", 21)})
+
+    await tap("main")
+    categories = deepcopy(registry.categories)
+    await tap("pause")
+    check("общая пауза не меняет настройки тем и клиентскую базу", registry.paused
+          and registry.categories == categories and vars(store) == before_store)
+    check("на паузе управление предлагает возобновить публикации", "start" in panel_cells(client.edits[-1][3])
+          and "pause" not in panel_cells(client.edits[-1][3]), str(panel_cells(client.edits[-1][3])))
+    first = len(client.posted)
+    await bot.on_message(client, Message(client, 9410, world["donor_sport_1"], caption="первый пост", photo=Photo("pause-shared")))
+    await bot.on_message(client, Message(client, 9411, world["donor_other"], caption="второй пост", photo=Photo("pause-owner")))
+    targets = [message.chat.id for message in client.posted[first:]]
+    check("на паузе обе темы владельца молчат, а клиент получает пост", targets == [target.id], str(targets))
+    check("клиентская публикация на паузе учитывается", store.usage.get(customer.id) == 1 and tenant.last_post_id > 0)
+    await tap("start")
+    first = len(client.posted)
+    await bot.on_message(client, Message(client, 9412, world["donor_sport_1"], caption="после паузы", photo=Photo("resume-shared")))
+    await bot.on_message(client, Message(client, 9413, world["donor_other"], caption="ещё пост", photo=Photo("resume-owner")))
+    targets = [message.chat.id for message in client.posted[first:]]
+    check("возобновление возвращает обе темы и не отключает клиента", not registry.paused and len(targets) == 3
+          and set(targets) == {world["sport"].id, world["yumor"].id, target.id}, str(targets))
+    await tap("pause")
+    restarted = Registry(client, cfg)
+    await restarted.rebuild()
+    check("новый запуск не восстанавливает временную паузу", restarted.paused is False
+          and restarted.categories == registry.categories)
+
+
+async def check_panel_pagination():
+    print("\n[9г] Владелец: страницы больших списков и лимиты Telegram")
+    from registry import Category, Donor
+
+    world = build_world(make_cfg(bot_token="900:AAstub"))
+    client = world["client"]
+    bot, registry, _ = await make_bot(world)
+    registry.categories = {
+        1000 + index: Category(1000 + index, f"Тема {index:02d} " + "я" * 42,
+                              target=-1001000 - index, target_name=f"Канал {index:02d} " + "ц" * 119)
+        for index in range(45)
+    }
+    category = registry.categories[1000]
+    category.donors = {
+        -1002000 - index: Donor(-1002000 - index, f"Источник {index:02d} " + "д" * 115,
+                               f"https://t.me/source_{index:02d}", 10000 + index)
+        for index in range(65)
+    }
+    registry._reindex()
+    panel = Panel(client, world["cfg"], registry, bot)
+    owner = client.add_user(User(777))
+    await panel.start(owner.id)
+    before = panel_registry_state(registry)
+
+    async def page(data):
+        query = Query(client, data, owner.id, Message(client, 9500, owner, text="список"))
+        await panel.on_button(client, query)
+        assert query.answers == [("", False)], query.answers
+        body, keyboard = client.edits[-1][2:]
+        cells = panel_cells(keyboard)
+        check(f"лимиты Telegram соблюдены: {data}", len(body.encode("utf-16-le")) // 2 <= 4096
+              and 0 < len(cells) <= 100 and all(0 < len(cell.encode("utf-8")) <= 64 for cell in cells), str(cells))
+        check(f"страница не меняет Registry: {data}", panel_registry_state(registry) == before)
+        return cells
+
+    seen = []
+    for number in range(3):
+        cells = await page("topics" if number == 0 else f"topics|{number}")
+        shown = [cell for cell in cells if cell.startswith("cat|")]
+        wanted = [f"cat|{topic_id}" for topic_id in list(registry.categories)[number * 20:(number + 1) * 20]]
+        check(f"страница тем {number} содержит ровно свою двадцатку", shown == wanted, str(shown))
+        check(f"переходы страниц тем {number}",
+              (f"topics|{number - 1}" in cells) == (number > 0)
+              and (f"topics|{number + 1}" in cells) == (number < 2)
+              and {"channel", "main"} <= set(cells), str(cells))
+        seen.extend(shown)
+    check("все темы достижимы без пропусков и повторов", seen == [f"cat|{topic_id}" for topic_id in registry.categories])
+    cells = await page("topics|999")
+    check("выход за последнюю страницу тем ограничен", [cell for cell in cells if cell.startswith("cat|")] == seen[-5:])
+
+    seen = []
+    for number in range(3):
+        cells = await page("sources|1000" if number == 0 else f"sources|1000|{number}")
+        shown = [cell for cell in cells if cell.startswith("del|")]
+        wanted = [f"del|1000|{donor.message_id}" for donor in list(category.donors.values())[number * 30:(number + 1) * 30]]
+        check(f"страница источников {number} содержит ровно свою тридцатку", shown == wanted, str(shown))
+        check(f"переходы страниц источников {number}",
+              (f"sources|1000|{number - 1}" in cells) == (number > 0)
+              and (f"sources|1000|{number + 1}" in cells) == (number < 2)
+              and {"add|1000", "cat|1000"} <= set(cells), str(cells))
+        seen.extend(shown)
+    check("все источники достижимы без пропусков и повторов", seen == [f"del|1000|{donor.message_id}" for donor in category.donors.values()])
+    cells = await page("sources|1000|999")
+    check("выход за последнюю страницу источников ограничен", [cell for cell in cells if cell.startswith("del|")] == seen[-5:])
 
 
 def check_startup_wiring() -> None:
@@ -2188,11 +2617,11 @@ async def check_reactions():
     body = pclient.replies[-1][1]
     rows = pclient.replies[-1][2].inline_keyboard
     cells = [button.callback_data for row in rows for button in row]
-    check("меню рассказывает про реакции", "Реакции: включены" in body, body[:120])
+    check("главное меню не выдаёт заказ реакций за результат", "Реакции:" not in body and "status" in cells, body[:200])
     check("общей кнопки реакций больше нет", "reactions" not in cells, str(cells))
 
-    await panel.on_button(pclient, press("cat|22"))
-    check("канал показывает свои реакции", "4. Реакции:" in pclient.edits[-1][2] and "ставим" in pclient.edits[-1][2], pclient.edits[-1][2][:260])
+    await panel.on_button(pclient, press("settings|22"))
+    check("настройки темы показывают выбор заказа реакций", "Реакции: заказывать" in pclient.edits[-1][2], pclient.edits[-1][2][:260])
     await panel.on_button(pclient, press("cw|22"))
     check("переключатель текста выключает переписывание", panel_registry.categories[22].rewrite is False
           and "словами автора" in pclient.edits[-1][2], pclient.edits[-1][2][:260])
@@ -2202,18 +2631,23 @@ async def check_reactions():
     check("у другого канала текст не тронут", panel_registry.rewrite_for(panel_registry.categories[21]) is True,
           str(panel_registry.categories[21].rewrite))
     await panel.on_button(pclient, press("cw|22"))
-    check("и возвращается обратно", panel_registry.categories[22].rewrite is True
-          and "переписывает нейросеть" in pclient.edits[-1][2], pclient.edits[-1][2][:260])
+    check("и возвращается обратно без ложного обещания доступного ИИ", panel_registry.categories[22].rewrite is True
+          and "нейросеть недоступна" in pclient.edits[-1][2]
+          and "Выбор переписывания сохранён" in pclient.edits[-1][2], pclient.edits[-1][2][:400])
     await panel.on_button(pclient, press("cr|22"))
     check("кнопка выключает реакции канала", panel_registry.categories[22].reactions is False
-          and "выключены" in pclient.edits[-1][2], pclient.edits[-1][2][:160])
+          and "Реакции: не заказывать" in pclient.edits[-1][2], pclient.edits[-1][2][:400])
     check("другой канал не тронут", panel_registry.reactions_for(panel_registry.categories[21]) is True,
           str(panel_registry.categories[21].reactions))
     await panel.on_button(pclient, press("cr|22"))
     check("кнопка снова включает реакции канала", panel_registry.categories[22].reactions is True
-          and "включены" in pclient.edits[-1][2], pclient.edits[-1][2][:160])
+          and "Реакции: заказывать" in pclient.edits[-1][2], pclient.edits[-1][2][:400])
     await panel.on_button(pclient, press("status"))
-    check("статус показывает очередь реакций", "Реакции:" in pclient.edits[-1][2] and "smmnakrutka" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
+    cells = [button.callback_data for row in pclient.edits[-1][3].inline_keyboard for button in row]
+    check("результат ведёт к отдельной очереди реакций", "rstate" in cells, str(cells))
+    await panel.on_button(pclient, press("rstate"))
+    check("экран заказов показывает очередь реакций", "Очередь реакций:" in pclient.edits[-1][2]
+          and "Отправка заказа не подтверждает доставку" in pclient.edits[-1][2], pclient.edits[-1][2])
 
 
 async def check_reaction_measure():
@@ -2409,10 +2843,10 @@ async def check_views():
     await panel.on_message(pclient, Message(pclient, 9001, owner, text="/start"))
     cells = [button.callback_data for row in pclient.replies[-1][2].inline_keyboard for button in row]
     check("общей кнопки просмотров больше нет", "views" not in cells, str(cells))
-    check("в меню есть «Мои каналы»", "topics" in cells, str(cells))
+    check("в меню есть мои темы", "topics" in cells, str(cells))
 
-    await panel.on_button(pclient, press("cat|21"))
-    check("экран канала показывает число по умолчанию", "1000 на каждый пост" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
+    await panel.on_button(pclient, press("settings|21"))
+    check("настройки темы показывают число по умолчанию", "1000 на каждый пост" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
     check("у канала своя кнопка просмотров", "cv|21" in panel_buttons(), str(panel_buttons()))
 
     await panel.on_button(pclient, press("cv|21"))
@@ -2425,7 +2859,7 @@ async def check_views():
           str(panel_registry.views_for(panel_registry.categories[21])))
     check("другой канал остался при своём", panel_registry.views_for(panel_registry.categories[22]) == 1000,
           str(panel_registry.views_for(panel_registry.categories[22])))
-    check("панель это подтверждает", "Просмотры канала" in pclient.replies[-1][1] and "144" in pclient.replies[-1][1],
+    check("панель это подтверждает", "Просмотры темы" in pclient.replies[-1][1] and "144" in pclient.replies[-1][1],
           str(pclient.replies[-1][1][:80]))
 
     await panel.on_button(pclient, press("cv|21"))
@@ -2446,7 +2880,9 @@ async def check_views():
           str(panel_registry.views_for(panel_registry.categories[21])))
 
     await panel.on_button(pclient, press("status"))
-    check("статус показывает число по умолчанию", "Просмотры для новых каналов" in pclient.edits[-1][2], pclient.edits[-1][2][:200])
+    check("статус не смешивает дефолты просмотров с результатами",
+          "Просмотры для новых каналов" not in pclient.edits[-1][2] and "PROMO_VIEWS" not in pclient.edits[-1][2]
+          and "Опубликовано постов:" in pclient.edits[-1][2], pclient.edits[-1][2])
 
 
 async def check_legal():
@@ -2940,29 +3376,29 @@ async def check_cabinet():
 
     # ---- новичок: первое окно ----
     await panel.on_message(client, Message(client, 6001, petr, text="/start"))
-    check("новичок попадает в пошаговый запуск", "Пошаговый запуск" in reply_text() and "Шаг 1 из 5" in reply_text(), reply_text()[:90])
-    check("первый шаг назван человеческим словом", "Откуда брать посты" in reply_text(), reply_text()[:160])
-    check("первый экран начинается с инструкции", "Что сделать" in reply_text() and "➕ Добавить канал" in reply_text(), reply_text()[:200])
-    check("в кабинете свои кнопки", "cadd" in reply_cells() and "cnext" in reply_cells(), str(reply_cells()))
+    check("новичок попадает в пошаговый запуск", "Настроить канал" in reply_text() and "Шаг 1 из 3" in reply_text(), reply_text()[:90])
+    check("первый шаг — куда публиковать", "Куда публиковать" in reply_text(), reply_text()[:160])
+    check("первый экран даёт инструкцию", "Добавь рабочего аккаунта" in reply_text(), reply_text()[:200])
+    check("в кабинете свои кнопки", "cset_target" in reply_cells() and "cnext" in reply_cells(), str(reply_cells()))
     check("клиент не видит панель владельца", "🤖 АвтоПост" not in reply_text() and "донор" not in reply_text().lower(), reply_text()[:120])
     await panel.on_message(client, Message(client, 6002, owner, text="/start"))
     check("владелец по-прежнему в своей панели", "АвтоПост" in reply_text(), reply_text()[:60])
 
     # ---- шаг 1: каналы-источники ----
     await panel.on_button(client, tap("cadd"))
-    check("кнопка объясняет, где взять ссылку", "Где её взять" in text() and "до 10 каналов" in text(), text()[:220])
+    check("добавление источника просит ссылку", "@name или https://t.me/name" in text() and "до 10 источников" in text(), text()[:220])
     await panel.on_message(client, Message(client, 6003, petr, text="@bankrollo"))
     check("источник записан в базу", (petr.id, "bankrollo") in store.donors, str(list(store.donors)))
-    check("подписка обещана самим ботом", "Бот подпишется сам" in reply_text(), reply_text()[:200])
-    check("новый канал пока не открыт", "⏳ подписываюсь" in reply_text(), reply_text()[:260])
+    check("подписка выполняется рабочим аккаунтом", "попробует подписаться" in reply_text(), reply_text()[:200])
+    check("новый источник ещё не подтверждён", "доступ не подтверждён" in reply_text(), reply_text()[:260])
     store.donors[(petr.id, "bankrollo")].chat_id = -100900
     await panel.on_button(client, tap("cdonors"))
-    check("прочитанный канал отмечен галочкой", "✅ читаем" in text() and "@bankrollo" in text(), text()[:240])
+    check("подключённый источник отмечен", "подключён" in text() and "@bankrollo" in text(), text()[:240])
     check("канал можно убрать кнопкой", cells()[1].startswith("cdel|"), str(cells()))
     await panel.on_button(client, tap("cdel|1"))
     check("канал убран", (petr.id, "bankrollo") not in store.donors, str(list(store.donors)))
     await panel.on_button(client, tap("cdel|7"))
-    check("уже убранный не ломает экран", "уже убран" in text(), text()[:90])
+    check("уже удалённый не ломает экран", "уже удалён" in text(), text()[:90])
     await panel.on_button(client, tap("cadd"))
     await panel.on_message(client, Message(client, 6004, petr, text="@bankrollo"))
     check("канал вернулся в список", (petr.id, "bankrollo") in store.donors, str(list(store.donors)))
@@ -2973,17 +3409,17 @@ async def check_cabinet():
     check("нужные права названы", "публиковать сообщения" in text(), text()[:280])
     check("ссылку просят отдельной кнопкой", "cset_target" in cells(), str(cells()))
     await panel.on_button(client, tap("cset_target"))
-    check("перед вводом говорят про публичную ссылку", "Публичную ссылку" in text(), text()[:240])
+    check("перед вводом говорят про публичную ссылку", "Публичный адрес" in text(), text()[:240])
     await panel.on_message(client, Message(client, 6005, petr, text="https://t.me/petr_ch"))
     check("канал записан в базу", store.tenants[petr.id].target == "petr_ch", store.tenants[petr.id].target)
-    check("доступ ещё не подтверждён", "⏳ проверяю доступ" in reply_text(), reply_text()[:200])
-    check("срок проверки обещан коротким", "пара минут" in reply_text(), reply_text()[:260])
+    check("доступ ещё не подтверждён", "Доступ ещё не подтверждён" in reply_text(), reply_text()[:200])
+    check("сохранение ссылки не обещает публикации", "статус — в «Результат»" in reply_text(), reply_text()[:260])
     await panel.on_button(client, tap("cset_target"))
     await panel.on_message(client, Message(client, 6006, petr, text="куда-то туда"))
     check("текст без ссылки отклонён", "Не понимаю ссылку" in reply_text(), reply_text()[:130])
     await panel.on_button(client, tap("cset_target"))
     await panel.on_message(client, Message(client, 6007, petr, text="https://t.me/c/123456/78"))
-    check("закрытая ссылка отклонена с объяснением", "закрытый канал" in reply_text().lower(), reply_text()[:170])
+    check("закрытая ссылка отклонена с объяснением", "t.me/c/... не подходит" in reply_text(), reply_text()[:170])
     check("и сказано, где взять публичную", "Публичная ссылка" in reply_text(), reply_text()[:300])
     await panel.on_button(client, tap("cset_target"))
     await panel.on_message(client, Message(client, 6008, petr, text="https://t.me/petr_ch"))
@@ -2992,12 +3428,12 @@ async def check_cabinet():
     # ---- шаг 4: просмотры ----
     await panel.on_button(client, tap("cviews"))
     check("диапазон просмотров назван", "10000" in text(), text()[:300])
-    check("ноль назван выбором человека", "не накручивать" in text(), text()[:320])
+    check("ноль отключает заказы просмотров", "Ноль — не заказывать" in text(), text()[:320])
     await panel.on_button(client, tap("cviews|1000"))
     check("просмотры с готовой кнопки", store.tenants[petr.id].views == 1000, str(store.tenants[petr.id].views))
-    check("экран просмотров показывает число", "Сейчас: 1000 на каждый пост" in text(), text()[:200])
+    check("экран просмотров показывает размер заказа", "Сейчас: заказывать 1000 на каждый пост" in text(), text()[:200])
     await panel.on_button(client, tap("cviews|0"))
-    check("ноль принимается как выбор", store.tenants[petr.id].views == 0 and "не накручиваем (0)" in text(), text()[:240])
+    check("ноль принимается как выбор", store.tenants[petr.id].views == 0 and "не заказывать (0)" in text(), text()[:240])
     await panel.on_button(client, tap("cviews|999999"))
     check("просмотры выше потолка отклонены", store.tenants[petr.id].views == 0 and "Просмотров должно быть от 0" in text(), text()[:150])
     await panel.on_button(client, tap("cviews"))
@@ -3006,23 +3442,23 @@ async def check_cabinet():
 
     # ---- реакции ----
     await panel.on_button(client, tap("cboost"))
-    check("экран реакций ставит условие", "ВСЕ реакции" in text(), text()[:280])
-    check("без замера фразу не выдумываем", "ждём первый замер" in text(), text()[:340])
+    check("экран реакций ставит условие", "разреши все реакции" in text(), text()[:280])
+    check("без замера фразу не выдумываем", "результат ещё не измерен" in text(), text()[:340])
     await panel.on_button(client, tap("creactions"))
-    check("реакции выключаются", store.tenants[petr.id].reactions is False and "выключены" in text(), text()[:200])
+    check("реакции выключаются", store.tenants[petr.id].reactions is False and "выключен" in text(), text()[:200])
     await panel.on_button(client, tap("creactions"))
-    check("реакции включаются обратно", store.tenants[petr.id].reactions is True and "включены" in text(), text()[:200])
+    check("выбор реакций сохранён при общем отключении", store.tenants[petr.id].reactions is True and "сервис сейчас выключен" in text(), text()[:200])
 
     # ---- шаг 5: тариф и оплата ----
     await panel.on_button(client, tap("cplans"))
-    check("цены названы", "Неделя - 600 ₽" in text() and "Месяц - 2000 ₽" in text(), text()[:200])
+    check("цены названы", "Неделя — 600 ₽" in text() and "Месяц — 2000 ₽" in text(), text()[:200])
     check("что входит - перечислено", "постов в сутки" in text(), text()[:280])
-    check("дни подписки не сгорают", "не сгорают" in text(), text()[-200:])
+    check("дни подписки сохраняются", "добавляет дни к оставшемуся сроку" in text(), text()[-200:])
     await panel.on_button(client, tap("cbuy|week"))
     check("без согласия покупка не идёт", store.tenants[petr.id].plan_until is None and "cagree" in cells(), str(cells()))
     await panel.on_button(client, tap("ctopup"))
     check("пополнение тоже просит согласие", "cagree" in cells(), str(cells()))
-    check("в согласии есть обе кнопки документов", "cdoc|1" in cells() and "cdoc|2" in cells(), str(cells()))
+    check("в согласии есть обе кнопки документов", "cdoc|1|agree" in cells() and "cdoc|2|agree" in cells(), str(cells()))
     await panel.on_button(client, tap("cagree"))
     check("согласие записано", store.tenants[petr.id].agreed is True, str(store.tenants[petr.id].agreed))
     await panel.on_button(client, tap("cbuy|week"))
@@ -3032,7 +3468,7 @@ async def check_cabinet():
     await panel.on_message(client, Message(client, 6010, petr, text="600"))
     check("заявка на оплату создана", any(row["status"] == "pending" and row["amount_rub"] == 600 for row in store.payments),
           str(store.payments))
-    check("кабинет подтвердил заявку", "Заявка №1" in reply_text() and "начислю сумму" in reply_text(), reply_text()[:200])
+    check("кабинет подтвердил заявку", "Заявка №1" in reply_text() and "ждёт проверки платежа" in reply_text(), reply_text()[:200])
     await panel.on_button(client, tap("ctopup"))
     await panel.on_message(client, Message(client, 6011, petr, text="50"))
     check("меньшая сумма отклонена", "от 100" in reply_text(), reply_text()[:150])
@@ -3041,14 +3477,20 @@ async def check_cabinet():
     tenant = store.tenants[petr.id]
     check("неделя списана с баланса", tenant.active() and tenant.balance == 0, f"{tenant.plan_until} / {tenant.balance}")
     check("кабинет показывает срок", "активен ещё" in text(), text()[:200])
-    check("покупка попала в историю", "Последнее по оплате" in text(), text()[-220:])
-    await panel.on_button(client, tap("chome"))
+    check("покупка попала в историю", "Последние оплаты" in text(), text()[-220:])
     check("заявка без подтверждения помечена", "ждёт проверки" in text(), text()[-260:])
-    check("настроенному клиенту не предлагают запуск", "Всё настроено" in text() and "cresult" in cells(), text()[-260:])
-    check("обещание сервиса читается в кабинете",
-          "Текст поста:" in text() and "просмотры и реакции" in text() and "Бот читает каналы" in text(), text()[:300])
-    check("кабинет даёт все четыре шага кнопками", {"cdonors", "cchannel", "cviews", "cplans"} <= set(cells()), str(cells()))
-    check("и помощь с кнопками документов", {"cguide", "cdoc|1", "cdoc|2"} <= set(cells()), str(cells()))
+    await panel.on_button(client, tap("chome"))
+    check("заполненному кабинету не предлагают запуск", "cstart" not in cells() and "cresult" in cells(), text()[-260:])
+    check("главная не обещает работу при неподтверждённом доступе",
+          "доступ к каналу публикации не подтверждён" in text() and "Всё идёт" not in text(), text()[:300])
+    check("главная короткая и содержит четыре действия", len(text()) < 600 and set(cells()) == {"cproject", "cresult", "cplans", "cguide"}, str(cells()))
+    check("история и документы не перегружают главную", "Последние оплаты" not in text() and not any(x.startswith("cdoc") for x in cells()), text())
+    await panel.on_button(client, tap("cproject"))
+    check("карточка одного канала открывает вложенные разделы", set(cells()) == {"cchannel", "cdonors", "csettings", "chome"}, str(cells()))
+    await panel.on_button(client, tap("csettings"))
+    check("настройки собраны вместе", set(cells()) == {"ctext", "cviews", "cboost", "cproject"}, str(cells()))
+    await panel.on_button(client, tap("cguide"))
+    check("документы доступны из помощи", {"cdoc|1|guide", "cdoc|2|guide"} <= set(cells()), str(cells()))
 
     sent_before = len(client.sent)
     await panel.on_button(client, tap("cdoc|1"))
@@ -3061,9 +3503,9 @@ async def check_cabinet():
           any("Политика конфиденциальности" in text for _, text in client.sent[sent_before:]),
           str(client.sent[sent_before:])[:120])
     await panel.on_button(client, tap("cdonors", ivan))
-    check("у второго клиента свой пустой список", "Сейчас в списке: 0 из 10" in text(), text()[:240])
+    check("у второго клиента свой пустой список", "Источников: 0 из 10" in text(), text()[:240])
     await panel.on_button(client, tap("chome", ivan))
-    check("чужие настройки не видны", "не накручиваем (0)" in text() and "@bankrollo" not in text(), text()[:240])
+    check("чужие настройки не видны", "Канал: не указан" in text() and "@bankrollo" not in text() and "@petr_ch" not in text(), text()[:240])
     wrong = tap("neknopka")
     await panel.on_button(client, wrong)
     check("несуществующая кнопка отвечает подсказкой", "Такой кнопки нет" in wrong.answers[-1][0], str(wrong.answers))
@@ -3098,77 +3540,187 @@ async def check_cabinet_launch():
         return client.replies[-1]
 
     await panel.on_message(client, Message(client, 6101, nina, text="/start"))
-    check("первый экран ведёт за руку", "Шаг 1 из 5 - Откуда брать посты" in reply()[1], reply()[1][:80])
-    check("у шага есть кнопка «Дальше»", "cnext" in reply()[2].inline_keyboard[-1][0].callback_data, reply()[1][:60])
-
-    await panel.on_button(client, tap("cstart"))
-    check("«Пошаговый запуск» открывает шаг 1", "Шаг 1 из 5" in text(), text()[:70])
+    check("запуск начинается с канала публикации", "Шаг 1 из 3 — Куда публиковать" in reply()[1], reply()[1][:120])
+    check("у первого шага есть продолжение", any(b.callback_data == "cnext" for row in reply()[2].inline_keyboard for b in row))
     await panel.on_button(client, tap("cnext"))
-    check("«Дальше» ведёт к каналу публикации", "Шаг 2 из 5 - Куда публиковать" in text(), text()[:90])
-    check("без рабочего аккаунта просят помощь", "нажми «🆘 Помощь»" in text(), text()[-200:])
-    await panel.on_button(client, tap("cnext"))
-    check("шаг про выбор человека", "Шаг 3 из 5 - Текст поста" in text(), text()[:90])
-    check("и объясняет переключатель", "Сейчас: переписывает нейросеть" in text() and "cretext" in cells(), text()[:260])
-    await panel.on_button(client, tap("cretext"))
-    check("переключатель выключает переписывание", store.tenants[nina.id].rewrite is False
-          and "Сейчас: публикуем словами автора" in text(), text()[:300])
-    await panel.on_button(client, tap("cretext"))
-    check("и включает обратно", store.tenants[nina.id].rewrite is True and "cretext" in cells(), str(cells()))
-    await panel.on_button(client, tap("cnext"))
-    check("просмотры остаются в walkthrough", "Шаг 4 из 5 - Просмотры на пост" in text(), text()[:90])
-    await panel.on_button(client, tap("cnext"))
-    check("последний шаг - тариф", "Шаг 5 из 5 - Тариф и оплата" in text(), text()[:90])
-    await panel.on_button(client, tap("cnext"))
-    check("пройдены все шаги - «Готово»", "Готово - все шаги пройдены" in text(), text()[:90])
-    check("и предлагают результат", "cresult" in cells(), str(cells()))
-
-    # ---- экран результата: по одной настоящей причине за раз ----
-    await panel.on_button(client, tap("cresult"))
-    check("без тарифа названа причина", "нужен оплаченный тариф" in text(), text()[:180])
-    check("и сказано, что нажать", "нажми «5️⃣ Тариф»" in text(), text()[:220])
-    check("числа видены всегда", "Постов сегодня: 0 из 50" in text() and "Последний пост: постов ещё не было" in text(), text()[-300:])
-
-    await panel.on_button(client, tap("cadd"))
-    await panel.on_message(client, Message(client, 6102, nina, text="@sport0"))
+    check("незаполненный канал нельзя пропустить", "Шаг 1 из 3" in text(), text())
+    check("контакт рабочего аккаунта не выдумывается", "контакт пока не указан" in text(), text())
     await panel.on_button(client, tap("cset_target"))
     await panel.on_message(client, Message(client, 6103, nina, text="https://t.me/nina_ch"))
+    check("после ввода канала не теряется текущий шаг", "Шаг 1 из 3" in reply()[1], reply()[1])
+    await panel.on_button(client, tap("cnext"))
+    check("второй шаг — источники", "Шаг 2 из 3 — Откуда брать посты" in text(), text())
+    await panel.on_button(client, tap("cnext"))
+    check("пустые источники нельзя пропустить", "Шаг 2 из 3" in text(), text())
+    await panel.on_button(client, tap("cadd"))
+    await panel.on_message(client, Message(client, 6102, nina, text="@sport0"))
+    check("после источника сохранена навигация запуска", "Шаг 2 из 3" in reply()[1], reply()[1])
+    await panel.on_button(client, tap("cnext"))
+    check("третий шаг — тариф", "Шаг 3 из 3 — Тариф и оплата" in text(), text())
+    await panel.on_button(client, tap("cprev"))
+    check("можно вернуться на предыдущий шаг", "Шаг 2 из 3" in text(), text())
+    await panel.on_button(client, tap("chome"))
+    await panel.on_button(client, tap("cstart"))
+    check("повторный запуск ищет незавершённый шаг", "Шаг 3 из 3" in text(), text())
+    await panel.on_button(client, tap("ctopup"))
+    check("оплата в запуске требует соглашения", "cagree" in cells(), str(cells()))
+    await panel.on_button(client, tap("cdoc|1|agree"))
+    doc_back = client.sent_messages[-1].reply_markup.inline_keyboard[-1][0].callback_data
+    check("из документа возвращаемся к соглашению", doc_back == "cterms", doc_back)
+    await panel.on_button(client, tap(doc_back))
+    await panel.on_button(client, tap("cagree"))
+    check("соглашение не теряет третий шаг", "Шаг 3 из 3" in text(), text())
+    await panel.on_button(client, tap("ctopup"))
+    check("отсутствие реквизитов названо прямо", "Реквизиты пока не указаны" in text(), text())
+    await panel.on_message(client, Message(client, 6104, nina, text="600"))
+    check("заявка возвращает к третьему шагу", "Шаг 3 из 3" in reply()[1], reply()[1])
+    await panel.on_button(client, tap("cnext"))
+    check("заявка не заменяет оплаченный тариф", "Шаг 3 из 3" in text() and not store.tenants[nina.id].active(), text())
+    await panel.on_button(client, tap("cresult"))
+    check("без тарифа названа причина и действие", "нет активного тарифа" in text() and "Тариф и оплата" in text(), text())
+    check("числа публикаций видны всегда", "Постов сегодня: 0 из 50" in text() and "Последний пост: постов ещё не было" in text(), text())
+    await panel.on_button(client, tap("cstart"))
     await store.add_balance(nina.id, 600)
-    await store.buy(nina.id, "week")
+    await panel.on_button(client, tap("cbuy|week"))
+    check("покупка сохраняет шаг с кнопкой дальше", "Шаг 3 из 3" in text() and "cnext" in cells(), text())
+    await panel.on_button(client, tap("cnext"))
+    check("завершение настройки не обещает доступ", "Обязательные настройки сохранены" in text() and "доступ к каналу публикации не подтверждён" in text(), text())
+    check("на завершении есть результат", "cresult" in cells(), str(cells()))
     await panel.on_button(client, tap("cresult"))
-    check("источник ещё не открыт - это видно", "ни один канал-источник не открылся" in text(), text()[:200])
-    check("не открывшиеся ссылки перечислены", "Не открылись: @sport0" in text(), text()[-200:])
-    store.donors[(nina.id, "sport0")].chat_id = -1004307467493
-    await panel.on_button(client, tap("cresult"))
-    check("без прав админа пост не выйдет", "не админ" in text(), text()[:220])
-    check("рабочий аккаунт назван или обещан", "пришлю по запросу" in text(), text()[-260:])
+    check("неподтверждённые источники перечислены", "Доступ к источникам не подтверждён: @sport0" in text(), text())
+    check("неподтверждённый доступ не объявляется отсутствием прав", "доступ к каналу публикации не подтверждён" in text() and "не админ" not in text(), text())
     await store.set_target_ok(nina.id, True, "НИНА")
     await panel.on_button(client, tap("cresult"))
-    check("всё готово - «Всё идёт»", "✅ Всё идёт" in text() and "⛔" not in text(), text()[:200])
-    check("доступ подтверждён показан", "✅ доступ подтверждён" in text(), text()[-300:])
+    check("подтверждение канала не скрывает недоступные источники", "доступ к источникам не подтверждён" in text(), text())
+    store.donors[(nina.id, "sport0")].chat_id = -1004307467493
+    await panel.on_button(client, tap("cresult"))
+    check("готовность не заменяет факт публикации", "автопубликация настроена" in text() and "постов ещё не было" in text(), text())
+    check("доступ подтверждён показан", "доступ подтверждён" in text(), text())
     await store.note_publish(nina.id, 42)
     await panel.on_button(client, tap("cresult"))
-    check("после поста видно «сколько назад»", "Последний пост: только что" in text(), text()[-320:])
+    check("после поста видно время", "Последний пост: только что" in text(), text())
     store.tenants[nina.id].last_post_at = _utcnow() - datetime.timedelta(minutes=95)
     await panel.on_button(client, tap("cresult"))
-    check("время считается по-человечески", "Последний пост: 1 ч назад" in text(), text()[-320:])
+    check("время считается по-человечески", "Последний пост: 1 ч назад" in text(), text())
     store.usage[nina.id] = MAX_POSTS_PER_DAY
     await panel.on_button(client, tap("cresult"))
-    check("исчерпанный лимит назван", "лимит 50 постов" in text() and "после полуночи" in text(), text()[:240])
+    check("исчерпанный лимит назван", "лимит 50 постов" in text() and "следующие сутки" in text(), text())
     store.usage[nina.id] = 0
-    store.tenants[nina.id].reactions_added = 0
-    await panel.on_button(client, tap("cresult"))
-    check("пустой замер реакций пишется прямо", "сервис не добавил ничего" in text(), text()[-300:])
-    store.tenants[nina.id].reactions_added = 12
-    await panel.on_button(client, tap("cresult"))
-    check("добавленные реакции тоже", "сервис добавил 12" in text(), text()[-300:])
-
-    # ---- помощник и оплата без реквизитов ----
+    for added, expected in ((None, "результат ещё не измерен"), (0, "число не изменилось"),
+                            (12, "по последнему замеру +12"), (-2, "снижение на 2")):
+        store.tenants[nina.id].reactions_added = added
+        await panel.on_button(client, tap("cresult"))
+        check(f"реакции {added}: показан замер, не догадка", expected in text() and "сервис добавил" not in text() and "сервис не добавил" not in text(), text())
+    await panel.on_button(client, tap("ctext"))
+    check("выбор текста вынесен из обязательного запуска", "cretext" in cells() and "Шаг" not in text(), text())
+    await panel.on_button(client, tap("cretext"))
+    check("переписывание выключается", not store.tenants[nina.id].rewrite and "текст автора" in text(), text())
+    await panel.on_button(client, tap("cretext"))
+    check("переписывание включается обратно", store.tenants[nina.id].rewrite and "cretext" in cells(), text())
     await panel.on_button(client, tap("cguide"))
-    check("помощь объясняет каждую кнопку", "Что делает каждая кнопка" in text() and "📊 Результат" in text(), text()[:200])
-    check("и порядок шагов", "1️⃣ Откуда брать посты" in text() and "5️⃣ Тариф" in text(), text()[:300])
-    await store.set_agreed(nina.id)
-    await panel.on_button(client, tap("ctopup"))
-    check("без реквизитов обещают прислать их", "Реквизиты пришлю" in text() and "cguide" in cells(), text()[-200:])
+    check("помощь называет понятный порядок", "куда публиковать → откуда брать посты → тариф" in text(), text())
+    check("справка учитывает видео и фото без подписи", "видео с подписью или без неё" in text() and "Фото и фотоальбомы без подписи пропускаются" in text(), text())
+    await check_cabinet_navigation(panel, client, store, nina)
+
+
+async def check_cabinet_navigation(panel, client, store, nina):
+    from pyrogram.errors import MessageNotModified
+    from store import StoreError
+
+    cab = panel.cabinet
+    other = client.add_user(User(5011, "Другой клиент"))
+
+    async def tap(data, user=nina):
+        await panel.on_button(client, Query(client, data, user.id, Message(client, 6190, user, text="Кабинет")))
+
+    async def say(text, user=nina):
+        await panel.on_message(client, Message(client, 6191, user, text=text))
+
+    for command in ("/help", "/help@bot_post_sam_bot"):
+        await tap("cadd")
+        await say(command)
+        check(f"{command} открывает помощь и отменяет ввод", client.replies[-1][1].startswith("Помощь") and nina.id not in cab.awaiting)
+    await tap("cviews")
+    await tap("cset_target", other)
+    check("ожидания клиентов независимы", cab.awaiting.get(nina.id) == ("views", 0) and cab.awaiting.get(other.id) == ("channel", 0))
+    await tap("csettings")
+    await say("2500")
+    check("отмена не меняет просмотры", store.tenants[nina.id].views == 0 and cab.awaiting.get(other.id) == ("channel", 0))
+    await say("@other_channel", other)
+    check("другой клиент меняет только свой канал", store.tenants[other.id].target == "other_channel" and store.tenants[nina.id].target == "nina_ch")
+    await tap("cviews")
+    await say("много")
+    check("неверное число оставляет повтор ввода", cab.awaiting.get(nina.id) == ("views", 0))
+    await say("144")
+    check("число можно исправить сообщением", store.tenants[nina.id].views == 144 and nina.id not in cab.awaiting)
+    await tap("cviews")
+    await tap("cviews|500")
+    await say("777")
+    check("готовое число отменяет дальнейший ввод", store.tenants[nina.id].views == 500 and nina.id not in cab.awaiting)
+    await tap("cadd")
+    await say("/start")
+    check("старт отменяет старое ожидание", nina.id not in cab.awaiting)
+    for screen in ("home", "project", "settings", "donors", "channel", "text", "views", "reactions", "result", "guide", "plans"):
+        body, keyboard = await cab._view(nina.id, screen)
+        buttons = [button for row in keyboard.inline_keyboard for button in row]
+        check(f"экран клиента {screen}: помещается в Telegram", len(body) <= 4096 and all(len(b.callback_data.encode()) <= 64 for b in buttons))
+        check(f"экран клиента {screen}: нет админских команд", all(b.callback_data.startswith("c") for b in buttons) and not any(word in body for word in ("REWRITE", "DATABASE_URL", "PROMO_VIEWS", "Railway")))
+    check("отклонённая оплата не выглядит ожидающей", "отклонено" in cab._payment_line({"status": "rejected", "amount_rub": 600}))
+    original_edit = client.edit_message_text
+
+    async def unchanged(*args, **kwargs):
+        raise MessageNotModified()
+
+    client.edit_message_text = unchanged
+    query = Query(client, "cresult", nina.id, Message(client, 6192, nina, text="Результат"))
+    try:
+        await panel.on_button(client, query)
+        check("обновление неизменившегося результата не ошибка", query.answers == [("", False)], str(query.answers))
+    finally:
+        client.edit_message_text = original_edit
+
+    # Поздняя ошибка предыдущего ввода не перехватывает новую настройку.
+    entered, finish = asyncio.Event(), asyncio.Event()
+    original_views = store.set_views
+
+    async def delayed_error(*args):
+        entered.set()
+        await finish.wait()
+        raise StoreError("Проверочная ошибка")
+
+    store.set_views = delayed_error
+    try:
+        await tap("cviews")
+        pending = asyncio.create_task(say("800"))
+        await entered.wait()
+        await tap("cset_target")
+        finish.set()
+        await pending
+        check("поздняя ошибка не затирает новый ввод клиента", cab.awaiting.get(nina.id) == ("channel", 0))
+        check("поздний ответ не возвращает старые кнопки", client.replies[-1][2] is None)
+    finally:
+        finish.set()
+        store.set_views = original_views
+
+    # И успешный готовый выбор не должен отменять более новый ввод.
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def delayed_success(*args):
+        entered.set()
+        await finish.wait()
+        return await original_views(*args)
+
+    store.set_views = delayed_success
+    try:
+        pending = asyncio.create_task(tap("cviews|900"))
+        await entered.wait()
+        await tap("cset_target")
+        finish.set()
+        await pending
+        check("поздний пресет не отменяет новое ожидание", cab.awaiting.get(nina.id) == ("channel", 0))
+    finally:
+        finish.set()
+        store.set_views = original_views
 
 
 async def check_tenants():
@@ -3427,8 +3979,12 @@ async def check_money():
 
     # ---- панель владельца ----
     await panel.on_message(client, Message(client, 7102, owner, text="/start"))
-    check("в меню владельца есть деньги и клиенты", "money" in reply_cells() and "clients" in reply_cells(), str(reply_cells()))
+    check("главное меню владельца ведёт к управлению", "admin" in reply_cells()
+          and not {"money", "clients"} & set(reply_cells()), str(reply_cells()))
+    await panel.on_button(client, tap("admin", owner))
+    check("деньги и клиенты находятся в управлении", {"money", "clients", "main"} <= set(cells()), str(cells()))
     await panel.on_button(client, tap("money", owner))
+    check("из заявок можно вернуться к управлению", "admin" in cells(), str(cells()))
     check("экран заявок называет клиента и сумму", "клиент 5001" in text() and "600 ₽" in text(), text()[:220])
     check("у заявки есть два решения", "mpay|1" in cells() and "mno|1" in cells(), str(cells()))
     await panel.on_button(client, tap("mpay|1", owner))
@@ -3471,9 +4027,12 @@ async def check_money():
     await plain.start(777, "Витя")
     await plain.on_message(client, Message(client, 7107, owner, text="/start"))
     check("без базы кнопок про деньги нет", "money" not in reply_cells() and "clients" not in reply_cells(), str(reply_cells()))
+    await plain.on_button(client, tap("admin", owner))
+    check("без базы управление тоже не предлагает деньги и клиентов", not {"money", "clients"} & set(cells()), str(cells()))
     query = tap("money", owner)
     await plain.on_button(client, query)
-    check("старая кнопка без базы не роняет панель", "DATABASE_URL" in query.answers[-1][0], str(query.answers))
+    check("старая кнопка без базы не роняет панель", "Кабинеты клиентов пока не подключены" in query.answers[-1][0]
+          and query.answers[-1][1] is True and "DATABASE_URL" not in query.answers[-1][0], str(query.answers))
 
 
 async def check_liveness_signals():

@@ -1,13 +1,6 @@
-"""Личный кабинет клиента в том же боте.
+"""Личный кабинет одного канала: настройка, оплата и наблюдаемый результат.
 
-Владелец аккаунта видит своё меню, все остальные - кабинет: откуда брать
-посты, куда их выкладывать, переписывать ли текст, сколько просмотров, идут
-ли реакции. Всё живёт в базе, поэтому между перезапусками бот ничего не
-должен помнить сам.
-
-Тексты читаются как инструкция: нажал кнопку - получил, что сделать по шагам и
-что будет дальше. Служебных слов («склад», «тема», «донор») человек не видит:
-для него канал-источник и канал, куда посты ложатся.
+Настройки хранятся в базе; ожидание ввода и шаг запуска изолированы по пользователю.
 """
 
 import datetime
@@ -15,6 +8,8 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 import legal
+from pyrogram.errors import MessageNotModified
+
 from ai import cut
 from config import VIEWS_LIMIT, parse_views
 from store import MAX_DONORS, MAX_POSTS_PER_DAY, MIN_TOPUP, PLANS, StoreError, Tenant, parse_ref
@@ -25,18 +20,22 @@ log = logging.getLogger("cabinet")
 # 0 - не ошибка ввода, а осознанный выбор человека: просмотры не накручивать
 VIEWS_PRESETS = (0, 500, 1000, 2000, 5000)
 
-# порядок пошагового запуска: один экран - один шаг, «Дальше» ведёт по ним
-STEPS = ("donors", "channel", "text", "views", "plans")
+# Только обязательные настройки; текст, просмотры и реакции доступны отдельно.
+STEPS = ("channel", "donors", "plans")
 STEP_TITLES = {
-    "donors": "Откуда брать посты",
     "channel": "Куда публиковать",
-    "text": "Текст поста: переписывать или нет",
-    "views": "Просмотры на пост",
+    "donors": "Откуда брать посты",
     "plans": "Тариф и оплата",
 }
+FORMATS = (
+    "Поддерживаются текст, фото с подписью, видео с подписью или без неё, "
+    "альбомы фото и видео. Фото и фотоальбомы без подписи пропускаются. "
+    "У документов и других вложений переносится только текст."
+)
 
-# куда возвращаем человека, если он ошибся вводом
+# После ввода возвращаем шаг, а не теряем пошаговую навигацию.
 SCREENS = {"donor": "donors", "channel": "channel", "views": "views", "sum": "plans"}
+CANCEL_INPUT = {"donor": "cdonors", "channel": "cchannel", "sum": "cplans"}
 
 
 def date(value) -> str:
@@ -57,18 +56,19 @@ def ref_word(ref) -> str:
 
 def plan_line(tenant: Tenant, now: datetime.datetime) -> str:
     if not tenant.active(now):
-        return "⛔ не подключён - посты не публикуются"
-    return f"✅ активен ещё {tenant.days_left(now)} дн. (до {date(tenant.plan_until)})"
+        return "нет активного тарифа"
+    return f"активен ещё {tenant.days_left(now)} дн. (до {date(tenant.plan_until)})"
 
 
 def channel_line(tenant: Tenant) -> str:
     if not tenant.target:
-        return "⛔ не указан"
-    return f"{ref_word(tenant.target)} - {'✅ доступ подтверждён' if tenant.target_ok else '⏳ проверяю доступ'}"
+        return "не указан"
+    status = "доступ подтверждён" if tenant.target_ok else "доступ не подтверждён"
+    return f"{ref_word(tenant.target)} — {status}"
 
 
 def views_line(tenant: Tenant) -> str:
-    return f"{tenant.views} на каждый пост" if tenant.views else "не накручиваем (0)"
+    return f"заказывать {tenant.views} на каждый пост" if tenant.views else "не заказывать (0)"
 
 
 def add_row(buttons, row: List[Tuple[str, str]]):
@@ -82,6 +82,9 @@ class Cabinet:
     SHOW = {
         "chome": "home",
         "cstart": "wizard",
+        "cproject": "project",
+        "csettings": "settings",
+        "cterms": "agree",
         "cdonors": "donors",
         "cchannel": "channel",
         "ctext": "text",
@@ -97,6 +100,7 @@ class Cabinet:
         self.cfg = cfg
         self.store = store
         self.awaiting: Dict[int, Tuple[str, int]] = {}
+        self._input_version: Dict[int, int] = {}
         self.notice: Dict[int, str] = {}
         self.wizard: Dict[int, int] = {}
 
@@ -105,29 +109,43 @@ class Cabinet:
     async def on_message(self, message) -> None:
         user_id = message.chat.id
         text = (message.text or "").strip()
+        self._input_version[user_id] = self._input_version.get(user_id, 0) + 1
         kind, _ = self.awaiting.pop(user_id, ("", 0))
-        if kind and text and not text.startswith("/"):
+        if kind and not text.startswith("/"):
             await self._apply_text(message, kind, text)
             return
 
-        body, buttons = await self._view(user_id, await self._entry(user_id))
+        command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
+        self.wizard.pop(user_id, None)
+        if command == "/help":
+            screen = "guide"
+        elif command == "/cancel":
+            screen = "home"
+        else:
+            screen = await self._entry(user_id)
+        body, buttons = await self._view(user_id, screen)
         await call(message.reply, cut(body, TEXT_LIMIT), reply_markup=buttons)
 
     async def on_button(self, query) -> None:
         try:
             await self._route(query)
         except (StoreError, ValueError) as exc:
-            self._note(query.from_user.id, f"⚠ {exc}")
+            self._note(query.from_user.id, str(exc))
             await self._show(query, self._back_to(query))
         except Exception as exc:  # noqa: BLE001 - кнопка всегда должна чем-то ответить
             log.error("Кабинет: кнопка «%s» не сделалась: %s: %s", query.data, type(exc).__name__, exc)
-            await call(query.answer, f"Ошибка: {type(exc).__name__}", show_alert=True)
+            await call(query.answer, "Не удалось выполнить действие. Попробуй ещё раз.", show_alert=True)
 
     async def _entry(self, user_id: int) -> str:
-        """Новичок попадает сразу в пошаговый запуск, у настроенного - обычный кабинет."""
+        """Новый вход всегда начинает с первого незаполненного обязательного шага."""
         tenant = await self.store.ensure_tenant(user_id)
         donors = await self.store.list_donors(user_id)
-        return "wizard" if self._next_step(tenant, donors, now_utc()) == 0 else "home"
+        index = self._next_step(tenant, donors, now_utc())
+        if index < len(STEPS):
+            self.wizard[user_id] = index
+            return "wizard"
+        self.wizard.pop(user_id, None)
+        return "home"
 
     # ==== разбор кнопок ====
 
@@ -137,15 +155,31 @@ class Cabinet:
         key = parts[0]
         arg = parts[1] if len(parts) > 1 else ""
 
+        # Любая кнопка завершает старый ввод только этого пользователя.
+        # Новый ввод ниже включается явно, готовое число не оставляет ожидания.
+        version = self._input_version[user_id] = self._input_version.get(user_id, 0) + 1
+        self.awaiting.pop(user_id, None)
         if key == "cviews":
-            # раньше SHOW: у готовых кнопок числа есть arg, и он обязан примениться, а не открыть экран
+            self.wizard.pop(user_id, None)
+            self.awaiting[user_id] = ("views", 0)
             if arg:
                 await self._apply(user_id, "views", arg)
-            else:
-                self.awaiting[user_id] = ("views", 0)
+                if self._input_version.get(user_id) == version:
+                    self.awaiting.pop(user_id, None)
             await self._show(query, "views")
+        elif key == "cstart":
+            await self._entry(user_id)
+            await self._show(query, "wizard")
         elif key in self.SHOW:
-            await self._show(query, self.SHOW[key])
+            screen = self.SHOW[key]
+            index = self.wizard.get(user_id, len(STEPS))
+            # Возврат из ввода/оплаты сохраняет текущий шаг. Другая навигация
+            # выходит из запуска, чтобы старые кнопки не навязывали его позже.
+            if index >= len(STEPS) or screen not in (
+                STEPS[index], "agree" if STEPS[index] == "plans" else ""
+            ):
+                self.wizard.pop(user_id, None)
+            await self._show(query, screen)
         elif key == "cset_target":
             self.awaiting[user_id] = ("channel", 0)
             await self._show(query, "target")
@@ -153,7 +187,22 @@ class Cabinet:
             self.awaiting[user_id] = ("donor", 0)
             await self._show(query, "add")
         elif key == "cnext":
-            self.wizard[user_id] = await self._step(user_id) + 1
+            index = await self._step(user_id)
+            tenant = await self.store.ensure_tenant(user_id)
+            donors = await self.store.list_donors(user_id)
+            missing = self._next_step(tenant, donors, now_utc())
+            if index < len(STEPS) and missing == index:
+                self._note(user_id, {
+                    "channel": "Сначала укажи канал, куда публиковать.",
+                    "donors": "Сначала добавь хотя бы один канал-источник.",
+                    "plans": "Сначала подключи тариф. Заявка на пополнение ещё не означает оплату тарифа.",
+                }[STEPS[index]])
+            else:
+                index = min(index + 1, len(STEPS))
+            self.wizard[user_id] = index
+            await self._show(query, "wizard")
+        elif key == "cprev":
+            self.wizard[user_id] = max(0, await self._step(user_id) - 1)
             await self._show(query, "wizard")
         elif key == "ctopup":
             tenant = await self.store.ensure_tenant(user_id)
@@ -163,7 +212,8 @@ class Cabinet:
             self.awaiting[user_id] = ("sum", 0)
             await self._show(query, "sum")
         elif key == "cdoc":
-            await self._send_document(query, int(arg or 0))
+            parent = parts[2] if len(parts) > 2 else "guide"
+            await self._send_document(query, int(arg or 0), parent)
         elif key == "cdel":
             await self._remove_donor(query, int(arg or 0))
         elif key == "creactions":
@@ -174,38 +224,40 @@ class Cabinet:
             await self._buy(query, arg)
         elif key == "cagree":
             await self.store.set_agreed(user_id)
-            self._note(user_id, "✅ Спасибо, условия приняты.")
+            self._note(user_id, "Условия приняты. Можно перейти к оплате.")
             await self._show(query, "plans")
         else:
-            await call(query.answer, "Такой кнопки нет - нажми «⬅️ Кабинет».")
+            await call(query.answer, "Такой кнопки нет — открой «Личный кабинет» через /start.")
 
-    async def _send_document(self, query, kind: int) -> None:
-        """Документ приходит отдельными сообщениями: длинный текст не влезает в одно, а терять куски нельзя."""
+    async def _send_document(self, query, kind: int, parent: str = "guide") -> None:
+        """Старые ссылки на документы работают; новые помнят родительский экран."""
         title, pages = legal.document(kind)
+        back = {"guide": "cguide", "plans": "cplans", "agree": "cterms"}.get(parent, "cguide")
         await call(query.answer, title)
         for index, page in enumerate(pages):
             text = f"{title}\n\n{page}" if index == 0 else page
-            buttons = markup([("⬅️ Кабинет", "chome")]) if index == len(pages) - 1 else None
+            buttons = markup([("Назад", back)]) if index == len(pages) - 1 else None
             await call(self.client.send_message, query.message.chat.id, cut(text, TEXT_LIMIT), reply_markup=buttons)
 
     async def _remove_donor(self, query, position: int) -> None:
         donors = await self.store.list_donors(query.from_user.id)
         if not 1 <= position <= len(donors):
-            self._note(query.from_user.id, "⚠ Этот канал уже убран.")
+            self._note(query.from_user.id, "Этот источник уже удалён.")
         else:
             donor = donors[position - 1]
             await self.store.remove_donor(query.from_user.id, donor.ref)
-            self._note(query.from_user.id, f"✅ Убрал {ref_word(donor.ref)}.")
+            self._note(query.from_user.id, f"Источник {ref_word(donor.ref)} удалён.")
         await self._show(query, "donors")
 
     async def _toggle_reactions(self, query) -> None:
         tenant = await self.store.ensure_tenant(query.from_user.id)
-        await self.store.set_reactions(tenant.id, not tenant.reactions)
+        turned_on = not tenant.reactions
+        await self.store.set_reactions(tenant.id, turned_on)
         self._note(
             tenant.id,
-            "✨ Реакции включены: каждый новый пост канала встаёт в очередь на бесплатный заказ."
-            if not tenant.reactions
-            else "✨ Реакции выключены - заказы не отправляю, посты публикуются как раньше.",
+            ("Заказ реакций включён. Доставка реакций не гарантируется."
+             if self.cfg.reactions_enabled else "Выбор сохранён, но сервис реакций сейчас выключен.")
+            if turned_on else "Заказ реакций выключен. Настройка публикации не изменилась.",
         )
         await self._show(query, "reactions")
 
@@ -214,15 +266,11 @@ class Cabinet:
         turned_on = not tenant.rewrite
         await self.store.set_rewrite(tenant.id, turned_on)
         if not turned_on:
-            self._note(tenant.id, "✏️ Выключил: пост выходит теми же словами, что написал автор канала-источника.")
-        elif self.cfg.ai_enabled:
-            self._note(tenant.id, "✏️ Включил: каждый пост переписывается своими словами - он не совпадает с оригиналом.")
+            self._note(tenant.id, "Выбран текст автора без переписывания.")
+        elif self._ai_ready:
+            self._note(tenant.id, "Выбрано переписывание текста нейросетью.")
         else:
-            self._note(
-                tenant.id,
-                "✏️ Переписывание включено и сохранено. Сейчас нейросеть выключена общей "
-                "настройкой на стороне сервиса, поэтому пост выходит словами автора.",
-            )
+            self._note(tenant.id, "Выбор переписывания сохранён. Нейросеть сейчас недоступна — используется текст автора.")
         await self._show(query, "text")
 
     async def _buy(self, query, kind: str) -> None:
@@ -234,29 +282,37 @@ class Cabinet:
             await self._show(query, "agree")
             return
         if not tenant.target:
-            self._note(tenant.id, "⚠ Сначала укажи канал, куда постить - шаг 2.")
+            self._note(tenant.id, "Сначала укажи канал, куда публиковать — первый шаг настройки.")
+            if tenant.id in self.wizard:
+                self.wizard[tenant.id] = 0
             await self._show(query, "channel")
             return
         await self.store.buy(tenant.id, kind)
         price = PLANS[kind]["price"]
-        self._note(tenant.id, f"✅ {PLANS[kind]['title']} подключён за {price} ₽.")
-        await self._show(query, "home", flash=f"-{price} ₽")
+        self._note(tenant.id, f"{PLANS[kind]['title']} подключён за {price} ₽.")
+        await self._show(query, "plans", flash=f"-{price} ₽")
 
     # ==== ввод текстом ====
 
     async def _apply_text(self, message, kind: str, text: str) -> None:
         user_id = message.chat.id
+        screen = SCREENS.get(kind, "home")
+        version = self._input_version.get(user_id, 0)
         try:
             await self._apply(user_id, kind, text)
-            screen = SCREENS.get(kind, "home")
         except (StoreError, ValueError) as exc:
-            self._note(user_id, f"⚠ {exc}")
-            screen = SCREENS.get(kind, "home")
+            if self._input_version.get(user_id, 0) == version:
+                self.awaiting[user_id] = (kind, 0)
+            self._note(user_id, f"{exc}\nПовтори ввод сообщением или нажми «Отмена».")
         except Exception as exc:  # noqa: BLE001 - ввод клиента не роняет бота
             log.error("Кабинет: действие из текста упало: %s: %s", type(exc).__name__, exc)
-            self._note(user_id, f"⚠ Ошибка: {type(exc).__name__}")
-            screen = "home"
+            self._note(user_id, "Не удалось выполнить действие. Проверь результат перед повторной попыткой.")
 
+        if self._input_version.get(user_id, 0) != version:
+            note = self.notice.pop(user_id, "")
+            if note:
+                await call(message.reply, cut(note, TEXT_LIMIT))
+            return
         body, buttons = await self._view(user_id, screen)
         await call(message.reply, cut(body, TEXT_LIMIT), reply_markup=buttons)
 
@@ -264,42 +320,30 @@ class Cabinet:
         if kind == "channel":
             ref = self._public_ref(text)
             await self.store.set_target(user_id, str(ref), ref if isinstance(ref, int) else None, "")
-            self._note(
-                user_id,
-                f"✅ Канал {ref_word(ref)} записал. Проверю, пускает ли рабочего аккаунта,"
-                "\nи поставлю отметку в «📊 Результат» - обычно это пара минут.",
-            )
+            self._note(user_id, f"Канал {ref_word(ref)} сохранён. Доступ ещё не подтверждён; статус — в «Результат».")
         elif kind == "donor":
             donor = await self.store.add_donor(user_id, parse_ref(text))
-            self._note(
-                user_id,
-                f"✅ Добавил {ref_word(donor.ref)}: буду читать этот канал.\n"
-                "Бот подпишется сам и начнёт ловить каждый новый пост этого канала.",
-            )
+            self._note(user_id, f"Источник {ref_word(donor.ref)} добавлен. Рабочий аккаунт попробует подписаться на него.")
         elif kind == "views":
             number = parse_views(text, low=0)
             await self.store.set_views(user_id, number)
             self._note(
                 user_id,
-                f"✅ Просмотры: {number} на каждый пост."
+                f"Сохранено: заказывать {number} просмотров на пост. Фактическое число не гарантируется."
                 if number
-                else "✅ Просмотры не накручиваем - посты будут выходить без них.",
+                else "Сохранено: не заказывать просмотры.",
             )
         elif kind == "sum":
             request_id = await self.store.request_topup(user_id, self._rubles(text))
-            self._note(
-                user_id,
-                f"✅ Заявка №{request_id} принята. Посмотрю платёж и начислю сумму на баланс -"
-                "\nтогда и купишь тариф.",
-            )
+            self._note(user_id, f"Заявка №{request_id} принята и ждёт проверки платежа. После зачисления можно купить тариф.")
 
     @staticmethod
     def _public_ref(text: str):
         """Ссылка на канал клиента: закрытый адрес вида t.me/c/... не годится - по нему сервисы пост не найдут."""
         if "t.me/c/" in (text or "").lower():
             raise ValueError(
-                "Это закрытый канал - по такой ссылке ни промо-бот, ни реакции пост не увидят.\n"
-                "Открой свой канал → Изменить → Публичная ссылка и пришли адрес вида @name или https://t.me/name."
+                "Ссылка t.me/c/... не подходит для этой настройки.\n"
+                "Открой канал → Изменить → Публичная ссылка и пришли @name или https://t.me/name."
             )
         return parse_ref(text)
 
@@ -314,28 +358,73 @@ class Cabinet:
 
     @staticmethod
     def _next_step(tenant: Tenant, donors: List, now: datetime.datetime) -> int:
-        """С какого шага начинать: просмотры и переписывание - не преграда, там всё уже выбрано по умолчанию."""
-        if not donors:
-            return 0
+        """Заполнение шагов не равнозначно подтверждённому доступу или публикации."""
         if not tenant.target:
+            return 0
+        if not donors:
             return 1
         if not tenant.active(now):
-            return STEPS.index("plans")
+            return 2
         return len(STEPS)
 
     async def _step(self, user_id: int) -> int:
         tenant = await self.store.ensure_tenant(user_id)
         donors = await self.store.list_donors(user_id)
-        return self.wizard.get(user_id, self._next_step(tenant, donors, now_utc()))
+        missing = self._next_step(tenant, donors, now_utc())
+        # Можно вернуться назад, но нельзя оказаться за незаполненным шагом.
+        return min(max(0, self.wizard.get(user_id, missing)), missing)
 
     # ==== экраны ====
 
     async def _view(self, user_id: int, kind: str) -> Tuple[str, object]:
+        index = self.wizard.get(user_id, len(STEPS))
+        step = STEPS[index] if 0 <= index < len(STEPS) else ""
+        children = {"channel": {"target"}, "donors": {"add"}, "plans": {"sum", "agree"}}
+        if kind == "wizard" or (step and kind == step):
+            tenant = await self.store.ensure_tenant(user_id)
+            body, buttons = await self._wizard_view(user_id, tenant, now_utc())
+        else:
+            if kind not in children.get(step, set()):
+                self.wizard.pop(user_id, None)
+            body, buttons = await self._screen_view(user_id, kind)
+
+        waiting, _ = self.awaiting.get(user_id, ("", 0))
+        if waiting in CANCEL_INPUT and kind == SCREENS[waiting]:
+            buttons = add_row(buttons, [("Отмена", CANCEL_INPUT[waiting])])
+        return body, buttons
+
+    async def _screen_view(self, user_id: int, kind: str) -> Tuple[str, object]:
+        """Содержимое экранов без оболочки пошагового запуска."""
         tenant = await self.store.ensure_tenant(user_id)
         now = now_utc()
 
-        if kind == "wizard":
-            return await self._wizard_view(user_id, tenant, now)
+        if kind == "project":
+            donors = await self.store.list_donors(user_id)
+            return self._notice(
+                user_id,
+                f"Мой канал\n\nКанал: {channel_line(tenant)}\n"
+                f"Источников: {len(donors)} из {MAX_DONORS}\n\n"
+                "Здесь настраивается один канал публикации.",
+            ), markup(
+                [("Куда публиковать", "cchannel")],
+                [("Откуда брать посты", "cdonors")],
+                [("Настройки", "csettings")],
+                [("Назад: Личный кабинет", "chome")],
+            )
+
+        if kind == "settings":
+            return self._notice(
+                user_id,
+                f"Настройки канала\n\nТекст: {self._text_line(tenant)}\n"
+                f"Просмотры: {views_line(tenant)}\n"
+                f"Заказ реакций: {self._reaction_setting(tenant)}\n\n"
+                "Это выбранные настройки, не подтверждение результата.",
+            ), markup(
+                [("Текст постов", "ctext")],
+                [("Просмотры", "cviews")],
+                [("Реакции", "cboost")],
+                [("Назад: Мой канал", "cproject")],
+            )
 
         if kind == "donors":
             return await self._donors_view(user_id, tenant)
@@ -343,103 +432,65 @@ class Cabinet:
         if kind == "add":
             return self._notice(
                 user_id,
-                "Пришли ссылку на канал-источник.\n\n"
-                "Где её взять: открой нужный канал, нажми на его название - в адресе будет\n"
-                "@name или https://t.me/name. Скопируй и пришли сюда одним сообщением.\n\n"
-                f"Сколько можно: до {MAX_DONORS} каналов. Бот подпишется на них сам, и через\n"
-                "пару минут начнёт ловить каждый новый пост этого канала.",
-            ), markup([("⬅️ К списку каналов", "cdonors")])
+                "Добавить источник\n\nПришли @name или https://t.me/name одним сообщением.\n"
+                f"Можно добавить до {MAX_DONORS} источников. Рабочий аккаунт сам подписывается на них; "
+                "доступ подтверждается отдельно.",
+            ), markup([("Отмена", "cdonors")])
 
         if kind == "channel":
             return self._notice(
                 user_id,
-                "Что сделать:\n"
-                "1. Добавь рабочего аккаунта в администраторы своего канала:\n"
-                f"   {self.worker}\n"
-                "   Нужны два права: публиковать сообщения и оставлять реакции.\n"
-                "2. Нажми «📤 Указать мой канал» и пришли ссылку на него:\n"
-                "   @name или https://t.me/name.\n\n"
-                "Как поймёшь, что всё готово:\n"
-                "Появится «✅ доступ подтверждён» - с этого момента каждый новый пост из\n"
-                "каналов-источников выходит в твоём канале. Проверка занимает пару минут.\n\n"
-                f"Сейчас: {channel_line(tenant)}",
+                "Куда публиковать\n\n"
+                f"Добавь рабочего аккаунта {self.worker} в администраторы своего канала.\n"
+                "Нужны права публиковать сообщения и оставлять реакции. Затем укажи ссылку на канал.\n\n"
+                f"Сейчас: {channel_line(tenant)}\n"
+                "Сохранение ссылки не подтверждает доступ. Его статус — в «Результат».",
             ), markup(
-                [("📤 Указать мой канал", "cset_target")],
-                [("📊 Результат", "cresult")],
-                [("⬅️ Кабинет", "chome")],
+                [("Указать мой канал", "cset_target")],
+                [("Назад: Мой канал", "cproject")],
             )
 
         if kind == "target":
             return self._notice(
                 user_id,
-                "Пришли ссылку на свой канал: @name или https://t.me/name.\n\n"
-                "Канал должен быть публичным - с именем. Закрытая ссылка вида t.me/c/... не\n"
-                "подойдёт: по ней ни промо-бот, ни сервис реакций пост не найдут.\n"
-                "Публичную ссылку задают в настройках канала: Изменить → Публичная ссылка.\n\n"
+                "Пришли ссылку на свой публичный канал: @name или https://t.me/name.\n"
+                "Ссылка t.me/c/... не подходит. Публичный адрес задаётся в настройках канала.\n\n"
                 f"Сейчас: {channel_line(tenant)}",
-            ), markup([("⬅️ К шагу 2", "cchannel")])
+            ), markup([("Отмена", "cchannel")])
 
         if kind == "text":
             return self._notice(
                 user_id,
-                "Что сделать:\n"
-                "Выбери одним переключателем ниже, что делать с текстом чужого поста.\n\n"
-                "Как это работает:\n"
-                "• Переписывать - бот просит нейросеть написать тот же смысл другими\n"
-                "   словами. Пост перестаёт совпадать с оригиналом, картинка остаётся та же.\n"
-                "• Словами автора - бот публикует текст точно как в канале-источнике.\n\n"
-                "Что выбрать:\n"
-                "Если не хочешь, чтобы в твоём канале лежали чужие тексты слово в слово,\n"
-                "оставь переписывание. Если важен оригинальный текст - выключи.\n\n"
+                "Текст постов\n\nМожно оставить слова автора или поручить нейросети переписать текст. "
+                "Если нейросеть недоступна, используется текст автора; твой выбор сохраняется.\n\n"
                 f"Сейчас: {self._text_line(tenant)}",
-            ), markup(
-                [self._text_cell(tenant)],
-                [("📊 Результат", "cresult")],
-                [("⬅️ Кабинет", "chome")],
-            )
+            ), markup([self._text_cell(tenant)], [("Назад: Настройки", "csettings")])
 
         if kind == "views":
             presets = [
-                [("не накручивать (0)" if count == 0 else str(count), f"cviews|{count}") for count in VIEWS_PRESETS[:3]],
+                [("Не заказывать (0)" if count == 0 else str(count), f"cviews|{count}") for count in VIEWS_PRESETS[:3]],
                 [(str(count), f"cviews|{count}") for count in VIEWS_PRESETS[3:]],
             ]
+            waiting = self.awaiting.get(user_id, ("", 0))[0] == "views"
+            rows = presets if waiting else presets + [[("Ввести другое число", "cviews")]]
             return self._notice(
                 user_id,
-                "Сколько хочешь, столько и ставь.\n\n"
-                "Что сделать:\n"
-                f"1. Напиши одним числом, сколько просмотров добавлять к каждому посту - от 0\n"
-                f"   до {VIEWS_LIMIT}. Ноль значит «просмотры не накручивать».\n"
-                "   Или выбери готовое кнопкой.\n\n"
-                "Что будет дальше:\n"
-                "Сразу после публикации поста бот отправляет это число боту продвижения.\n"
-                "Сколько назвал - столько и будет на каждом новом посте. Менять можно в\n"
-                "любой момент, число остаётся в кабинете.\n\n"
+                "Просмотры\n\n"
+                f"Число для заказа на новый пост: от 0 до {VIEWS_LIMIT}. Ноль — не заказывать.\n"
+                + ("Пришли число сообщением или выбери кнопкой.\n\n" if waiting
+                   else "Выбери число кнопкой или нажми «Ввести другое число».\n\n")
+                + "Это запрос внешнему сервису, а не гарантия количества просмотров.\n"
                 f"Сейчас: {views_line(tenant)}",
-            ), markup(*presets, [("📊 Результат", "cresult")], [("⬅️ Кабинет", "chome")])
+            ), markup(*rows, [("Отмена" if waiting else "Назад: Настройки", "csettings")])
 
         if kind == "reactions":
             return self._notice(
                 user_id,
-                "Что делает: бесплатно ставит реакции под каждый новый пост твоего канала.\n\n"
-                "Обязательное условие:\n"
-                "В настройках канала должны быть разрешены ВСЕ реакции. Если часть эмодзи\n"
-                "запрещена, сервис не поставит ни одной - это настройка канала, изменить её\n"
-                "бот не может: канал → Изменить → Реакции.\n\n"
-                "Как устроено:\n"
-                "Каждый новый пост встаёт в очередь отдельно и ждёт своего окна: заказы\n"
-                "идут раз в 5 минут. Если сервис отвечает словами про лимит, бот не ждёт\n"
-                "час, а пробует тот же пост ещё раз в следующем окне. Сам заказ идёт около\n"
-                "6 минут: столько сервис требует, чтобы страница была открыта.\n\n"
-                "Как проверить, что работает:\n"
-                "Бот считает реакции до заказа и после, поэтому в «📊 Результат» видно\n"
-                "конкретное число - добавил сервис что-то или нет.\n\n"
-                f"Сейчас: {'реакции включены' if tenant.reactions else 'реакции выключены'}."
-                f"\n{tenant.reactions_phrase()}",
-            ), markup(
-                [self._reactions_cell(tenant)],
-                [("📊 Результат", "cresult")],
-                [("⬅️ Кабинет", "chome")],
-            )
+                "Реакции\n\nЗаказы для новых постов обрабатываются очередью. Доставка и сроки не гарантируются.\n"
+                "Для заказа разреши все реакции: канал → Изменить → Реакции.\n\n"
+                f"Заказ реакций: {self._reaction_setting(tenant)}.\n"
+                f"{self._reactions_line(tenant)}",
+            ), markup([self._reactions_cell(tenant)], [("Назад: Настройки", "csettings")])
 
         if kind == "result":
             return await self._result_view(user_id, tenant, now)
@@ -447,68 +498,57 @@ class Cabinet:
         if kind == "guide":
             return self._notice(
                 user_id,
-                "Что делает каждая кнопка\n\n"
-                "🚀 Пошаговый запуск - пять шагов по порядку, от ссылок до тарифа.\n"
-                f"1️⃣ Откуда брать посты - каналы, которые читаем. До {MAX_DONORS} штук.\n"
-                "2️⃣ Куда публиковать - твой канал и как добавить рабочего аккаунта.\n"
-                "3️⃣ Текст поста - переписывать чужой текст своими словами или публиковать как есть.\n"
-                f"4️⃣ Просмотры - число от 0 до {VIEWS_LIMIT} на каждый пост. 0 - не накручивать.\n"
-                "5️⃣ Тариф - цена, баланс, оплата и срок подписки.\n"
-                "✨ Реакции - бесплатная накрутка реакций, включается и выключается.\n"
-                "📊 Результат - видно, работает ли всё сейчас и что нажать, если нет.\n"
-                "📄 Соглашение и 🔒 Политика - документы сервиса, читаются прямо в боте.\n\n"
-                f"Рабочий аккаунт, которого нужно добавить в администраторы: {self.worker}\n\n"
-                "Дальше ничего нажимать не нужно: посты выходят сами, как только у источника\n"
-                "появляется новый текст. Проверить - кнопка «📊 Результат».",
+                "Помощь\n\nНастройка: куда публиковать → откуда брать посты → тариф.\n"
+                "В «Мой канал» можно менять канал и источники; в «Настройки» — текст, просмотры и реакции.\n"
+                "«Результат» показывает известные статусы и последний пост, не обещание новых публикаций.\n\n"
+                f"{FORMATS}\n\n"
+                f"Рабочий аккаунт: {self.worker}. Он подписывается на источники; "
+                "в твоём канале ему нужны права администратора: публиковать сообщения и оставлять реакции.",
             ), markup(
-                [("🚀 Пошаговый запуск", "cstart")],
-                [("📊 Результат", "cresult")],
-                [("⬅️ Кабинет", "chome")],
+                [("Настроить канал", "cstart")],
+                [("Соглашение", "cdoc|1|guide"), ("Политика", "cdoc|2|guide")],
+                [("Назад: Личный кабинет", "chome")],
             )
 
         if kind == "plans":
+            payments = await self.store.list_payments(user_id, 3)
+            history = "\n\nПоследние оплаты:\n" + "\n".join(self._payment_line(row) for row in payments) if payments else ""
             return self._notice(
                 user_id,
-                "Сколько стоит\n\n"
-                f"• Неделя - {PLANS['week']['price']} ₽ ({PLANS['week']['days']} дней)\n"
-                f"• Месяц - {PLANS['month']['price']} ₽ ({PLANS['month']['days']} дней) - выходит дешевле\n\n"
-                "Что входит в один кабинет:\n"
-                f"свой канал, до {MAX_DONORS} каналов-источников, до {MAX_POSTS_PER_DAY} постов в сутки,\n"
-                f"просмотры до {VIEWS_LIMIT} на пост и бесплатные реакции.\n\n"
-                f"На балансе: {tenant.balance} ₽\n"
-                f"Тариф: {plan_line(tenant, now)}\n\n"
-                "Как платить:\n"
-                "1. «Пополнить баланс» - напиши сумму цифрами и переведи по реквизитам.\n"
-                "2. Я проверю платёж и положу деньги на баланс.\n"
-                "3. «Купить неделю» или «Купить месяц» - сумма спишется с баланса.\n"
-                "Дни текущей подписки не сгорают: покупка добавляется к остатку.",
+                "Тариф и оплата\n\n"
+                f"Неделя — {PLANS['week']['price']} ₽ ({PLANS['week']['days']} дней)\n"
+                f"Месяц — {PLANS['month']['price']} ₽ ({PLANS['month']['days']} дней)\n"
+                f"Один канал, до {MAX_DONORS} источников, до {MAX_POSTS_PER_DAY} постов в сутки.\n"
+                "Настройки просмотров и реакций не гарантируют их получение.\n\n"
+                f"Баланс: {tenant.balance} ₽\nТариф: {plan_line(tenant, now)}\n\n"
+                "Пополнение проверяется вручную. После зачисления выбери тариф — стоимость спишется с баланса. "
+                "Покупка добавляет дни к оставшемуся сроку."
+                + history,
             ), markup(
                 [(f"Купить неделю {PLANS['week']['price']} ₽", "cbuy|week")],
                 [(f"Купить месяц {PLANS['month']['price']} ₽", "cbuy|month")],
-                [("💳 Пополнить баланс", "ctopup")],
-                [("📄 Соглашение", "cdoc|1"), ("🔒 Политика", "cdoc|2")],
-                [("📊 Результат", "cresult")],
-                [("⬅️ Кабинет", "chome")],
+                [("Пополнить баланс", "ctopup")],
+                [("Соглашение", "cdoc|1|plans"), ("Политика", "cdoc|2|plans")],
+                [("Назад: Личный кабинет", "chome")],
             )
 
         if kind == "sum":
             return self._notice(
                 user_id,
-                "Напиши, сколько перевёл - одним числом, например 600.\n\n"
-                f"{self.cfg.payment_details or 'Реквизиты пришлю здесь же - нажми «🆘 Помощь».'}\n\n"
-                f"Меньше {MIN_TOPUP} ₽ заявку не делаю. Начислю на баланс, как только увижу платёж,\n"
-                "и напишу тебе в этот чат.",
-            ), markup([("🆘 Помощь", "cguide")], [("⬅️ Кабинет", "chome")])
+                "Пополнение баланса\n\n"
+                f"{self.cfg.payment_details or 'Реквизиты пока не указаны. Запроси их у владельца сервиса.'}\n\n"
+                f"После перевода пришли сумму одним числом, от {MIN_TOPUP} ₽. "
+                "Заявка поступит на проверку, зачисление не мгновенное.",
+            ), markup([("Отмена", "cplans")])
 
         if kind == "agree":
-            return (
-                "Перед оплатой - документы сервиса.\n"
-                "Прочитай их кнопками ниже: соглашение и политика конфиденциальности.",
-                markup(
-                    [("📄 Соглашение", "cdoc|1"), ("🔒 Политика", "cdoc|2")],
-                    [("✅ Принимаю условия", "cagree")],
-                    [("⬅️ Кабинет", "chome")],
-                ),
+            return self._notice(
+                user_id,
+                "Перед оплатой прочитай соглашение и политику конфиденциальности.",
+            ), markup(
+                [("Соглашение", "cdoc|1|agree"), ("Политика", "cdoc|2|agree")],
+                [("Принимаю условия", "cagree")],
+                [("Отмена", "cplans")],
             )
 
         return await self._home_view(user_id, tenant, now)
@@ -518,188 +558,189 @@ class Cabinet:
     async def _home_view(self, user_id: int, tenant: Tenant, now: datetime.datetime) -> Tuple[str, object]:
         donors = await self.store.list_donors(user_id)
         bound = sum(1 for donor in donors if donor.chat_id)
-        ready = bool(donors) and bool(tenant.target) and tenant.active(now)
+        posts = await self.store.posts_today(user_id)
+        blocker = self._blocker(tenant, donors, bound, posts)
         lines = [
-            "🚀 АвтоПост - твой канал на автопилоте",
+            "Личный кабинет",
             "",
-            "Бот читает каналы, которые ты укажешь, и выкладывает их посты в твой канал.",
-            f"Текст поста: {self._text_line(tenant)}. Следом добавляет просмотры и реакции.",
-            "Переписывание, просмотры и реакции включаются и выключаются по отдельности.",
-            "",
-            f"1️⃣ Откуда брать посты: {len(donors)} из {MAX_DONORS} (читаю {bound})",
-            f"2️⃣ Куда публиковать: {channel_line(tenant)}",
-            f"3️⃣ Текст поста: {self._text_line(tenant)}",
-            f"4️⃣ Просмотры: {views_line(tenant)}",
-            f"5️⃣ Тариф: {plan_line(tenant, now)}",
+            f"Канал: {channel_line(tenant)}",
+            f"Состояние: {blocker[0]}" if blocker else "Состояние: канал подключён, автопубликация настроена.",
+            f"Дальше: {blocker[1]}" if blocker else "Дальше: проверь свежие публикации в «Результат».",
+            f"Последний пост: {tenant.last_post_phrase(now)}",
         ]
-        payments = await self.store.list_payments(user_id, 3)
-        if payments:
-            lines.append("")
-            lines.append("Последнее по оплате:")
-            lines += [f"• {self._payment_line(row)}" for row in payments]
-        lines += [
-            "",
-            "Нажми «🚀 Пошаговый запуск» - проведу по шагам по очереди."
-            if not ready
-            else "Всё настроено - посты идут сами. «📊 Результат» покажет, что происходит.",
-        ]
-        rows = (
-            [[("🚀 Пошаговый запуск", "cstart")]]
-            if not ready
-            else [[("📊 Результат", "cresult"), self._reactions_cell(tenant)]]
-        )
-        return self._notice(user_id, "\n".join(lines)), markup(
-            *rows,
-            [("1️⃣ Откуда брать посты", "cdonors"), ("2️⃣ Куда публиковать", "cchannel")],
-            [("3️⃣ Текст поста", "ctext"), ("4️⃣ Просмотры", "cviews")],
-            [("5️⃣ Тариф", "cplans")],
-            [("🆘 Помощь", "cguide")],
-            [("📄 Соглашение", "cdoc|1"), ("🔒 Политика", "cdoc|2")],
-        )
+        rows = [[("Мой канал", "cproject")], [("Результат", "cresult")],
+                [("Тариф и оплата", "cplans")], [("Помощь", "cguide")]]
+        if self._next_step(tenant, donors, now) < len(STEPS):
+            rows.insert(0, [("Настроить канал", "cstart")])
+        return self._notice(user_id, "\n".join(lines)), markup(*rows)
 
     def _payment_line(self, row: dict) -> str:
         title = PLANS.get(row.get("kind"), {}).get("title", "Пополнение")
-        status = "" if row.get("status") == "done" else " (ждёт проверки)"
+        status = {"done": "", "pending": " (ждёт проверки)", "rejected": " (отклонено)"}.get(
+            row.get("status"), " (статус не указан)"
+        )
         return f"{title} {row.get('amount_rub')} ₽ {date(row.get('created_at'))}{status}".strip()
 
     async def _donors_view(self, user_id: int, tenant: Tenant) -> Tuple[str, object]:
         donors = await self.store.list_donors(user_id)
         lines = [
-            "Что сделать:\n"
-            "1. Открой канал, чьи посты тебе нравятся.\n"
-            "2. Нажми «➕ Добавить канал» и пришли на него ссылку:\n"
-            "   @name или https://t.me/name.\n"
-            f"3. Повтори для каждого интересного канала - вместе до {MAX_DONORS} штук.\n\n"
-            "Что будет дальше:\n"
-            "Бот сам подпишется на эти каналы и поймает каждый новый пост, в котором\n"
-            "есть текст. Пост с картинкой выйдет с картинкой, пост без картинки -\n"
-            "текстом. Ничего скачивать и загружать тебе не нужно.\n\n"
-            f"Сейчас в списке: {len(donors)} из {MAX_DONORS}.",
+            "Откуда брать посты\n\n"
+            f"Добавь до {MAX_DONORS} каналов-источников. Рабочий аккаунт сам подписывается на них.\n"
+            f"{FORMATS}\n\n"
+            f"Источников: {len(donors)} из {MAX_DONORS}.",
         ]
         for donor in donors:
-            lines.append(f"• {ref_word(donor.ref)} - " + ("✅ читаем" if donor.chat_id else "⏳ подписываюсь"))
-        rows = [[(f"🗑 {ref_word(donor.ref)[:22]}", f"cdel|{index}")] for index, donor in enumerate(donors, 1)]
+            status = "подключён" if donor.chat_id else "доступ не подтверждён"
+            lines.append(f"{ref_word(donor.ref)} — {status}")
+        rows = [[(f"Удалить {ref_word(donor.ref)[:22]}", f"cdel|{index}")] for index, donor in enumerate(donors, 1)]
         return self._notice(user_id, "\n".join(lines)), markup(
-            [("➕ Добавить канал", "cadd")],
-            *rows,
-            [("📊 Результат", "cresult")],
-            [("⬅️ Кабинет", "chome")],
+            [("Добавить источник", "cadd")], *rows, [("Назад: Мой канал", "cproject")],
         )
 
     async def _result_view(self, user_id: int, tenant: Tenant, now: datetime.datetime) -> Tuple[str, object]:
-        """Экран «идёт / не идёт»: одна причина, что делать, и все числа по порядку."""
+        """Наблюдаемые данные отдельно от выбранных настроек."""
         donors = await self.store.list_donors(user_id)
         bound = sum(1 for donor in donors if donor.chat_id)
         posts = await self.store.posts_today(user_id)
         blocker = self._blocker(tenant, donors, bound, posts)
-        lines = ["📊 Результат", ""]
+        lines = ["Результат", ""]
         if blocker:
-            lines += [f"⛔ Сейчас не идёт: {blocker[0]}", f"   Что сделать: {blocker[1]}", ""]
+            lines += [f"Состояние: {blocker[0]}", f"Дальше: {blocker[1]}", ""]
         else:
-            lines += ["✅ Всё идёт - посты выходят сами.", ""]
+            lines += ["Канал подключён, автопубликация настроена. Последний опубликованный пост указан ниже.", ""]
         lines += [
             f"Канал: {channel_line(tenant)}",
-            f"Каналы, откуда берём посты: {len(donors)} (читаю {bound})",
+            f"Источников: {len(donors)} (подключено {bound})",
             f"Постов сегодня: {posts} из {MAX_POSTS_PER_DAY}",
             f"Последний пост: {tenant.last_post_phrase(now)}",
-            f"Текст поста: {self._text_line(tenant)}",
+            f"Реакции: {self._reactions_line(tenant)}",
+            "",
+            "Настройки:",
+            f"Текст: {self._text_line(tenant)}",
             f"Просмотры: {views_line(tenant)}",
-            f"Реакции: {'включены' if tenant.reactions else 'выключены'} - {tenant.reactions_phrase()}",
+            f"Заказ реакций: {self._reaction_setting(tenant)}",
             f"Тариф: {plan_line(tenant, now)}",
         ]
         if donor_problems := [ref_word(donor.ref) for donor in donors if not donor.chat_id]:
-            lines += ["", "Не открылись: " + ", ".join(donor_problems[:5]), "   Проверь ссылку или убери канал кнопкой 🗑."]
+            lines += ["", "Доступ к источникам не подтверждён: " + ", ".join(donor_problems[:5])]
         return self._notice(user_id, "\n".join(lines)), markup(
-            [("1️⃣ Откуда брать посты", "cdonors"), ("2️⃣ Куда публиковать", "cchannel")],
-            [("3️⃣ Текст поста", "ctext"), ("4️⃣ Просмотры", "cviews")],
-            [("5️⃣ Тариф", "cplans"), ("✨ Реакции", "cboost")],
-            [("⬅️ Кабинет", "chome")],
+            [("Обновить", "cresult")],
+            [("Мой канал", "cproject"), ("Тариф и оплата", "cplans")],
+            [("Назад: Личный кабинет", "chome")],
         )
 
     def _blocker(self, tenant: Tenant, donors: List, bound: int, posts: int) -> Optional[Tuple[str, str]]:
-        """Первая настоящая причина, по которой пост сейчас не выйдет, и что нажать."""
-        if not tenant.active(now_utc()):
-            return ("нужен оплаченный тариф", "нажми «5️⃣ Тариф» - неделя или месяц, оплата с баланса")
-        if not donors:
-            return ("не указан ни один канал-источник", "нажми «1️⃣ Откуда брать посты» и пришли ссылку на канал")
-        if not bound:
-            return (
-                "ни один канал-источник не открылся",
-                "проверь ссылки: канал может быть без публичного адреса - тогда поправь ссылку",
-            )
+        """Только известные условия: отсутствие подтверждения не объясняет его причину."""
         if not tenant.target:
-            return ("не указан канал, куда публиковать", "нажми «2️⃣ Куда публиковать»")
+            return ("не указан канал публикации", "открой «Мой канал» → «Куда публиковать»")
+        if not donors:
+            return ("не указан ни один источник", "открой «Мой канал» → «Откуда брать посты»")
+        if not tenant.active(now_utc()):
+            return ("нет активного тарифа", "открой «Тариф и оплата» и подключи тариф")
         if not tenant.target_ok:
             return (
-                "рабочий аккаунт не админ в твоём канале",
-                f"добавь {self.worker} в администраторы с правом публиковать сообщения",
+                "доступ к каналу публикации не подтверждён",
+                "проверь ссылку и права рабочего аккаунта в «Мой канал» → «Куда публиковать», затем обнови «Результат»",
+            )
+        if not bound:
+            return (
+                "доступ к источникам не подтверждён",
+                "проверь ссылки в «Мой канал» → «Откуда брать посты», затем обнови «Результат»",
             )
         if posts >= MAX_POSTS_PER_DAY:
-            return (
-                f"на сегодня использован лимит {MAX_POSTS_PER_DAY} постов",
-                "ничего делать не нужно - после полуночи лимит обнулится сам",
-            )
+            return (f"на сегодня использован лимит {MAX_POSTS_PER_DAY} постов", "проверь «Результат» в следующие сутки")
         return None
 
     async def _wizard_view(self, user_id: int, tenant: Tenant, now: datetime.datetime) -> Tuple[str, object]:
         index = await self._step(user_id)
+        self.wizard[user_id] = index
         if index >= len(STEPS):
+            self.wizard.pop(user_id, None)
             donors = await self.store.list_donors(user_id)
+            posts = await self.store.posts_today(user_id)
+            blocker = self._blocker(tenant, donors, sum(1 for donor in donors if donor.chat_id), posts)
+            state = (f"Состояние: {blocker[0]}\nДальше: {blocker[1]}" if blocker
+                     else "Канал подключён. Последние публикации можно посмотреть в «Результат».")
             return self._notice(
                 user_id,
-                "Готово - все шаги пройдены.\n\n"
-                f"• Каналы, откуда берём посты: {len(donors)}\n"
-                f"• Публикуем в: {channel_line(tenant)}\n"
-                f"• Текст поста: {self._text_line(tenant)}\n"
-                f"• Просмотры: {views_line(tenant)}\n"
-                f"• Тариф: {plan_line(tenant, now)}\n\n"
-                "Дальше бот работает сам: ловит новый пост источника и выкладывает его\n"
-                f"в твой канал ({self._text_line(tenant)}), затем добавляет просмотры и реакции.\n"
-                "Заглядывать стоит только в «📊 Результат» - там видно, идёт ли всё сейчас.",
-            ), markup(
-                [("📊 Результат", "cresult")],
-                [("🚀 В кабинет", "chome")],
-            )
+                "Обязательные настройки сохранены\n\n"
+                f"Канал: {channel_line(tenant)}\nИсточников: {len(donors)}\n"
+                f"Тариф: {plan_line(tenant, now)}\n\n{state}\n\n"
+                "Завершение настройки не подтверждает выход постов. "
+                "Текст, просмотры и реакции можно менять в «Мой канал» → «Настройки».",
+            ), markup([("Результат", "cresult")], [("Личный кабинет", "chome")])
 
-        step = STEPS[index]
-        body, buttons = await self._view(user_id, step)
-        head = f"🚀 Пошаговый запуск\nШаг {index + 1} из {len(STEPS)} - {STEP_TITLES[step]}\n\n"
-        return head + body, add_row(buttons, [("✅ Дальше", "cnext")])
+        body, buttons = await self._screen_view(user_id, STEPS[index])
+        # Вместо обычного возврата к разделу — предыдущий шаг и явный выход.
+        rows = [
+            [(button.text, button.callback_data) for button in row]
+            for row in buttons.inline_keyboard
+            if not any(button.callback_data in {"cproject", "chome"} for button in row)
+        ]
+        rows.append([("Назад", "cprev" if index else "cproject"), ("Дальше", "cnext")])
+        rows.append([("В личный кабинет", "chome")])
+        head = f"Настроить канал\nШаг {index + 1} из {len(STEPS)} — {STEP_TITLES[STEPS[index]]}\n\n"
+        return head + body, markup(*rows)
+
+    def _reaction_setting(self, tenant: Tenant) -> str:
+        if not tenant.reactions:
+            return "выключен"
+        if not self.cfg.reactions_enabled:
+            return "выбран, но сервис сейчас выключен"
+        return "включён"
+
+    @staticmethod
+    def _reactions_line(tenant: Tenant) -> str:
+        added = tenant.reactions_added
+        if added is None:
+            return "результат ещё не измерен"
+        if added == 0:
+            return "по последнему замеру число не изменилось"
+        if added > 0:
+            return f"по последнему замеру +{added}; это изменение, не подтверждение доставки сервисом"
+        return f"по последнему замеру снижение на {abs(added)}; причина изменения не установлена"
 
     def _reactions_cell(self, tenant: Tenant) -> Tuple[str, str]:
-        return ("✨ Реакции: выключить" if tenant.reactions else "✨ Реакции: включить", "creactions")
+        return ("Заказ реакций: выключить" if tenant.reactions else "Заказ реакций: включить", "creactions")
+
+    @property
+    def _ai_ready(self) -> bool:
+        return bool(self.cfg.ai_enabled and self.cfg.minimax_api_key)
 
     def _text_line(self, tenant: Tenant) -> str:
-        """Честная строка про текст: без нейросети - общей настройкой или без ключа - выбор не работает."""
         if not tenant.rewrite:
-            return "публикуем словами автора"
-        if not self.cfg.ai_enabled:
-            return "переписывание включено, но нейросеть выключена для всех - выходит словами автора"
-        if not self.cfg.minimax_api_key:
-            return "переписывание включено, но ключа нейросети нет - выходит словами автора"
-        return f"переписывает нейросеть ({self.cfg.ai_model})"
+            return "текст автора, без переписывания"
+        if not self._ai_ready:
+            return "текст автора; нейросеть недоступна, выбор переписывания сохранён"
+        return "переписывание нейросетью"
 
     def _text_cell(self, tenant: Tenant) -> Tuple[str, str]:
-        """Переключатель: надпись показывает, как сейчас, - нажал и стало наоборот."""
-        return ("✏️ Текст: переписывает ИИ" if tenant.rewrite else "✏️ Текст: словами автора", "cretext")
+        if not tenant.rewrite:
+            label = "Выбрать переписывание"
+        else:
+            label = "Оставить текст автора"
+        return label, "cretext"
 
     @property
     def worker(self) -> str:
-        """Как клиенту найти рабочего аккаунта: адрес даёт владелец, без него просим через помощь."""
-        return self.cfg.worker_contact or "пришлю по запросу - нажми «🆘 Помощь»"
+        """Контакт рабочего аккаунта, без выдуманного адреса или обещаний."""
+        return self.cfg.worker_contact or "(контакт пока не указан — запроси у владельца сервиса)"
 
     # ==== вывод ====
 
     async def _show(self, query, kind: str, flash: str = "") -> None:
         text, buttons = await self._view(query.from_user.id, kind)
-        await call(
-            self.client.edit_message_text,
-            query.message.chat.id,
-            query.message.id,
-            cut(text, TEXT_LIMIT),
-            reply_markup=buttons,
-        )
-        await call(query.answer, flash[:TEXT_LIMIT])
+        try:
+            await call(
+                self.client.edit_message_text,
+                query.message.chat.id,
+                query.message.id,
+                cut(text, TEXT_LIMIT),
+                reply_markup=buttons,
+            )
+        except MessageNotModified:
+            pass
+        await call(query.answer, flash[:180])
 
     def _back_to(self, query) -> str:
         key = (query.data or "").split("|")[0]
@@ -714,6 +755,7 @@ class Cabinet:
             "creactions": "reactions",
             "cretext": "text",
             "cnext": "wizard",
+            "cprev": "wizard",
         }.get(key, "home")
 
     def _note(self, user_id: int, text: str) -> None:
