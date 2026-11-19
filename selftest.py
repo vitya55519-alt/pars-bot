@@ -578,6 +578,7 @@ async def main():
     await check_reactions()
     await check_reaction_measure()
     await check_views()
+    await check_posts_limit()
     await check_legal()
     await check_signature()
     await check_store()
@@ -1809,7 +1810,7 @@ async def check_panel():
     check("настройки содержат текст, просмотры и реакции",
           all(label in last_edit() for label in ("Текст:", "Просмотры:", "Реакции:")), last_edit()[:300])
     check("у темы свои кнопки настроек и названия",
-          {"cv|21", "cr|21", "cw|21", "rename|21", "drop|21", "cat|21"} == set(last_buttons()), str(last_buttons()))
+          {"cv|21", "cr|21", "cw|21", "pl|21", "rename|21", "drop|21", "cat|21"} == set(last_buttons()), str(last_buttons()))
     await panel.on_button(client, press("topics"))
     check("список тем сохраняет их названия", "Спорт" in last_edit() and "Юмор @yumor_ch" in last_edit(), last_edit()[:200])
     check("список тем показывает количество источников", "Источников: 2" in last_edit() and "Источников: 1" in last_edit(), last_edit()[:200])
@@ -2003,7 +2004,7 @@ async def check_panel_navigation():
         "topics": {"cat|21", "cat|22", "channel", "main"},
         "cat|22": {"target|22", "sources|22", "settings|22", "topics", "main"},
         "sources|22": {"add|22", "del|22|3", "cat|22"},
-        "settings|22": {"cw|22", "cv|22", "cr|22", "rename|22", "drop|22", "cat|22"},
+        "settings|22": {"cw|22", "cv|22", "cr|22", "pl|22", "rename|22", "drop|22", "cat|22"},
         "status": {"check", "rstate", "status", "topics", "main"},
         "help": {"topics", "doc|1", "doc|2", "main"},
         "admin": {"clients", "money", "pause", "check", "update", "rstate", "group_rename", "main"},
@@ -3010,6 +3011,149 @@ async def check_views():
           "Просмотры для новых каналов" not in pclient.edits[-1][2] and "PROMO_VIEWS" not in pclient.edits[-1][2]
           and "Опубликовано постов:" in pclient.edits[-1][2], pclient.edits[-1][2])
 
+    # ---- посты в сутки ----
+    from config import POSTS_LIMIT
+
+    await panel.on_button(pclient, press("settings|21"))
+    check("у темы есть кнопка постов в сутки", "pl|21" in panel_buttons(), str(panel_buttons()))
+    check("в настройках темы лимит постов пока не ограничивать",
+          "Посты в сутки: не ограничивать" in pclient.edits[-1][2], pclient.edits[-1][2][:300])
+    await panel.on_button(pclient, press("pl|21"))
+    body = pclient.edits[-1][2]
+    check("экран постов объясняет потолок и ноль",
+          f"от 0 до {POSTS_LIMIT}" in body and "Ноль — не ограничивать" in body, body[:220])
+    check("экран постов объясняет полночь и пропуск",
+          "по Москве" in body and "на завтра не копится" in body, body[:320])
+    check("экран постов - лимит на тему целиком", "на тему целиком" in body, body[-200:])
+
+    await panel.on_message(pclient, Message(pclient, 9010, owner, text="10"))
+    check("введённый лимит применён к теме", panel_registry.posts_for(panel_registry.categories[21]) == 10,
+          str(panel_registry.posts_for(panel_registry.categories[21])))
+    check("панель подтверждает лимит темы", "не больше 10 постов в сутки" in pclient.replies[-1][1],
+          str(pclient.replies[-1][1][:140]))
+    recorded = [text for _, text, _ in pclient.topic_posts] + [edit[2] for edit in pclient.edits]
+    check("лимит записан в служебное сообщение темы",
+          any("Постов в сутки: 10" in text for text in recorded), str(recorded[-1][:80]))
+    await panel.on_button(pclient, press("settings|21"))
+    check("в настройках темы виден лимит", "Посты в сутки: не больше 10" in pclient.edits[-1][2], pclient.edits[-1][2][:300])
+
+    await panel.on_button(pclient, press("pl|21"))
+    await panel.on_message(pclient, Message(pclient, 9011, owner, text="много"))
+    check("не число - подсказка, лимит цел",
+          "Напиши число постов" in pclient.replies[-1][1] and panel_registry.posts_for(panel_registry.categories[21]) == 10,
+          str(pclient.replies[-1][1][:120]))
+    await panel.on_button(pclient, press("pl|21|20"))
+    check("готовая кнопка ставит лимит", panel_registry.posts_for(panel_registry.categories[21]) == 20,
+          str(panel_registry.posts_for(panel_registry.categories[21])))
+    await panel.on_button(pclient, press(f"pl|21|{POSTS_LIMIT + 1}"))
+    check("кнопка выше потолка отклонена",
+          panel_registry.posts_for(panel_registry.categories[21]) == 20 and "Лимит от 0" in pclient.edits[-1][2],
+          pclient.edits[-1][2][:120])
+    await panel.on_button(pclient, press("pl|21|0"))
+    check("ноль кнопкой - не ограничивать",
+          panel_registry.posts_for(panel_registry.categories[21]) is None and "не ограничиваем" in pclient.edits[-1][2],
+          pclient.edits[-1][2][:200])
+    check("лимит другой темы не тронут", panel_registry.posts_for(panel_registry.categories[22]) is None)
+
+
+async def check_posts_limit():
+    print("\n[27в] Лимит постов в сутки: тема и клиент пропускают лишнее, счётчик в базе")
+    from clients import Clients
+    from config import POSTS_LIMIT, parse_post_limit
+    from store import today
+
+    def rejects(raw):
+        try:
+            parse_post_limit(raw)
+        except ValueError as exc:
+            return str(exc)
+        return ""
+
+    check("ноль - не ограничивать", parse_post_limit("0") == 0, str(parse_post_limit("0")))
+    check("число принято", parse_post_limit(" 12 ") == 12, str(parse_post_limit(" 12 ")))
+    check("потолок принят", parse_post_limit(str(POSTS_LIMIT)) == POSTS_LIMIT)
+    check("выше потолка отклонено", rejects(str(POSTS_LIMIT + 1)).startswith("Лимит от 0"), rejects("1001"))
+    check("без числа отклонено", rejects("много").startswith("Напиши число"), rejects("много"))
+
+    # --- моя тема: счётчик в памяти, лишнее за сутки не публикуется ---
+    cfg = make_cfg(promo_delay=0, reactions_enabled=False)
+    world = build_world(cfg)
+    client = world["client"]
+    bot, registry, _ = await make_bot(world)
+
+    number = await registry.save_category_posts(21, "1")
+    check("лимит темы применён", number == 1 and registry.posts_for(registry.categories[21]) == 1, str(number))
+    check("лимит записан в сообщение темы", "Постов в сутки: 1" in client.topic_posts[-1][1], str(client.topic_posts[-1]))
+    await registry.rebuild()
+    check("лимит пережил перечитку", registry.posts_for(registry.categories[21]) == 1,
+          str(registry.posts_for(registry.categories[21])))
+    check("тема без лимита остаётся без лимита",
+          registry.posts_for(registry.categories[22]) is None and registry.posts_text(registry.categories[22]) == "нет")
+
+    first = len(client.posted)
+    await bot.on_message(client, Message(client, 81, world["donor_sport_1"], caption="пост один", photo=Photo("pl-1")))
+    check("первый пост за сутки вышел", len(client.posted) - first == 1, str(len(client.posted) - first))
+    await bot.on_message(client, Message(client, 82, world["donor_sport_1"], caption="пост два", photo=Photo("pl-2")))
+    check("сверх лимита дня пост пропущен", len(client.posted) - first == 1, str(len(client.posted) - first))
+    check("счётчик темы помнит вышедший пост", bot._topic_usage.get((21, today())) == 1, str(bot._topic_usage))
+    await registry.save_category_posts(21, "0")
+    await bot.on_message(client, Message(client, 83, world["donor_sport_1"], caption="пост три", photo=Photo("pl-3")))
+    check("после снятия лимита посты идут", len(client.posted) - first == 2, str(len(client.posted) - first))
+    check("учёт ведётся и без активного лимита", bot._topic_usage.get((21, today())) == 2, str(bot._topic_usage))
+
+    # --- база: счётчик темы живёт в store, клиент со своим лимитом ---
+    cfg2 = make_cfg(promo_delay=0, reactions_enabled=False)
+    world2 = build_world(cfg2)
+    client2 = world2["client"]
+    bot2, registry2, _ = await make_bot(world2)
+    store = MemoryStore()
+    clients = Clients(client2, store)
+    bot2.attach(store, clients)
+    await registry2.save_category_posts(21, "1")
+    await store.count_topic_post(21)  # база помнит: сегодня тема уже выложила свой один пост
+    posts_before = len(client2.posted)
+    await bot2.on_message(client2, Message(client2, 84, world2["donor_sport_1"], caption="сверх", photo=Photo("pl-4")))
+    check("счётчик из базы: второй пост за сутки пропущен", len(client2.posted) == posts_before, str(len(client2.posted)))
+
+    chan_e = client2.add_chat(Chat(-10090, title="Клиент Е", username="client_e_ch"))
+    await store.ensure_tenant(5005)
+    await store.set_target(5005, chan_e.username, chan_e.id, chan_e.title)
+    await store.set_target_ok(5005, True)
+    await store.add_donor(5005, "donor_sport_1")
+    store.donors[(5005, "donor_sport_1")].chat_id = world2["donor_sport_1"].id
+    await store.add_balance(5005, 600)
+    await store.buy(5005, "week")
+    store.usage[5005] = 500
+    await clients.sync()
+    await registry2.save_category_posts(21, "0")  # теме не мешаем, проверяем клиента
+    posts_before = len(client2.posted)
+    await store.set_post_limit(5005, 0)
+    await bot2.on_message(client2, Message(client2, 85, world2["donor_sport_1"], caption="без лимита", photo=Photo("pl-5")))
+    check("клиент с нулём публикуется даже за 500 постов",
+          chan_e.id in [message.chat.id for message in client2.posted[posts_before:]], str(store.usage))
+    posts_before = len(client2.posted)
+    await store.set_post_limit(5005, 502)
+    await bot2.on_message(client2, Message(client2, 86, world2["donor_sport_1"], caption="догнал лимит", photo=Photo("pl-6")))
+    check("клиент до своего лимита ещё публикует", chan_e.id in [m.chat.id for m in client2.posted[posts_before:]],
+          str(store.usage))
+    posts_before = len(client2.posted)
+    await bot2.on_message(client2, Message(client2, 87, world2["donor_sport_1"], caption="сверх", photo=Photo("pl-7")))
+    check("клиент сверх своего лимита пропущен", chan_e.id not in [m.chat.id for m in client2.posted[posts_before:]],
+          str(store.usage))
+
+    # --- fail-closed: счётчик не прочитан - пост не публикуем ---
+    async def broken(topic_id):
+        raise RuntimeError("базы нет")
+
+    errors_before = dict(bot2.stats)
+    store.topic_posts_today = broken
+    await registry2.save_category_posts(21, "5")
+    posts_before = len(client2.posted)
+    await bot2.on_message(client2, Message(client2, 88, world2["donor_sport_1"], caption="пропуск", photo=Photo("pl-8")))
+    check("без счётчика тема не публикует", world2["sport"].id not in [m.chat.id for m in client2.posted[posts_before:]],
+          str([m.chat.id for m in client2.posted[posts_before:]]))
+    check("сбой счётчика попадёт в ошибки", bot2.stats["errors"] > errors_before["errors"], str(bot2.stats))
+
 
 async def check_legal():
     print("\n[27] Документы сервиса: соглашение и политика прямо в боте")
@@ -3108,6 +3252,7 @@ def _tenant_row(tenant_id: int = 777, balance: int = 0, until=None, target: str 
         "target_ok": False,
         "views": 0,
         "views_max": None,
+        "post_limit": None,
         "reactions": True,
         "rewrite": True,
         "balance_rub": balance,
@@ -3137,6 +3282,7 @@ class MemoryStore:
         self.donors = {}
         self.payments = []
         self.usage = {}
+        self.topic_usage = {}
         self.next_payment = 1
 
     async def get_tenant(self, tenant_id):
@@ -3192,6 +3338,9 @@ class MemoryStore:
 
     async def set_reactions(self, tenant_id, enabled):
         (await self.ensure_tenant(tenant_id)).reactions = enabled
+
+    async def set_post_limit(self, tenant_id, limit):
+        (await self.ensure_tenant(tenant_id)).post_limit = limit
 
     async def set_rewrite(self, tenant_id, enabled):
         (await self.ensure_tenant(tenant_id)).rewrite = enabled
@@ -3289,10 +3438,23 @@ class MemoryStore:
         self.usage[tenant_id] = self.usage.get(tenant_id, 0) + 1
         return self.usage[tenant_id]
 
-    async def quota_left(self, tenant_id):
+    async def quota_state(self, tenant_id):
         from store import MAX_POSTS_PER_DAY
 
-        return await self.posts_today(tenant_id) < MAX_POSTS_PER_DAY
+        tenant = self.tenants.get(tenant_id)
+        cap = tenant.cap_today() if tenant else MAX_POSTS_PER_DAY
+        return self.usage.get(tenant_id, 0), cap
+
+    async def quota_left(self, tenant_id):
+        used, cap = await self.quota_state(tenant_id)
+        return cap == 0 or used < cap
+
+    async def topic_posts_today(self, topic_id):
+        return self.topic_usage.get(topic_id, 0)
+
+    async def count_topic_post(self, topic_id):
+        self.topic_usage[topic_id] = self.topic_usage.get(topic_id, 0) + 1
+        return self.topic_usage[topic_id]
 
     async def donors_by_chat(self, chat_id):
         now = _utcnow()
@@ -3406,7 +3568,8 @@ async def check_store():
     print("\n[15] База клиентов: ссылки, тариф, баланс")
     import datetime as dt
 
-    from store import MAX_DONORS, MONTH_RUB, PLANS, WEEK_RUB, Store, StoreError, Tenant, parse_ref, ref_key
+    from store import MAX_DONORS, MAX_POSTS_PER_DAY, MONTH_RUB, PLANS, WEEK_RUB, Store, StoreError, Tenant, parse_ref, ref_key
+    from store import today as store_today
 
     check("неделя 600, месяц 2000", WEEK_RUB == 600 and MONTH_RUB == 2000 and PLANS["month"]["days"] == 30,
           f"{WEEK_RUB}/{MONTH_RUB}")
@@ -3465,6 +3628,25 @@ async def check_store():
     pool.answers = [{"posts": 4}]
     check("пост учтён", await store.count_post(777) == 4)
     check("обращение к таблице дня", any("day_usage" in call[0] for call in pool.queries))
+
+    pool.answers = [{"post_limit": 7}, {"posts": 6}]
+    used, cap = await store.quota_state(777)
+    check("свой лимит клиента и счётчик дня прочитаны", used == 6 and cap == 7, f"{used}/{cap}")
+    pool.answers = [{"post_limit": None}, {"posts": MAX_POSTS_PER_DAY}]
+    used, cap = await store.quota_state(777)
+    check("без своего лимита действует общее правило", cap == MAX_POSTS_PER_DAY and used >= cap, f"{used}/{cap}")
+    pool.answers = [{"post_limit": 0}, {"posts": 999}]
+    check("ноль - посты в сутки не ограничивать", await store.quota_left(777))
+    await store.set_post_limit(777, 10)
+    check("лимит записан в таблицу клиентов",
+          any("UPDATE tenants SET post_limit" in call[0] and call[1][1] == 10 for call in pool.queries))
+    pool.answers = [{"posts": 4}]
+    check("счётчик дня темы читается", await store.topic_posts_today(31) == 4)
+    pool.answers = [{"posts": 5}]
+    check("пост темы учтён", await store.count_topic_post(31) == 5)
+    check("обращение к таблице счётчика тем", any("topic_usage" in call[0] for call in pool.queries))
+    moscow_late = dt.datetime(2026, 11, 18, 22, 30, tzinfo=dt.timezone.utc)
+    check("сутки считаются по Москве", store_today(moscow_late) == dt.date(2026, 11, 19), str(store_today(moscow_late)))
 
 
 async def check_cabinet():
@@ -3568,6 +3750,26 @@ async def check_cabinet():
     await panel.on_message(client, Message(client, 6009, petr, text="2500"))
     check("просмотры введены текстом", store.tenants[petr.id].views == 2500, str(store.tenants[petr.id].views))
 
+    # ---- посты в сутки ----
+    from config import POSTS_LIMIT
+
+    await panel.on_button(client, tap("cposts"))
+    check("экран постов объясняет потолок", f"от 0 до {POSTS_LIMIT}" in text() and "Ноль — не ограничивать" in text(), text()[:220])
+    check("общее правило показано", "Сейчас: не больше 50 (общее правило)" in text(), text()[:300])
+    await panel.on_button(client, tap("cposts|20"))
+    check("лимит с готовой кнопки", store.tenants[petr.id].post_limit == 20, str(store.tenants[petr.id].post_limit))
+    check("лимит объяснён", "не больше 20 постов в сутки" in text() and "на завтра не копятся" in text(), text()[:240])
+    await panel.on_button(client, tap("cposts|0"))
+    check("ноль - не ограничивать", store.tenants[petr.id].post_limit == 0 and "не ограничивать" in text(), text()[:240])
+    await panel.on_button(client, tap("cposts|1001"))
+    check("число выше потолка отклонено",
+          "Лимит от 0" in text() and store.tenants[petr.id].post_limit == 0, text()[:150])
+    await panel.on_button(client, tap("cposts"))
+    await panel.on_message(client, Message(client, 60095, petr, text="15"))
+    check("лимит введён текстом", store.tenants[petr.id].post_limit == 15, str(store.tenants[petr.id].post_limit))
+    await panel.on_button(client, tap("csettings"))
+    check("в настройках виден свой лимит постов", "Посты в сутки: не больше 15" in text(), text()[:300])
+
     # ---- реакции ----
     await panel.on_button(client, tap("cboost"))
     check("экран реакций ставит условие", "разреши все реакции" in text(), text()[:280])
@@ -3616,7 +3818,7 @@ async def check_cabinet():
     await panel.on_button(client, tap("cproject"))
     check("карточка одного канала открывает вложенные разделы", set(cells()) == {"cchannel", "cdonors", "csettings", "chome"}, str(cells()))
     await panel.on_button(client, tap("csettings"))
-    check("настройки собраны вместе", set(cells()) == {"ctext", "cviews", "cboost", "cproject"}, str(cells()))
+    check("настройки собраны вместе", set(cells()) == {"ctext", "cviews", "cposts", "cboost", "cproject"}, str(cells()))
     await panel.on_button(client, tap("cguide"))
     check("документы доступны из помощи", {"cdoc|1|guide", "cdoc|2|guide"} <= set(cells()), str(cells()))
 

@@ -18,7 +18,7 @@ from pyrogram.types import BotCommand, InlineKeyboardMarkup
 import legal
 from ai import cut
 from cabinet import Cabinet
-from config import VIEWS_LIMIT
+from config import POSTS_LIMIT, VIEWS_LIMIT
 from registry import RegistryError
 from store import StoreError
 from utils import TEXT_LIMIT, call, chunks, markup
@@ -69,6 +69,8 @@ class Panel:
         self.awaiting: Dict[int, Tuple[str, int]] = {}
         self._input_version: Dict[int, int] = {}
         self.notice = ""
+        # сколько постов тема выложила сегодня: читается перед экраном лимита, None - ещё не читали
+        self.posts_today: Optional[int] = None
 
     def setup(self) -> None:
         self.client.add_handler(MessageHandler(self.on_message, filters.private))
@@ -168,6 +170,13 @@ class Panel:
             else:
                 self.awaiting[query.from_user.id] = ("cviews", arg)
                 await self._show(query, "cviews", arg)
+        elif key == "pl":
+            self.posts_today = await self.bot.topic_posts_used(arg)
+            if len(parts) > 2 and parts[2].isdigit():
+                await self._apply_category_posts(query, arg, parts[2])
+            else:
+                self.awaiting[query.from_user.id] = ("cpl", arg)
+                await self._show(query, "cpl", arg)
         elif key == "cr":
             await self._toggle_category_reactions(query, arg)
         elif key == "cw":
@@ -245,6 +254,31 @@ class Panel:
              if number else f"Для темы «{self._name(topic_id)}» просмотры не заказываются.")
         )
         await self._show(query, "settings", topic_id, flash=shown)
+
+    def _posts_notice(self, topic_id: int, number: int) -> str:
+        if number:
+            return (
+                f"Тема «{self._name(topic_id)}»: не больше {number} постов в сутки."
+                " Лишнее в тот же день пропускаем, на завтра не копим."
+            )
+        return f"Тема «{self._name(topic_id)}»: постов в сутки не ограничиваем."
+
+    async def _apply_category_posts(self, query, topic_id: int, raw: str) -> None:
+        version = self._input_version.get(query.from_user.id, 0)
+        try:
+            number = await self.registry.save_category_posts(topic_id, raw)
+        except ValueError as exc:
+            self.notice = str(exc)
+            if self._input_version.get(query.from_user.id, 0) == version:
+                self.awaiting[query.from_user.id] = ("cpl", topic_id)
+            await self._show(query, "cpl", topic_id)
+            return
+        except RegistryError as exc:
+            self.notice = f"⚠ {exc}"
+            await self._show(query, "cat", topic_id)
+            return
+        self.notice = self._posts_notice(topic_id, number)
+        await self._show(query, "settings", topic_id, flash=str(number) if number else "нет")
 
     async def _toggle_category_reactions(self, query, topic_id: int) -> None:
         enabled = await self.registry.toggle_category_reactions(topic_id)
@@ -419,6 +453,11 @@ class Panel:
                      if number else f"Для темы «{self._name(topic_id)}» просмотры не заказываются.")
                 )
                 screen = ("settings", topic_id)
+            elif kind == "cpl":
+                number = await registry.save_category_posts(topic_id, text)
+                self.posts_today = await self.bot.topic_posts_used(topic_id)
+                self.notice = self._posts_notice(topic_id, number)
+                screen = ("settings", topic_id)
             elif kind == "credit":
                 digits = "".join(char for char in text if char.isdigit())
                 if not digits:
@@ -509,6 +548,8 @@ class Panel:
             return self._rename_group_view()
         if kind == "cviews":
             return self._category_views_view(topic_id)
+        if kind == "cpl":
+            return self._category_posts_view(topic_id)
         if kind == "react":
             return self._react_view()
         if kind == "credit":
@@ -655,16 +696,19 @@ class Panel:
         reaction_state = "заказывать" if reactions else "не заказывать"
         if reactions and not self.bot.reactions.enabled:
             reaction_state = "выбраны, но сервис реакций сейчас выключен"
+        posts_cap = self.registry.posts_for(category)
         lines = [
             f"Настройки темы «{category.name}»", "",
             f"Текст: {text_state}.",
             f"Просмотры: {views_state}.",
+            f"Посты в сутки: {f'не больше {posts_cap}' if posts_cap else 'не ограничивать'}.",
             f"Реакции: {reaction_state}.", "",
             "Это настройки новых постов, не отчёт о выполненных заказах.",
         ]
         return cut(self._with_notice("\n".join(lines)), TEXT_LIMIT), markup(
             [("Оставить текст автора" if rewrite else "Выбрать переписывание", f"cw|{topic_id}")],
             [("Просмотры на пост", f"cv|{topic_id}")],
+            [("Посты в сутки", f"pl|{topic_id}")],
             [("Не заказывать реакции" if reactions else "Заказывать реакции", f"cr|{topic_id}")],
             [("Изменить название", f"rename|{topic_id}")],
             [("Удалить тему", f"drop|{topic_id}")],
@@ -824,6 +868,24 @@ class Panel:
         presets = [(str(count), f"cv|{topic_id}|{count}") for count in (500, 1000, 2000, 5000)]
         return cut(self._with_notice(text), TEXT_LIMIT), markup(
             presets[:2], presets[2:], [("Не заказывать", f"cv|{topic_id}|0")],
+            [("Отмена", f"settings|{topic_id}")],
+        )
+
+    def _category_posts_view(self, topic_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+        category = self.registry.categories.get(topic_id)
+        cap = self.registry.posts_for(category) if category else None
+        today_line = f"Сегодня в канал вышло: {self.posts_today}.\n" if self.posts_today is not None else ""
+        text = (
+            f"Тема «{self._name(topic_id)}» · посты в сутки\n"
+            f"Сейчас: {f'не больше {cap} в сутки' if cap else 'не ограничивать'}.\n{today_line}\n"
+            f"Напиши число от 0 до {POSTS_LIMIT} или выбери кнопкой. Ноль — не ограничивать. "
+            "Что не влезло в лимит за день, не публикуется и на завтра не копится. "
+            "Сутки считаются по Москве: после полуночи счётчик обнуляется, счётчик живёт в базе и переживает перезапуск.\n\n"
+            "Лимит считается на тему целиком: не важно, из какого источника пришёл пост."
+        )
+        presets = [(str(count), f"pl|{topic_id}|{count}") for count in (5, 10, 20, 50)]
+        return cut(self._with_notice(text), TEXT_LIMIT), markup(
+            presets[:2], presets[2:], [("Не ограничивать (0)", f"pl|{topic_id}|0")],
             [("Отмена", f"settings|{topic_id}")],
         )
 

@@ -9,6 +9,7 @@ THINKING_MODES = ("disabled", "adaptive")
 
 # потолок сервиса накрутки: больше десяти тысяч просмотров за заказ он не даёт
 VIEWS_LIMIT = 10000
+POSTS_LIMIT = 1000
 
 DEFAULT_PROMPT = (
     "Ты — редактор Telegram-канала. Перепиши присланный пост своими словами, "
@@ -82,6 +83,17 @@ def parse_views(raw: str, low: int = 1) -> int:
     value = int(digits)
     if not low <= value <= VIEWS_LIMIT:
         raise ValueError(f"Просмотров должно быть от {low} до {VIEWS_LIMIT} - больше не даёт сервис.")
+    return value
+
+
+def parse_post_limit(raw: str) -> int:
+    """Постов в сутки: число от 0 до POSTS_LIMIT. Ноль - не ограничивать."""
+    digits = re.sub(r"\D", "", str(raw or ""))
+    if not digits:
+        raise ValueError("Напиши число постов в сутки, например 10. Ноль - не ограничивать.")
+    value = int(digits)
+    if value > POSTS_LIMIT:
+        raise ValueError(f"Лимит от 0 до {POSTS_LIMIT} постов в сутки. Ноль - не ограничивать.")
     return value
 
 

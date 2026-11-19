@@ -37,8 +37,12 @@ MENTION_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_]{4,31})")
 NUMERIC_ID_RE = re.compile(r"-100\d{8,16}")
 
 
+MSK = datetime.timezone(datetime.timedelta(hours=3))
+
+
 def today(now: Optional[datetime.datetime] = None) -> datetime.date:
-    return (now or datetime.datetime.now(datetime.timezone.utc)).date()
+    """Сутки считаются по Москве: лимит постов обнуляется в полночь MSK, а не UTC."""
+    return (now or datetime.datetime.now(datetime.timezone.utc)).astimezone(MSK).date()
 
 
 def ref_key(ref: ChatRef) -> str:
@@ -72,6 +76,8 @@ class Tenant:
     target_ok: bool = False
     views: int = 0
     views_max: Optional[int] = None
+    # свой лимит постов в сутки: None - общее правило MAX_POSTS_PER_DAY, 0 - не ограничивать
+    post_limit: Optional[int] = None
     reactions: bool = True
     rewrite: bool = True
     balance: int = 0
@@ -85,6 +91,10 @@ class Tenant:
         if self.plan_until is None:
             return False
         return self.plan_until > (now or datetime.datetime.now(datetime.timezone.utc))
+
+    def cap_today(self) -> int:
+        """Сколько постов можно в сутки: своё число, 0 - без лимита, не задано - общее правило."""
+        return MAX_POSTS_PER_DAY if self.post_limit is None else self.post_limit
 
     def days_left(self, now: Optional[datetime.datetime] = None) -> int:
         if self.plan_until is None:
@@ -259,6 +269,15 @@ class Store:
                 tenant_id,
                 views,
                 views_max,
+            )
+
+    async def set_post_limit(self, tenant_id: int, limit: Optional[int]) -> None:
+        """Лимит постов в сутки: None - общее правило, 0 - не ограничивать, число - своё."""
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE tenants SET post_limit = $2, updated_at = now() WHERE id = $1",
+                tenant_id,
+                limit,
             )
 
     async def set_reactions(self, tenant_id: int, enabled: bool) -> None:
@@ -645,8 +664,45 @@ class Store:
             )
         return int(row["posts"])
 
+    async def quota_state(self, tenant_id: int):
+        """(сколько вышло сегодня, лимит): лимит 0 - не ограничивать; не задан - общее правило."""
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow("SELECT post_limit FROM tenants WHERE id = $1", tenant_id)
+            used = await con.fetchval(
+                "SELECT posts FROM day_usage WHERE tenant_id = $1 AND day = $2",
+                tenant_id,
+                today(),
+            )
+        cap = MAX_POSTS_PER_DAY if not row or row["post_limit"] is None else int(row["post_limit"])
+        return int(used or 0), cap
+
     async def quota_left(self, tenant_id: int) -> bool:
-        return await self.posts_today(tenant_id) < MAX_POSTS_PER_DAY
+        used, cap = await self.quota_state(tenant_id)
+        return cap == 0 or used < cap
+
+    # ==== счётчик тем владельца ====
+
+    async def topic_posts_today(self, topic_id: int) -> int:
+        async with self.pool.acquire() as con:
+            value = await con.fetchval(
+                "SELECT posts FROM topic_usage WHERE topic_id = $1 AND day = $2",
+                topic_id,
+                today(),
+            )
+        return int(value or 0)
+
+    async def count_topic_post(self, topic_id: int) -> int:
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow(
+                """
+                INSERT INTO topic_usage (topic_id, day, posts) VALUES ($1, $2, 1)
+                ON CONFLICT (topic_id, day) DO UPDATE SET posts = topic_usage.posts + 1
+                RETURNING posts
+                """,
+                topic_id,
+                today(),
+            )
+        return int(row["posts"])
 
 
 SCHEMA = """
@@ -658,6 +714,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     target_ok BOOLEAN NOT NULL DEFAULT FALSE,
     views INT NOT NULL DEFAULT 0,
     views_max INT,
+    post_limit INT,
     reactions BOOLEAN NOT NULL DEFAULT TRUE,
     rewrite BOOLEAN NOT NULL DEFAULT TRUE,
     balance_rub INT NOT NULL DEFAULT 0,
@@ -696,6 +753,13 @@ CREATE TABLE IF NOT EXISTS day_usage (
     day DATE NOT NULL,
     posts INT NOT NULL DEFAULT 0,
     PRIMARY KEY (tenant_id, day)
+);
+
+CREATE TABLE IF NOT EXISTS topic_usage (
+    topic_id BIGINT NOT NULL,
+    day DATE NOT NULL,
+    posts INT NOT NULL DEFAULT 0,
+    PRIMARY KEY (topic_id, day)
 );
 
 CREATE TABLE IF NOT EXISTS owner_channels (
@@ -739,6 +803,7 @@ MIGRATIONS = (
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS reactions_added INT",
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS rewrite BOOLEAN NOT NULL DEFAULT TRUE",
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS views_max INT",
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS post_limit INT",
     "ALTER TABLE owner_channels ADD COLUMN IF NOT EXISTS target_ref TEXT NOT NULL DEFAULT ''",
 )
 
@@ -777,6 +842,7 @@ def _tenant(row) -> Tenant:
         target_ok=bool(row["target_ok"]),
         views=int(row["views"] or 0),
         views_max=int(row["views_max"]) if row["views_max"] is not None else None,
+        post_limit=int(row["post_limit"]) if row["post_limit"] is not None else None,
         reactions=bool(row["reactions"]),
         rewrite=bool(row["rewrite"]),
         balance=int(row["balance_rub"] or 0),

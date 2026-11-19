@@ -14,7 +14,7 @@ import logging
 import random
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 from pyrogram import filters
 from pyrogram.enums import ChatMemberStatus, ChatType, ParseMode
@@ -27,7 +27,7 @@ from commands import Controls
 from promo import Promoter
 from reactions import Reactor, count_reactions
 from registry import Category
-from store import MAX_POSTS_PER_DAY
+from store import today
 from utils import TEXT_LIMIT, as_utc, call, chat_name, strip_source, utc_now
 
 log = logging.getLogger("pars")
@@ -58,6 +58,9 @@ class Destination:
     views: Optional[int] = None
     # верх границы диапазона: ставим на каждый пост случайное число от views до views_max
     views_max: Optional[int] = None
+    # моя тема (0 - не моя): лимит постов в сутки считается именно по ней
+    topic_id: int = 0
+    post_limit: Optional[int] = None
     reactions: bool = True
     rewrite: bool = True
     tenant_id: int = 0
@@ -110,6 +113,8 @@ class ParsBot:
         self.controls = Controls(client, cfg, registry, self)
         self._seen_groups: "OrderedDict[str, None]" = OrderedDict()
         self._sent_posts: "OrderedDict[str, None]" = OrderedDict()
+        # счётчик постов в сутки для моих тем без базы: {(topic_id, день): число}
+        self._topic_usage: Dict[tuple, int] = {}
         self.started = utc_now()
         self.stats = {"caught": 0, "published": 0, "forwarded": 0, "errors": 0, "seen": 0}
         self.last_publish = ""
@@ -250,6 +255,8 @@ class ParsBot:
                         label=f"мой канал {category.target_name}",
                         views=self.registry.views_for(category),
                         views_max=self.registry.views_max_for(category),
+                        topic_id=category.topic_id,
+                        post_limit=self.registry.posts_for(category),
                         reactions=self.registry.reactions_for(category),
                         rewrite=self.registry.rewrite_for(category),
                     )
@@ -277,6 +284,7 @@ class ParsBot:
             label=f"клиент {tenant.id}",
             views=tenant.views,
             views_max=getattr(tenant, "views_max", None),
+            post_limit=getattr(tenant, "post_limit", None),
             reactions=tenant.reactions,
             rewrite=tenant.rewrite,
             tenant_id=tenant.id,
@@ -335,21 +343,61 @@ class ParsBot:
         return (rewritten or author) if dest.rewrite else author
 
     async def _allowed(self, dest: Destination) -> bool:
-        """Суточный лимит клиента: складу владельца он не нужен, у него один хозяин."""
-        if not dest.tenant_id or self.store is None:
-            return True
-        try:
-            left = await self.store.quota_left(dest.tenant_id)
-        except Exception as exc:  # noqa: BLE001 - без цифр базы пост лучше не удваивать на следующий день
-            log.error("Клиент %s: лимит дня не прочитан (%s) - пост не публикую.", dest.tenant_id, type(exc).__name__)
-            return False
-        if not left:
-            log.warning(
-                "Клиент %s: дневной лимит %s постов исчерпан - пост пропущен, после полуночи снова пойдут.",
-                dest.tenant_id,
-                MAX_POSTS_PER_DAY,
-            )
-        return left
+        """Суточный лимит: у клиента - свой или общий, у моей темы - выбранный в настройках."""
+        if dest.tenant_id and self.store is not None:
+            try:
+                used, cap = await self.store.quota_state(dest.tenant_id)
+            except Exception as exc:  # noqa: BLE001 - без цифр базы пост лучше не удваивать на следующий день
+                log.error("Клиент %s: лимит дня не прочитан (%s) - пост не публикую.", dest.tenant_id, type(exc).__name__)
+                return False
+            if cap and used >= cap:
+                log.warning(
+                    "Клиент %s: дневной лимит %s постов исчерпан (вышло %s) - пост пропущен,"
+                    " после полуночи по Москве снова пойдут.",
+                    dest.tenant_id,
+                    cap,
+                    used,
+                )
+                return False
+        if dest.topic_id and dest.post_limit:
+            used = await self.topic_posts_used(dest.topic_id)
+            if used is None:
+                return False
+            if used >= dest.post_limit:
+                log.warning(
+                    "%s: выбрано не больше %s постов в сутки - сегодня уже вышло %s, этот пост пропускаю."
+                    " После полуночи по Москве счётчик обнулится.",
+                    dest.label,
+                    dest.post_limit,
+                    used,
+                )
+                return False
+        return True
+
+    async def topic_posts_used(self, topic_id: int) -> Optional[int]:
+        """Сколько постов тема выложила сегодня. None - счётчик не прочитан."""
+        if self.store is not None:
+            try:
+                return await self.store.topic_posts_today(topic_id)
+            except Exception as exc:  # noqa: BLE001 - без счётчика лучше пропустить пост, чем выложить двойню
+                self.stats["errors"] += 1
+                log.error("Тема %s: счётчик дня не прочитан (%s) - пост не публикую.", topic_id, type(exc).__name__)
+                return None
+        return self._topic_usage.get((topic_id, today()), 0)
+
+    async def _bump_topic(self, topic_id: int) -> None:
+        """Учёт обнуляется по московской полуночи и живёт в базе: перезапуск день не сбрасывает."""
+        if self.store is not None:
+            try:
+                await self.store.count_topic_post(topic_id)
+                return
+            except Exception as exc:  # noqa: BLE001 - пост вышел, счётчик догоним памятью
+                log.error("Тема %s: пост в счётчик дня не записан (%s: %s).", topic_id, type(exc).__name__, exc)
+        self._topic_usage[(topic_id, today())] = self._topic_usage.get((topic_id, today()), 0) + 1
+        if len(self._topic_usage) > 400:
+            fresh = {key: value for key, value in self._topic_usage.items() if key[1] == today()}
+            self._topic_usage.clear()
+            self._topic_usage.update(fresh)
 
     async def _publish(self, dest: Destination, message: Message, text: str) -> Message:
         """Фото и видео несём по file_id вместе с подписью, текстовый пост - без разметки."""
@@ -448,6 +496,8 @@ class ParsBot:
             posted.id,
             self._what_posted(posted),
         )
+        if dest.topic_id:
+            await self._bump_topic(dest.topic_id)
         if dest.tenant_id and self.store is not None:
             try:
                 await self.store.count_post(dest.tenant_id)
@@ -662,6 +712,8 @@ class ParsBot:
                 label=f"мой канал {category.target_name} (догон)",
                 views=self.registry.views_for(category),
                 views_max=self.registry.views_max_for(category),
+                topic_id=category.topic_id,
+                post_limit=self.registry.posts_for(category),
                 reactions=self.registry.reactions_for(category),
                 rewrite=self.registry.rewrite_for(category),
             )

@@ -11,7 +11,7 @@ import legal
 from pyrogram.errors import MessageNotModified
 
 from ai import cut
-from config import VIEWS_LIMIT, parse_views_range
+from config import POSTS_LIMIT, VIEWS_LIMIT, parse_post_limit, parse_views_range
 from store import MAX_DONORS, MAX_POSTS_PER_DAY, MIN_TOPUP, PLANS, StoreError, Tenant, parse_ref
 from utils import TEXT_LIMIT, call, markup
 
@@ -19,6 +19,9 @@ log = logging.getLogger("cabinet")
 
 # 0 - не ошибка ввода, а осознанный выбор человека: просмотры не накручивать
 VIEWS_PRESETS = (0, 500, 1000, 2000, 5000)
+
+# Кнопки лимита постов в сутки; «Не ограничивать» отдельной кнопкой (0).
+POSTS_PRESETS = (5, 10, 20, 50)
 
 # Только обязательные настройки; текст, просмотры и реакции доступны отдельно.
 STEPS = ("channel", "donors", "plans")
@@ -34,7 +37,7 @@ FORMATS = (
 )
 
 # После ввода возвращаем шаг, а не теряем пошаговую навигацию.
-SCREENS = {"donor": "donors", "channel": "channel", "views": "views", "sum": "plans"}
+SCREENS = {"donor": "donors", "channel": "channel", "views": "views", "posts": "posts", "sum": "plans"}
 CANCEL_INPUT = {"donor": "cdonors", "channel": "cchannel", "sum": "cplans"}
 
 
@@ -75,6 +78,25 @@ def views_line(tenant: Tenant) -> str:
     return f"заказывать {tenant.views} на каждый пост"
 
 
+def posts_line(tenant: Tenant) -> str:
+    cap = getattr(tenant, "post_limit", None)
+    if cap is None:
+        return f"не больше {MAX_POSTS_PER_DAY} (общее правило)"
+    if cap == 0:
+        return "не ограничивать"
+    return f"не больше {cap}"
+
+
+def posts_plan_line(tenant: Tenant) -> str:
+    """Фраза про лимит постов для экрана тарифа."""
+    cap = getattr(tenant, "post_limit", None)
+    if cap == 0:
+        return "посты в сутки не ограничивать"
+    if cap is None:
+        return f"до {MAX_POSTS_PER_DAY} постов в сутки (можно изменить в «Настройки»)"
+    return f"до {cap} постов в сутки (можно изменить в «Настройки»)"
+
+
 def add_row(buttons, row: List[Tuple[str, str]]):
     """Дописать ряд кнопок к готовому экрану: так пошаговый запуск не дублирует тексты шагов."""
     rows = [[(button.text, button.callback_data) for button in line] for line in (buttons.inline_keyboard or [])]
@@ -93,6 +115,7 @@ class Cabinet:
         "cchannel": "channel",
         "ctext": "text",
         "cviews": "views",
+        "cposts": "posts",
         "cplans": "plans",
         "cresult": "result",
         "cguide": "guide",
@@ -171,6 +194,14 @@ class Cabinet:
                 if self._input_version.get(user_id) == version:
                     self.awaiting.pop(user_id, None)
             await self._show(query, "views")
+        elif key == "cposts":
+            self.wizard.pop(user_id, None)
+            self.awaiting[user_id] = ("posts", 0)
+            if arg:
+                await self._apply(user_id, "posts", arg)
+                if self._input_version.get(user_id) == version:
+                    self.awaiting.pop(user_id, None)
+            await self._show(query, "posts")
         elif key == "cstart":
             await self._entry(user_id)
             await self._show(query, "wizard")
@@ -343,6 +374,17 @@ class Cabinet:
                 )
             else:
                 self._note(user_id, "Сохранено: не заказывать просмотры.")
+        elif kind == "posts":
+            value = parse_post_limit(text)
+            await self.store.set_post_limit(user_id, value)
+            if value == 0:
+                self._note(user_id, "Сохранено: посты в сутки не ограничивать.")
+            else:
+                self._note(
+                    user_id,
+                    f"Сохранено: не больше {value} постов в сутки. "
+                    "Лишние посты в тот же день пропускаются, на завтра не копятся.",
+                )
         elif kind == "sum":
             request_id = await self.store.request_topup(user_id, self._rubles(text))
             self._note(user_id, f"Заявка №{request_id} принята и ждёт проверки платежа. После зачисления можно купить тариф.")
@@ -427,11 +469,13 @@ class Cabinet:
                 user_id,
                 f"Настройки канала\n\nТекст: {self._text_line(tenant)}\n"
                 f"Просмотры: {views_line(tenant)}\n"
+                f"Посты в сутки: {posts_line(tenant)}\n"
                 f"Заказ реакций: {self._reaction_setting(tenant)}\n\n"
                 "Это выбранные настройки, не подтверждение результата.",
             ), markup(
                 [("Текст постов", "ctext")],
                 [("Просмотры", "cviews")],
+                [("Посты в сутки", "cposts")],
                 [("Реакции", "cboost")],
                 [("Назад: Мой канал", "cproject")],
             )
@@ -495,6 +539,25 @@ class Cabinet:
                 f"Сейчас: {views_line(tenant)}",
             ), markup(*rows, [("Отмена" if waiting else "Назад: Настройки", "csettings")])
 
+        if kind == "posts":
+            presets = [
+                [(str(count), f"cposts|{count}") for count in POSTS_PRESETS[:2]],
+                [(str(count), f"cposts|{count}") for count in POSTS_PRESETS[2:]],
+                [("Не ограничивать (0)", "cposts|0")],
+            ]
+            waiting = self.awaiting.get(user_id, ("", 0))[0] == "posts"
+            rows = presets if waiting else presets + [[("Ввести своё число", "cposts")]]
+            return self._notice(
+                user_id,
+                "Посты в сутки\n\n"
+                f"Сколько постов в сутки брать из источников и публиковать в канал: от 0 до {POSTS_LIMIT}. "
+                "Ноль — не ограничивать.\n"
+                "Счёт обнуляется в полночь по Москве. Лишние посты в тот же день пропускаются, на завтра не копятся.\n"
+                + ("Пришли число сообщением, либо выбери кнопкой.\n\n" if waiting
+                   else "Выбери число кнопкой или нажми «Ввести своё число».\n\n")
+                + f"Сейчас: {posts_line(tenant)}",
+            ), markup(*rows, [("Отмена" if waiting else "Назад: Настройки", "csettings")])
+
         if kind == "reactions":
             return self._notice(
                 user_id,
@@ -511,7 +574,7 @@ class Cabinet:
             return self._notice(
                 user_id,
                 "Помощь\n\nНастройка: куда публиковать → откуда брать посты → тариф.\n"
-                "В «Мой канал» можно менять канал и источники; в «Настройки» — текст, просмотры и реакции.\n"
+                "В «Мой канал» можно менять канал и источники; в «Настройки» — текст, просмотры, лимит постов и реакции.\n"
                 "«Результат» показывает известные статусы и последний пост, не обещание новых публикаций.\n\n"
                 f"{FORMATS}\n\n"
                 f"Рабочий аккаунт: {self.worker}. Он подписывается на источники; "
@@ -530,7 +593,7 @@ class Cabinet:
                 "Тариф и оплата\n\n"
                 f"Неделя — {PLANS['week']['price']} ₽ ({PLANS['week']['days']} дней)\n"
                 f"Месяц — {PLANS['month']['price']} ₽ ({PLANS['month']['days']} дней)\n"
-                f"Один канал, до {MAX_DONORS} источников, до {MAX_POSTS_PER_DAY} постов в сутки.\n"
+                f"Один канал, до {MAX_DONORS} источников, {posts_plan_line(tenant)}\n"
                 "Настройки просмотров и реакций не гарантируют их получение.\n\n"
                 f"Баланс: {tenant.balance} ₽\nТариф: {plan_line(tenant, now)}\n\n"
                 "Пополнение проверяется вручную. После зачисления выбери тариф — стоимость спишется с баланса. "
@@ -614,6 +677,7 @@ class Cabinet:
         donors = await self.store.list_donors(user_id)
         bound = sum(1 for donor in donors if donor.chat_id)
         posts = await self.store.posts_today(user_id)
+        cap = tenant.cap_today()
         blocker = self._blocker(tenant, donors, bound, posts)
         lines = ["Результат", ""]
         if blocker:
@@ -623,13 +687,14 @@ class Cabinet:
         lines += [
             f"Канал: {channel_line(tenant)}",
             f"Источников: {len(donors)} (подключено {bound})",
-            f"Постов сегодня: {posts} из {MAX_POSTS_PER_DAY}",
+            f"Постов сегодня: {posts} из {cap}" if cap else f"Постов сегодня: {posts} (без лимита)",
             f"Последний пост: {tenant.last_post_phrase(now)}",
             f"Реакции: {self._reactions_line(tenant)}",
             "",
             "Настройки:",
             f"Текст: {self._text_line(tenant)}",
             f"Просмотры: {views_line(tenant)}",
+            f"Посты в сутки: {posts_line(tenant)}",
             f"Заказ реакций: {self._reaction_setting(tenant)}",
             f"Тариф: {plan_line(tenant, now)}",
         ]
@@ -659,8 +724,12 @@ class Cabinet:
                 "доступ к источникам не подтверждён",
                 "проверь ссылки в «Мой канал» → «Откуда брать посты», затем обнови «Результат»",
             )
-        if posts >= MAX_POSTS_PER_DAY:
-            return (f"на сегодня использован лимит {MAX_POSTS_PER_DAY} постов", "проверь «Результат» в следующие сутки")
+        cap = tenant.cap_today()
+        if cap and posts >= cap:
+            return (
+                f"на сегодня использован лимит {cap} постов",
+                "проверь «Результат» в следующие сутки или измени лимит в «Настройки» → «Посты в сутки»",
+            )
         return None
 
     async def _wizard_view(self, user_id: int, tenant: Tenant, now: datetime.datetime) -> Tuple[str, object]:
@@ -679,7 +748,7 @@ class Cabinet:
                 f"Канал: {channel_line(tenant)}\nИсточников: {len(donors)}\n"
                 f"Тариф: {plan_line(tenant, now)}\n\n{state}\n\n"
                 "Завершение настройки не подтверждает выход постов. "
-                "Текст, просмотры и реакции можно менять в «Мой канал» → «Настройки».",
+                "Текст, просмотры, лимит постов и реакции можно менять в «Мой канал» → «Настройки».",
             ), markup([("Результат", "cresult")], [("Личный кабинет", "chome")])
 
         body, buttons = await self._screen_view(user_id, STEPS[index])
@@ -760,6 +829,7 @@ class Cabinet:
             "cdel": "donors",
             "cadd": "donors",
             "cviews": "views",
+            "cposts": "posts",
             "cbuy": "plans",
             "ctopup": "plans",
             "cchannel": "channel",

@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Set, Union
 
 from pyrogram.enums import ChatMemberStatus, ChatType
 
-from config import VIEWS_LIMIT, parse_views_range
+from config import POSTS_LIMIT, VIEWS_LIMIT, parse_post_limit, parse_views_range
 from utils import call, chat_name, norm_title
 
 log = logging.getLogger("registry")
@@ -31,6 +31,8 @@ REACTIONS_RE = re.compile(r"реакции\s*[:=]\s*(вкл|выкл)", re.I)
 REACTIONS_TEXT = "Реакции: {}"
 REWRITE_RE = re.compile(r"переписывание\s*[:=]\s*(вкл|выкл)", re.I)
 REWRITE_TEXT = "Переписывание: {}"
+POSTS_RE = re.compile(r"постов\s+в\s+сутки\s*[:=]\s*(\d{1,4})", re.I)
+POSTS_TEXT = "Постов в сутки: {}"
 TARGET_RE = re.compile(r"куда\s+постить\s*[:=]\s*(\S+)", re.I)
 TARGET_TEXT = "Куда постить: {}"
 PUBLIC_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{4,31})", re.I)
@@ -90,6 +92,8 @@ class Category:
     views_max: Optional[int] = None
     reactions: Optional[bool] = None
     rewrite: Optional[bool] = None
+    # свои посты в сутки: None - не ограничивать (для тем лимита по умолчанию нет), 0 тоже «не ограничивать»
+    post_limit: Optional[int] = None
     settings_message: Optional[int] = None
 
     @property
@@ -101,10 +105,11 @@ class Category:
         donors = ", ".join(self.donor_names) or "нет"
         return f"Канал «{self.name}» -> постим в {where}\n    откуда берём посты: {donors}"
 
-    def settings_line(self, views: str, reactions: bool, rewrite: bool) -> str:
+    def settings_line(self, views: str, reactions: bool, rewrite: bool, posts: Optional[int] = None) -> str:
+        cap = "постов в сутки: нет лимита" if posts is None else f"постов в сутки: {posts}"
         return (
             f"    просмотры: {views} · реакции: {'вкл' if reactions else 'выкл'}"
-            f" · переписывание: {'вкл' if rewrite else 'выкл'}"
+            f" · переписывание: {'вкл' if rewrite else 'выкл'} · {cap}"
         )
 
 
@@ -242,11 +247,14 @@ class Registry:
         reactions_match = REACTIONS_RE.search(text)
         rewrite_match = REWRITE_RE.search(text)
         target_match = TARGET_RE.search(text)
-        if not views_match and not reactions_match and not rewrite_match and not target_match:
+        posts_match = POSTS_RE.search(text)
+        if not views_match and not reactions_match and not rewrite_match and not target_match and not posts_match:
             return False
         if message_id <= (category.settings_message or 0):
             return True
         category.settings_message = message_id
+        if posts_match:
+            category.post_limit = min(int(posts_match.group(1)), POSTS_LIMIT)
         if views_match:
             value = int(views_match.group(1))
             top = int(views_match.group(2)) if views_match.group(2) else None
@@ -568,6 +576,25 @@ class Registry:
         """Переписывать ли тексты этого канала: своё значение из темы, иначе общий дефолт REWRITE_DEFAULT."""
         return category.rewrite if category.rewrite is not None else self.cfg.rewrite_default
 
+    def posts_for(self, category: Category) -> Optional[int]:
+        """Постов в сутки для темы: своё число из темы; None или 0 - не ограничивать."""
+        return category.post_limit or None
+
+    def posts_text(self, category: Category) -> str:
+        """Как показать лимит: «10» или «нет»."""
+        cap = self.posts_for(category)
+        return str(cap) if cap else "нет"
+
+    async def save_category_posts(self, topic_id: int, raw: str) -> int:
+        """Свой лимит темы: число постов в сутки, 0 - не ограничивать. Хранится сообщением в теме."""
+        value = parse_post_limit(raw)
+        category = self._category(topic_id)
+        async with self.lock:
+            category.post_limit = value
+            await self._write_settings(category)
+        log.info("Постов в сутки канала «%s»: %s (записано в тему).", category.name, self.posts_text(category))
+        return value
+
     async def save_category_views(self, topic_id: int, raw: str):
         """Свои просмотры канала: число или диапазон «1200-1600» - служебным сообщением в его теме."""
         number, top = parse_views_range(raw, low=0)
@@ -608,6 +635,8 @@ class Registry:
             lines.append(REACTIONS_TEXT.format("вкл" if category.reactions else "выкл"))
         if category.rewrite is not None:
             lines.append(REWRITE_TEXT.format("вкл" if category.rewrite else "выкл"))
+        if category.post_limit is not None:
+            lines.append(POSTS_TEXT.format(category.post_limit))
         text = "\n".join(lines)
         if not text:
             # писать нечего: тема без явных настроек остаётся чистой, пустое сообщение Telegram не примет
@@ -727,7 +756,7 @@ class Registry:
             return "В группе пока нет ни одного канала: добавь его кнопкой «➕ Добавить канал»."
         return "\n".join(
             f"  {category.describe()}\n"
-            f"{category.settings_line(self.views_text(category), self.reactions_for(category), self.rewrite_for(category))}"
+            f"{category.settings_line(self.views_text(category), self.reactions_for(category), self.rewrite_for(category), category.post_limit)}"
             for category in self.categories.values()
         )
 
