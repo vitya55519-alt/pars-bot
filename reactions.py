@@ -558,7 +558,7 @@ def payload(link: str, cfg, token: str, key: str) -> dict:
         "rand": "",
         "endtime": "",
         "verify": "",
-        "url_page": "smmnakrutka.ru",
+        "url_page": "free-telegram-reactions",
         "sessionToken": token,
         "permissionKey": key,
         "service": SERVICE_ID,

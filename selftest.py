@@ -15,7 +15,7 @@ from typing import List
 
 from pyrogram.enums import ChatMemberStatus, ChatType, ParseMode
 from pyrogram.errors import ChatForwardsRestricted, FloodWait, Unauthorized
-from pyrogram.types import InputMediaPhoto
+from pyrogram.types import InputMediaPhoto, InputMediaVideo
 from pyrogram.types import Message as _PyrogramMessage
 
 from ai import AiRewriter
@@ -48,6 +48,12 @@ def check(name, condition, detail=""):
 
 
 class Photo:
+    def __init__(self, file_id, file_unique_id=None):
+        self.file_id = file_id
+        self.file_unique_id = file_unique_id or file_id
+
+
+class Video:
     def __init__(self, file_id, file_unique_id=None):
         self.file_id = file_id
         self.file_unique_id = file_unique_id or file_id
@@ -104,12 +110,13 @@ class Message(_PyrogramMessage):
     """Настоящий класс Message, но без тяжёлого __init__: тогда фильтры куриграма видят тип."""
 
     def __init__(self, client, message_id, chat, text=None, caption=None, photo=None,
-                 group=None, thread=None, service=False, reply_to=None, author=None, date=None):
+                 group=None, thread=None, service=False, reply_to=None, author=None, date=None, video=None):
         self.id = message_id
         self.chat = chat
         self.text = text
         self.caption = caption
         self.photo = photo
+        self.video = video
         self.media_group_id = group
         self.message_thread_id = thread
         self.service = service
@@ -286,23 +293,46 @@ class FakeClient:
             self.histories[posted.chat.id].append(posted)
         return posted
 
+    async def send_video(self, chat, file_id, caption=None, **kwargs):
+        if self.flood_left > 0:
+            self.flood_left -= 1
+            raise FloodWait(1)
+        if not isinstance(file_id, str):
+            raise AssertionError("send_video получил объект видео вместо file_id")
+        posted = Message(
+            self, 500 + len(self.posted), await self.get_chat(chat),
+            caption=caption, video=Video(file_id, self.unique_of(file_id)),
+        )
+        self.posted.append(posted)
+        self.histories.setdefault(posted.chat.id, []).append(posted)
+        return posted
+
     def unique_of(self, file_id: str) -> str:
         """Telegram для одного и того же файла отдаёт один file_unique_id - воспроизводим это."""
         for messages in self.histories.values():
             for message in messages:
-                if message.photo and message.photo.file_id == file_id:
-                    return message.photo.file_unique_id
+                media = message.photo or message.video
+                if media and media.file_id == file_id:
+                    return media.file_unique_id
         return file_id
 
     async def send_media_group(self, chat, media):
-        if not all(isinstance(item, InputMediaPhoto) and isinstance(item.media, str) for item in media):
-            raise AssertionError("в альбоме попался объект фото - скачивание")
+        if not 2 <= len(media) <= 10:
+            raise AssertionError("send_media_group требует от 2 до 10 карточек")
+        if not all(isinstance(item, (InputMediaPhoto, InputMediaVideo)) and isinstance(item.media, str) for item in media):
+            raise AssertionError("в альбоме нужны фото или видео по строковому file_id")
         target = await self.get_chat(chat)
+        first_id = 700 + sum(len(album) for album in self.albums)
         posted = [
-            Message(self, 700 + index, target, caption=item.caption or None, photo=Photo(item.media))
+            Message(
+                self, first_id + index, target, caption=item.caption or None, group=f"sent-{len(self.albums)}",
+                photo=Photo(item.media, self.unique_of(item.media)) if isinstance(item, InputMediaPhoto) else None,
+                video=Video(item.media, self.unique_of(item.media)) if isinstance(item, InputMediaVideo) else None,
+            )
             for index, item in enumerate(media)
         ]
         self.albums.append(posted)
+        self.histories.setdefault(target.id, []).extend(posted)
         return posted
 
     async def get_media_group(self, chat_id, message_id):
@@ -527,6 +557,8 @@ async def main():
     await check_registry()
     await check_routing()
     await check_album()
+    await check_videos()
+    await check_video_restart()
     await check_flood_and_ai()
     await check_ai_clean_answer()
     await check_ai_switched_off()
@@ -770,18 +802,21 @@ async def check_text_posts():
     check("текстовый пост до запуска дублем не выгоняет", "Пропущенного нет" in await bot.catch_up(), str(sent_texts()))
     check("проверка о нём честно говорит", "текстовых до запуска не проверить: 1" in await bot.diagnose(), await bot.diagnose())
 
-    clip = Message(client, 64, donor, caption="Обзор тура")
-    clip.video = object()
+    clip = Message(client, 64, donor, caption="Обзор тура", video=Video("tour-video"))
     await bot.on_message(client, clip)
-    check("пост с видео публикует свой текст", len(sent_texts()) == 3, str(sent_texts()))
-    check("носитель вместо текста не тащим", not client.posted and bot.stats["errors"] == 0, str(bot.stats))
+    check("видео копируется по file_id с переписанной подписью",
+          len(client.posted) == 1 and client.posted[0].video
+          and client.posted[0].video.file_id == "tour-video"
+          and client.posted[0].caption == "переписанный текст", str(bot.stats))
+    check("подпись видео не дублируется текстовым постом", len(sent_texts()) == 2, str(sent_texts()))
 
-    cards = [Message(client, 71, donor, group="gv", caption="Нарезка голов"), Message(client, 72, donor, group="gv")]
-    cards[0].video = object()
-    client.donor_messages[donor.id] = cards
-    await bot.on_message(client, cards[0])
-    check("альбом без фото публикует свой текст", len(sent_texts()) == 4, str(sent_texts()))
-    check("пустой альбом не зовёт send_media_group", not client.albums, str(client.albums))
+    document = Message(client, 71, donor, caption="Документ с обзором тура")
+    document.document = SimpleNamespace(file_id="tour-document")
+    await bot.on_message(client, document)
+    check("документ по-прежнему публикует только свой текст",
+          len(sent_texts()) == 3 and sent_texts()[-1] == "переписанный текст", str(sent_texts()))
+    check("документ не попал в фото, видео или альбом",
+          len(client.posted) == 1 and not client.albums and bot.stats["errors"] == 0, str(bot.stats))
 
     client.send_message = original_send
 
@@ -799,13 +834,13 @@ async def check_text_posts():
     fans = client.add_chat(Chat(-10080, title="Обсуждение спорта", username="fan_chat", chat_type=ChatType.SUPERGROUP))
     await registry.add_donor(21, "@fan_chat")
     await bot.on_message(client, Message(client, 77, fans, text="а кто вратаря купил?"))
-    check("реплика из группы-донора в канал не идёт", len(sent_texts()) == 4, str(client.sent))
+    check("реплика из группы-донора в канал не идёт", len(sent_texts()) == 3, str(client.sent))
     check("переписку не считаем постом", bot.stats["caught"] == 3, str(bot.stats))
 
     announcement = Message(client, 78, fans, text="Официально: матч перенесён")
     announcement.sender_chat = fans
     await bot.on_message(client, announcement)
-    check("пост группы-донора публикуется текстом", len(sent_texts()) == 5, str(sent_texts()))
+    check("пост группы-донора публикуется текстом", len(sent_texts()) == 4, str(sent_texts()))
 
 
 async def check_manual_reaction():
@@ -1003,6 +1038,159 @@ async def check_album():
     check("карточки по file_id", [item.photo.file_id for item in posted] == ["a1", "a2", "a3"])
     check("альбом ушёл в канал темы", posted[0].chat.id == world["sport"].id)
     check("промо по карточке с текстом", client.forwarded[0][2] == posted[0].id, str(client.forwarded))
+
+
+async def check_videos():
+    print("\n[3б] Видео и смешанные альбомы сохраняют носители и подписи")
+    world = build_world(make_cfg(promo_delay=0))
+    bot, registry, ai = await make_bot(world)
+    client, donor, target = world["client"], world["donor_sport_1"], world["sport"]
+    donor_filter = client.handlers[0].filters
+
+    bare = Message(client, 101, donor, video=Video("bare-video"))
+    check("настоящий фильтр обработчика берёт видео без подписи", await donor_filter(client, bare))
+    outgoing = Message(client, 102, donor, video=Video("outgoing-video"))
+    outgoing.outgoing = True
+    check("фильтр отсекает исходящее видео без подписи", not await donor_filter(client, outgoing))
+    service = Message(client, 103, donor, video=Video("service-video"), service=True)
+    check("фильтр отсекает сервисное видео", not await donor_filter(client, service))
+    stranger = Message(client, 104, world["stranger"], video=Video("stranger-video"))
+    check("фильтр не берёт видео чужого канала", not await donor_filter(client, stranger))
+    for kind in ("animation", "document", "video_note"):
+        unsupported = Message(client, 105, donor)
+        setattr(unsupported, kind, SimpleNamespace(file_id=f"unsupported-{kind}"))
+        check(f"{kind} без подписи не считается обычным видео", not await donor_filter(client, unsupported))
+
+    fans = client.add_chat(Chat(-10085, title="Обсуждение видео", username="video_fans", chat_type=ChatType.SUPERGROUP))
+    await registry.add_donor(21, "@video_fans")
+    reply = Message(client, 106, fans, video=Video("reply-video"), reply_to=Message(client, 100, fans, text="обсуждение"))
+    # Проверяем зарегистрированную цепочку: фильтр, затем защита от переписки в on_message.
+    if await donor_filter(client, reply):
+        await bot.on_message(client, reply)
+    check("групповая реплика с видео не публикуется", not client.posted and bot.stats["caught"] == 0)
+
+    await registry.toggle_category_rewrite(21)
+    await bot.on_message(client, Message(client, 107, donor, video=Video("author-video"), caption="Обзор матча: 2:1"))
+    check("выключенный рерайт сохраняет подпись видео",
+          len(client.posted) == 1 and client.posted[0].video
+          and client.posted[0].video.file_id == "author-video"
+          and client.posted[0].caption == "Обзор матча: 2:1" and ai.calls == 0)
+    await registry.toggle_category_rewrite(21)
+
+    before = len(client.posted)
+    await bot.on_message(client, bare)
+    await bot.on_message(client, Message(client, 108, donor, video=Video("empty-caption-video"), caption=""))
+    check("видео с None и пустой подписью публикуются без ИИ",
+          len(client.posted) == before + 2 and ai.calls == 0
+          and all(item.video and not item.caption and item.chat.id == target.id for item in client.posted[before:]))
+
+    def media_ids(items):
+        return [("video", item.video.file_id) if item.video else ("photo", item.photo.file_id) for item in items]
+
+    for group, cards, expected in (
+        ("mixed-video", [
+            Message(client, 111, donor, video=Video("mix-v1"), group="mixed-video"),
+            Message(client, 112, donor, photo=Photo("mix-p1"), group="mixed-video", caption="Подпись второй карточки"),
+            Message(client, 113, donor, video=Video("mix-v2"), group="mixed-video"),
+        ], [("video", "mix-v1"), ("photo", "mix-p1"), ("video", "mix-v2")]),
+        ("video-only", [
+            Message(client, 121, donor, video=Video("only-v1"), group="video-only"),
+            Message(client, 122, donor, video=Video("only-v2"), group="video-only", caption="Вторая часть обзора"),
+        ], [("video", "only-v1"), ("video", "only-v2")]),
+    ):
+        client.donor_messages[donor.id] = cards
+        albums_before, calls_before, promo_before = len(client.albums), ai.calls, len(client.forwarded)
+        for card in (cards[0], cards[-1], cards[1], cards[0]):
+            await bot.on_message(client, card)
+        check(f"{group}: повторные карточки не дублируют альбом", len(client.albums) == albums_before + 1)
+        posted = client.albums[-1] if len(client.albums) > albums_before else []
+        check(f"{group}: все фото и видео сохранены по порядку", media_ids(posted) == expected, str(media_ids(posted)))
+        check(f"{group}: подпись второй карточки перенесена только на первую",
+              [item.caption or "" for item in posted] == ["переписанный текст"] + [""] * (len(cards) - 1))
+        check(f"{group}: рерайт и промо ровно один раз",
+              ai.calls == calls_before + 1 and len(client.forwarded) == promo_before + 1
+              and posted and client.forwarded[-1][2] == posted[0].id)
+
+    calls_before, albums_before = ai.calls, len(client.albums)
+    for group, cards, expected in (
+        ("bare-mixed", [
+            Message(client, 131, donor, photo=Photo("bare-photo"), group="bare-mixed"),
+            Message(client, 132, donor, video=Video("bare-mixed-video"), group="bare-mixed"),
+        ], [("photo", "bare-photo"), ("video", "bare-mixed-video")]),
+        ("bare-videos", [
+            Message(client, 133, donor, video=Video("bare-only-v1"), group="bare-videos"),
+            Message(client, 134, donor, video=Video("bare-only-v2"), group="bare-videos"),
+        ], [("video", "bare-only-v1"), ("video", "bare-only-v2")]),
+    ):
+        client.donor_messages[donor.id] = cards
+        before = len(client.albums)
+        for card in cards:
+            await bot.on_message(client, card)
+        posted = client.albums[-1] if len(client.albums) > before else []
+        check(f"{group}: альбом без текста сохраняет все носители",
+              len(client.albums) == before + 1 and media_ids(posted) == expected and all(not item.caption for item in posted))
+    check("альбомы с видео без текста не вызывают ИИ", ai.calls == calls_before and len(client.albums) == albums_before + 2)
+
+    before = len(client.posted)
+    albums_before, calls_before = len(client.albums), ai.calls
+    document = Message(client, 141, donor, group="one-video", caption="Подпись со второй карточки")
+    document.document = SimpleNamespace(file_id="album-document")
+    cards = [Message(client, 140, donor, video=Video("one-supported-video"), group="one-video"), document]
+    client.donor_messages[donor.id] = cards
+    # Событие неподдержанной карточки не должно определять тип итогового поста.
+    await bot.on_message(client, cards[1])
+    await bot.on_message(client, cards[0])
+    check("одно поддержанное видео альбома отправляется через send_video",
+          len(client.posted) == before + 1 and len(client.albums) == albums_before
+          and client.posted[-1].video and client.posted[-1].video.file_id == "one-supported-video")
+    check("единственное видео получает подпись альбома один раз",
+          len(client.posted) == before + 1 and client.posted[-1].caption == "переписанный текст" and ai.calls == calls_before + 1)
+
+    before, albums_before, calls_before = len(client.posted), len(client.albums), ai.calls
+    cards = [Message(client, 151 + index, donor, photo=Photo(f"bare-photo-{index}"), group="bare-photos") for index in range(2)]
+    client.donor_messages[donor.id] = cards
+    for card in cards:
+        await bot.on_message(client, card)
+    await bot.on_message(client, Message(client, 153, donor, photo=Photo("bare-single-photo")))
+    check("фото и фотоальбом без подписи по-прежнему пропускаются",
+          len(client.posted) == before and len(client.albums) == albums_before and ai.calls == calls_before)
+    check("видео и альбомы не создают текстовых дублей", not [text for chat, text in client.sent if chat == target.id])
+    check("видеопубликации не вызвали ошибок", bot.stats["errors"] == 0, str(bot.stats))
+
+
+async def check_video_restart():
+    print("\n[3в] Видео без подписи узнаётся после перезапуска по file_unique_id")
+    world = build_world(make_cfg(promo_delay=0))
+    client, donor, target = world["client"], world["donor_sport_1"], world["sport"]
+    source = Message(client, 161, donor, video=Video("source-video-id", "stable-video-id"), date=ago(120))
+    client.histories[donor.id] = [source]
+    client.histories[target.id] = []
+    bot, _, ai = await make_bot(world)
+    await bot.on_message(client, source)
+    check("видео записано в историю с исходным file_unique_id",
+          len(client.histories[target.id]) == 1 and client.histories[target.id][0].video
+          and client.histories[target.id][0].video.file_unique_id == "stable-video-id")
+
+    delivered = Message(client, 161, donor, video=Video("refreshed-video-id", "stable-video-id"), date=ago(120))
+    missed = Message(client, 162, donor, video=Video("missed-video-id", "missed-unique-id"), date=ago(90))
+    client.histories[donor.id] = [delivered, missed]
+    restarted, registry, restart_ai = await make_bot(world)
+    published = await restarted._published_ids(registry.categories[21], 50)
+    check("после перезапуска индекс содержит video.file_unique_id", "stable-video-id" in published, str(published))
+    check("смена file_id не дублирует доставленное видео", restarted._carried(delivered, published))
+    check("видео до запуска проверяемо, в отличие от старого текста", not restarted._unverifiable(missed))
+    check("догон видит только недоставленное видео без подписи",
+          restarted._not_carried([delivered, missed], published) == [missed])
+    before = len(client.posted)
+    result = await restarted.catch_up()
+    check("после перезапуска догон публикует ровно пропущенное видео",
+          "Догнал 1" in result and len(client.posted) == before + 1
+          and client.posted[-1].video and client.posted[-1].video.file_id == "missed-video-id", result)
+    again, _, again_ai = await make_bot(world)
+    result = await again.catch_up()
+    check("повторный перезапуск не дублирует видео без подписи",
+          "Пропущенного нет" in result and len(client.posted) == before + 1, result)
+    check("догон видео без подписи обходится без ИИ", ai.calls == restart_ai.calls == again_ai.calls == 0)
 
 
 async def check_flood_and_ai():
@@ -1826,6 +2014,7 @@ async def check_reactions():
     check("форма уходит с ключом разрешения", data["permissionKey"] == "kluch123" and data["sessionToken"] == token, str(data["permissionKey"]))
     check("в заказе есть ссылка поста", data["link"] == "https://t.me/yumor_ch/77?single", str(data["link"]))
     check("заказаны именно реакции", data["quantity-text"] == "Реакции Телеграм" and data["service"] == "680", str(data["service"]))
+    check("в форме название страницы, а не домен", data["url_page"] == "free-telegram-reactions", str(data["url_page"]))
     check(
         "набор полей как в браузере",
         data["formservices[]"] and data["tildaspec-formid"] == "form510249937" and data["tildaspec-projectid"] == "4412478",
@@ -3064,6 +3253,61 @@ async def check_tenants():
     before = len(client.posted)
     await bot.on_message(client, Message(client, 302, world["stranger"], caption="пост чужого канала"))
     check("чужой канал не публикуется никому", len(client.posted) == before and ai.calls == 1, f"{len(client.posted)} / {ai.calls}")
+
+    cards = [
+        Message(client, 311, donor, video=Video("tenant-album-v1"), group="tenant-mixed"),
+        Message(client, 312, donor, photo=Photo("tenant-album-p1"), group="tenant-mixed", caption="Общий видеообзор"),
+        Message(client, 313, donor, video=Video("tenant-album-v2"), group="tenant-mixed"),
+    ]
+    client.donor_messages[donor.id] = cards
+    scheduled = []
+    original_schedule = bot.reactions.schedule
+
+    def record_schedule(message, *args, **kwargs):
+        scheduled.append((message.chat.id, message.id))
+        return original_schedule(message, *args, **kwargs)
+
+    bot.reactions.schedule = record_schedule
+    albums_before, promo_before, ai_before = len(client.albums), len(client.forwarded), ai.calls
+    published_before, sent_before = bot.stats["published"], len(client.sent)
+    quota_before = dict(store.usage)
+    try:
+        for card in (cards[0], cards[2], cards[1], cards[0], cards[2]):
+            await bot.on_message(client, card)
+    finally:
+        bot.reactions.schedule = original_schedule
+        if bot.reactions._worker:
+            bot.reactions._worker.cancel()
+
+    albums = client.albums[albums_before:]
+    check("смешанный альбом ушёл ровно по одному разу складу и двум клиентам",
+          len(albums) == 3 and {album[0].chat.id for album in albums} == {world["sport"].id, chan_a.id, chan_b.id})
+    check("клиентские альбомы сохранили видео, фото, видео и одну подпись",
+          len(albums) == 3 and all(
+              len(album) == 3 and album[0].video and album[0].video.file_id == "tenant-album-v1"
+              and album[1].photo and album[1].photo.file_id == "tenant-album-p1"
+              and album[2].video and album[2].video.file_id == "tenant-album-v2"
+              and [item.caption or "" for item in album] == ["переписанный текст", "", ""]
+              for album in albums))
+    check("повтор карточек не повторяет клиентский рерайт и публикации",
+          ai.calls == ai_before + 1 and bot.stats["published"] == published_before + 3)
+    check("каждый клиент платит один пост квоты за весь альбом",
+          store.usage[5001] == quota_before[5001] + 1 and store.usage[5002] == quota_before[5002] + 1
+          and store.usage[5003] == quota_before[5003] and store.usage[5004] == quota_before[5004], str(store.usage))
+    first_cards = {(album[0].chat.id, album[0].id) for album in albums}
+    forwarded = client.forwarded[promo_before:]
+    check("промо получает только первую карточку каждого альбома",
+          len(forwarded) == 3 and {(chat_id, message_id) for _, chat_id, message_id in forwarded} == first_cards,
+          str(forwarded))
+    reacted = {(chat_id, message_id) for chat_id, message_id in first_cards if chat_id != chan_b.id}
+    check("реакции вызываются один раз на альбом, а не на каждую карточку",
+          len(scheduled) == 2 and set(scheduled) == reacted, str(scheduled))
+    check("кабинет запомнил первую карточку клиентского альбома",
+          any(album[0].chat.id == chan_a.id and store.tenants[5001].last_post_id == album[0].id for album in albums))
+    check("клиентские видеоальбомы не дублируются одиночными или текстовыми постами",
+          len(client.posted) == before and not [text for chat, text in client.sent[sent_before:]
+                                                if chat in {world["sport"].id, chan_a.id, chan_b.id}])
+    check("смешанные клиентские альбомы без ошибок", bot.stats["errors"] == 0, str(bot.stats))
 
 
 async def check_clients_sync():

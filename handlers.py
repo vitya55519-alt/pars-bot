@@ -1,10 +1,10 @@
 """Поймал пост донора -> переписал текст -> опубликовал в свой канал.
 
-Берём любой пост донора, в котором есть текст: с картинкой - картинкой по
-file_id (ничего не скачиваем), альбом - пачкой карточек, без картинки - просто
-текстом. У поста с видео или документом переносим только текст: такие носители
-мы по file_id не отдаём, о чём пишет в журнал. Пост без текста не публикуем -
-перепечатывать нечего. Если донор - группа, а не канал, ловим только посты
+Картинки и видео переносим по file_id (ничего не скачиваем), альбомы - вместе,
+сохраняя порядок фотографий и роликов. Видео публикуем и без подписи, не
+отправляя пустой текст нейросети. У документов и остальных неподдержанных
+носителей переносим только текст, о чём пишем в журнал. Фото без подписи,
+как прежде, пропускаем. Если донор - группа, а не канал, ловим только посты
 самого чата: реплики подписчиков в канал не идут.
 """
 
@@ -19,7 +19,7 @@ from pyrogram import filters
 from pyrogram.enums import ChatMemberStatus, ChatType, ParseMode
 from pyrogram.errors import ChatForwardsRestricted
 from pyrogram.handlers import MessageHandler
-from pyrogram.types import InputMediaPhoto, Message
+from pyrogram.types import InputMediaPhoto, InputMediaVideo, Message
 
 from ai import cut
 from commands import Controls
@@ -39,7 +39,7 @@ CATCH_UP_LIMIT = 10
 HEARTBEAT_SECONDS = 900
 WRITING_STATUSES = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
 # носители, которые мы по file_id не переносим: у такого поста в канал пойдёт только текст
-OTHER_MEDIA = ("video", "animation", "document", "audio", "voice", "video_note", "sticker")
+OTHER_MEDIA = ("animation", "document", "audio", "voice", "video_note", "sticker")
 
 
 @dataclass
@@ -69,8 +69,18 @@ def post_text(message: Message) -> str:
     return (message.caption or message.text or "").strip()
 
 
+def post_media(message: Message):
+    """Переносимый файл поста: фотография или обычный видеоролик."""
+    return message.photo or getattr(message, "video", None)
+
+
+def has_content(message: Message) -> bool:
+    """Текст или видео без подписи; прежний пропуск пустых фотографий сохраняем."""
+    return bool(post_text(message) or getattr(message, "video", None))
+
+
 def other_media(message: Message) -> str:
-    """Чем занят пост, кроме картинки: видеоролик, документ, голос. Пусто - картинка или текст."""
+    """Неподдержанный носитель: документ, анимация, голос. Переносим только его текст."""
     return next((kind for kind in OTHER_MEDIA if getattr(message, kind, None) is not None), "")
 
 
@@ -118,8 +128,8 @@ class ParsBot:
             return bool(self.clients) and message.chat.id in self.clients.chats
 
         is_donor = filters.create(interested)
-        has_text = (filters.photo | filters.text | filters.caption) & ~filters.service
-        self.client.add_handler(MessageHandler(self.on_message, is_donor & has_text & ~filters.outgoing))
+        has_post = (filters.photo | filters.video | filters.text | filters.caption) & ~filters.service
+        self.client.add_handler(MessageHandler(self.on_message, is_donor & has_post & ~filters.outgoing))
         self.controls.setup()
 
         log.info("Каналов, откуда берём посты: %s.", self.registry.donor_count)
@@ -148,7 +158,7 @@ class ParsBot:
             return f"не открылся ({type(exc).__name__}) - этот аккаунт должен быть подписан"
         if not history:
             return "сообщений нет"
-        posts = [message for message in history if post_text(message)]
+        posts = [message for message in history if has_content(message)]
         if not posts:
             return f"постов с текстом не нашли (последнее сообщение {self._ago(history[-1])})"
         return f"последний пост {self._ago(posts[-1])}"
@@ -284,8 +294,8 @@ class ParsBot:
         )
 
         original = post_text(message)
-        if not original:
-            log.info("В посте нет текста - пропуск (перепечатывать нечего).")
+        if not has_content(message):
+            log.info("В посте нет текста или видео - пропуск.")
             return
 
         author = self._drop_source(original, message.chat)
@@ -300,6 +310,8 @@ class ParsBot:
 
     async def _rewritten(self, message: Message, dests: List[Destination], author: str) -> str:
         """Переписанный текст считаем только если он кому-то нужен: лишний запрос к ИИ - лишние деньги."""
+        if not author:
+            return ""
         if not self.cfg.ai_enabled:
             # REWRITE=0 - общий выключатель: ни одного обращения к MiniMax, даже если
             # у канала переписывание осталось включённым с прежних времён.
@@ -335,7 +347,17 @@ class ParsBot:
         return left
 
     async def _publish(self, dest: Destination, message: Message, text: str) -> Message:
-        """Картинку несём по file_id, пост без картинки уходит в канал текстом - как есть, без разметки."""
+        """Фото и видео несём по file_id вместе с подписью, текстовый пост - без разметки."""
+        video = getattr(message, "video", None)
+        if video:
+            return await call(
+                self.client.send_video,
+                dest.target,
+                video.file_id,
+                caption=cut(text, self.cfg.caption_limit),
+                parse_mode=ParseMode.DISABLED,
+                has_spoiler=getattr(message, "has_media_spoiler", None),
+            )
         if message.photo:
             return await call(
                 self.client.send_photo,
@@ -365,35 +387,46 @@ class ParsBot:
         await asyncio.sleep(self.cfg.album_wait)
 
         items = await call(self.client.get_media_group, message.chat.id, message.id)
-        photos = [item for item in items if item.photo]
+        media_items = [item for item in items if post_media(item)][:TELEGRAM_ALBUM_LIMIT]
         original = next((item.caption for item in items if (item.caption or "").strip()), "").strip()
-        if not original:
-            log.info("В альбоме %s нет текста - пропуск.", group_id)
+        if not original and not any(getattr(item, "video", None) for item in media_items):
+            log.info("В альбоме %s нет текста или видео - пропуск.", group_id)
             return
 
         author = self._drop_source(original, message.chat)
         rewritten = await self._rewritten(message, dests, author)
 
-        if not photos:
-            log.info("В альбоме %s нет фото - публикую его текст обычным постом.", group_id)
+        if len(media_items) < 2:
+            # Telegram не принимает альбом из одного файла: отправляем его обычным постом.
+            source = media_items[0] if media_items else message
             for dest in dests:
                 if not await self._allowed(dest):
                     continue
-                posted = await self._publish(dest, message, self._text_for(dest, author, rewritten))
+                posted = await self._publish(dest, source, self._text_for(dest, author, rewritten))
                 await self._published(dest, posted, message)
                 await self._boost(dest, posted)
             return
 
-        log.info("Альбом: карточек %s, текстов %s символов.", len(photos[:TELEGRAM_ALBUM_LIMIT]), len(rewritten or author))
+        log.info(
+            "Альбом: файлов %s (видео %s), текстов %s символов.",
+            len(media_items),
+            sum(bool(getattr(item, "video", None)) for item in media_items),
+            len(rewritten or author),
+        )
 
         for dest in dests:
             if not await self._allowed(dest):
                 continue
             caption = cut(self._text_for(dest, author, rewritten), self.cfg.caption_limit)
-            media: List[InputMediaPhoto] = [
-                InputMediaPhoto(media=item.photo.file_id, caption=caption if index == 0 else "")
-                for index, item in enumerate(photos[:TELEGRAM_ALBUM_LIMIT])
-            ]
+            media: List[Union[InputMediaPhoto, InputMediaVideo]] = []
+            for index, item in enumerate(media_items):
+                media_type = InputMediaVideo if getattr(item, "video", None) else InputMediaPhoto
+                media.append(media_type(
+                    media=post_media(item).file_id,
+                    caption=caption if index == 0 else "",
+                    parse_mode=ParseMode.DISABLED,
+                    has_spoiler=getattr(item, "has_media_spoiler", None),
+                ))
             posted = await call(self.client.send_media_group, dest.target, media)
             main_message = next((item for item in posted if (item.caption or "").strip()), posted[0])
             await self._published(dest, main_message, message)
@@ -418,7 +451,9 @@ class ParsBot:
                 log.error("Клиент %s: пост в учёт не записан (%s: %s).", dest.tenant_id, type(exc).__name__, exc)
 
     def _what_posted(self, message: Message) -> str:
-        """Чем заполнен пост у нас в канале - по журналу видно, ушла картинка или только текст."""
+        """По журналу видно, что ушло в канал: видео, картинка или только текст."""
+        if getattr(message, "video", None):
+            return "видео с текстом" if (message.caption or "").strip() else "видео без подписи"
         if message.photo:
             return "картинка с текстом"
         if (message.text or "").strip():
@@ -455,11 +490,11 @@ class ParsBot:
         return items
 
     async def _published_ids(self, category: Category, limit: int) -> Set[str]:
-        """Картинки, которые уже лежат в нашем канале: по ним и проверяем, что дошло."""
+        """Фото и видео, которые уже лежат в нашем канале: по ним проверяем доставку."""
         return {
-            message.photo.file_unique_id
+            post_media(message).file_unique_id
             for message in await self._history(category.target, limit)
-            if message.photo
+            if post_media(message)
         }
 
     def _unverifiable(self, message: Message) -> bool:
@@ -469,24 +504,25 @@ class ParsBot:
         считаем такой пост доставленным - дубль в канале хуже пропущенного поста.
         """
         return (
-            not message.photo
+            not post_media(message)
             and post_key(message) not in self._sent_posts
             and not (message.date and as_utc(message.date) > as_utc(self.started))
         )
 
     def _carried(self, message: Message, published: Set[str]) -> bool:
-        """Дошёл ли пост до канала: картинку видно по file_unique_id, текст - по отправленному в этом запуске."""
+        """Фото и видео опознаём по file_unique_id, текст - по отправленному в этом запуске."""
         if post_key(message) in self._sent_posts:
             return True
-        if message.photo:
-            return message.photo.file_unique_id in published
+        media = post_media(message)
+        if media:
+            return media.file_unique_id in published
         return self._unverifiable(message)
 
     def _not_carried(self, history: List[Message], published: Set[str]) -> List[Message]:
         return [
             message
             for message in history
-            if post_text(message) and not self._carried(message, published)
+            if has_content(message) and not self._carried(message, published)
         ]
 
     async def _missed(self, category: Category, limit: int = LOOKBACK) -> List[Message]:
@@ -565,7 +601,7 @@ class ParsBot:
             history = await self._history(category.target, REACTIONS_LOOKBACK)
         except Exception as exc:  # noqa: BLE001 - канал мог закрыться для этого аккаунта
             return f"канал не открылся ({type(exc).__name__})"
-        posts = [message for message in reversed(history) if post_text(message)][:show]
+        posts = [message for message in reversed(history) if has_content(message)][:show]
         if not posts:
             return "постов с текстом в канале нет"
         return " · ".join(f"пост {message.id}: {count_reactions(message)}" for message in posts)
@@ -577,7 +613,7 @@ class ParsBot:
             return f"не открылся ({type(exc).__name__})"
         if not history:
             return "сообщений нет"
-        posts = [message for message in history if post_text(message)]
+        posts = [message for message in history if has_content(message)]
         missed = self._not_carried(history, published)
         blind = [message for message in posts if self._unverifiable(message)]
         stamp = self._ago(posts[-1] if posts else history[-1])
