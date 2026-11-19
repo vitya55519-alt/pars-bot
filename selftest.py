@@ -1425,6 +1425,15 @@ async def check_ai_switched_off():
         check("REWRITE=выкл снова выключает", Config.load().ai_enabled is False)
         os.environ.pop("REWRITE", None)
         check("без REWRITE один REWRITE_DEFAULT нейросеть не включает", Config.load().ai_enabled is False)
+        os.environ["PROMO_VIEWS"] = "1200-1600"
+        loaded = Config.load()
+        check("PROMO_VIEWS принимает диапазон", loaded.promo_views == 1200 and loaded.promo_views_max == 1600,
+              f"{loaded.promo_views}-{loaded.promo_views_max}")
+        os.environ["PROMO_VIEWS"] = "144"
+        loaded = Config.load()
+        check("одиночный PROMO_VIEWS работает как раньше", loaded.promo_views == 144 and loaded.promo_views_max is None,
+              str(loaded.promo_views_max))
+        os.environ.pop("PROMO_VIEWS", None)
     finally:
         os.environ.clear()
         os.environ.update(real_env)
@@ -2191,6 +2200,10 @@ async def check_panel_access_and_pause():
     await store.set_target(customer.id, target.username, target.id, target.title)
     await store.set_target_ok(customer.id, True)
     await store.set_views(customer.id, 0)
+    await store.set_views(customer.id, 1200, 1600)
+    check("диапазон клиента сохраняется", tenant.views == 1200 and tenant.views_max == 1600, f"{tenant.views}-{tenant.views_max}")
+    await store.set_views(customer.id, 0)
+    check("ноль снимает и диапазон", tenant.views == 0 and tenant.views_max is None, str(tenant.views_max))
     await store.set_reactions(customer.id, False)
     tenant.renew("week")
     await store.add_donor(customer.id, world["donor_sport_1"].username)
@@ -2788,6 +2801,27 @@ async def check_views():
           rejects_low(str(VIEWS_LIMIT + 1)))
     check("не число отклонено", rejects("много").startswith("Напиши одно число"), rejects("много"))
 
+    from config import parse_views_range
+
+    def rejects_range(raw):
+        try:
+            parse_views_range(raw)
+        except ValueError as exc:
+            return str(exc)
+        return ""
+
+    check("диапазон читается", parse_views_range("1200-1600") == (1200, 1600), str(parse_views_range("1200-1600")))
+    check("слово «до» тоже диапазон", parse_views_range("1200 до 1600") == (1200, 1600), str(parse_views_range("1200 до 1600")))
+    check("тире-палочка подходит", parse_views_range("1200–1600") == (1200, 1600), str(parse_views_range("1200–1600")))
+    check("одиночное число - как раньше", parse_views_range("144") == (144, None), str(parse_views_range("144")))
+    check("равные границы сворачиваются в число", parse_views_range("1200-1200") == (1200, None), str(parse_views_range("1200-1200")))
+    check("перевёрнутый диапазон отклонён", rejects_range("1600-1200").startswith("В диапазоне первое число"), rejects_range("1600-1200"))
+    check("диапазон не начинается с нуля", rejects_range("0-1600").startswith("Просмотров должно быть"), rejects_range("0-1600"))
+    check("одиночный ноль - по-прежнему выбор", parse_views_range("0", low=0) == (0, None), str(parse_views_range("0", low=0)))
+    check("потолок сервиса и для верха диапазона", rejects_range(f"100-{VIEWS_LIMIT + 1}").startswith("Просмотров должно быть"),
+          rejects_range(f"100-{VIEWS_LIMIT + 1}"))
+    check("три числа - не диапазон", rejects_range("1-2-3").startswith("Напиши одно число или два"), rejects_range("1-2-3"))
+
     cfg = make_cfg(promo_views=1000)
     world = build_world(cfg)
     client, group = world["client"], world["group"]
@@ -2803,8 +2837,8 @@ async def check_views():
     check("каналы без своих настроек берут новое число", registry.views_for(registry.categories[21]) == 3000,
           str(registry.views_for(registry.categories[21])))
 
-    number = await registry.save_category_views(21, "144")
-    check("свои просмотры канала применены", number == 144 and registry.views_for(registry.categories[21]) == 144, str(number))
+    number, top = await registry.save_category_views(21, "144")
+    check("свои просмотры канала применены", (number, top) == (144, None) and registry.views_for(registry.categories[21]) == 144, str(number))
     check("другой канал не тронут", registry.views_for(registry.categories[22]) == 3000,
           str(registry.views_for(registry.categories[22])))
     check("настройка записана в тему канала", client.topic_posts[-1] == (group.id, "Просмотры: 144", 21), str(client.topic_posts[-1]))
@@ -2821,8 +2855,32 @@ async def check_views():
     check("плохое число не меняет настройку",
           (await _raises(registry.save_category_views, 21, "много")) and registry.views_for(registry.categories[21]) == 2000,
           str(registry.views_for(registry.categories[21])))
-    check("ноль - осознанный выбор канала", await registry.save_category_views(21, "0") == 0
+    check("ноль - осознанный выбор канала", await registry.save_category_views(21, "0") == (0, None)
           and registry.views_for(registry.categories[21]) == 0, str(registry.views_for(registry.categories[21])))
+
+    number, top = await registry.save_category_views(21, "1200 до 1600")
+    check("диапазон сохранён для канала", (number, top) == (1200, 1600), f"{number}-{top}")
+    check("низ диапазона - число канала", registry.views_for(registry.categories[21]) == 1200 and
+          registry.views_max_for(registry.categories[21]) == 1600, str(registry.views_max_for(registry.categories[21])))
+    check("служебное сообщение хранит диапазон", client.edits[-1][2] == "Просмотры: 1200-1600", str(client.edits[-1][2]))
+    check("в настройках диапазон виден", registry.views_text(registry.categories[21]) == "1200-1600",
+          registry.views_text(registry.categories[21]))
+    await registry.rebuild()
+    check("диапазон пережил перечитку", registry.views_for(registry.categories[21]) == 1200 and
+          registry.views_max_for(registry.categories[21]) == 1600, registry.views_text(registry.categories[21]))
+    check("перевёрнутый диапазон каналу не пишется",
+          (await _raises(registry.save_category_views, 21, "1600-1200")) and registry.views_for(registry.categories[21]) == 1200,
+          str(registry.views_for(registry.categories[21])))
+
+    common = next(m for m in client.group_messages if (m.text or "").startswith("Просмотры") and m.message_thread_id == 1)
+    common.text = "Просмотры: 900-1500"
+    await registry.rebuild()
+    check("диапазон по умолчанию прочитан из общей темы",
+          registry.views == 900 and registry.views_max == 1500 and cfg.promo_views == 900 and cfg.promo_views_max == 1500,
+          f"{registry.views}-{registry.views_max}")
+    check("канал без своей настройки берёт диапазон по умолчанию",
+          registry.views_for(registry.categories[22]) == 900 and registry.views_max_for(registry.categories[22]) == 1500,
+          registry.views_text(registry.categories[22]))
 
     enabled = await registry.toggle_category_reactions(22)
     check("реакции канала включились", enabled is True and registry.reactions_for(registry.categories[22]) is True, str(enabled))
@@ -2840,6 +2898,8 @@ async def check_views():
     check("оба поля восстановились после перечитки",
           registry.views_for(registry.categories[22]) == 500 and registry.reactions_for(registry.categories[22]) is False,
           f"{registry.views_for(registry.categories[22])} / {registry.reactions_for(registry.categories[22])}")
+    check("своё одиночное число не берёт потолок по умолчанию", registry.views_max_for(registry.categories[22]) is None,
+          str(registry.views_max_for(registry.categories[22])))
 
     off = await registry.toggle_category_rewrite(22)
     check("переписывание канала выключилось", off is False and registry.rewrite_for(registry.categories[22]) is False, str(off))
@@ -2862,6 +2922,17 @@ async def check_views():
     await bot.on_message(live["client"], Message(live["client"], 61, live["donor_other"], caption="пост", photo=Photo("v1")))
     check("промо-бот получает число канала", ("promo_bot", "4500") in live["client"].sent, str(live["client"].sent[-1]))
     check("выключенные реакции канала не ставят пост в очередь", len(bot.reactions._queue) == 0, str(list(bot.reactions._queue)))
+    await live_registry.save_category_views(22, "1200-1600")
+    await bot.on_message(live["client"], Message(live["client"], 62, live["donor_other"], caption="второй пост", photo=Photo("v2")))
+    orders = [body for chat, body in live["client"].sent if chat == "promo_bot"]
+    check("промо-бот получает случайное число из диапазона", orders and 1200 <= int(orders[-1]) <= 1600, str(orders[-1:]))
+    from handlers import Destination
+    single = Destination(target="t", name="н", label="л", views=4500)
+    check("без диапазона число ровно своё", bot._roll_views(single) == 4500, str(bot._roll_views(single)))
+    ranged = Destination(target="t", name="н", label="л", views=1200, views_max=1600)
+    rolls = {bot._roll_views(ranged) for _ in range(40)}
+    check("диапазон катится внутри границ", all(1200 <= v <= 1600 for v in rolls), str(sorted(rolls)[:4]))
+    check("диапазон правда разный", len(rolls) > 1, str(len(rolls)))
 
     panel_cfg = make_cfg(bot_token="900:AAstub", promo_views=1000, promo_delay=0, reactions_enabled=False)
     panel_world = build_world(panel_cfg)
@@ -2917,6 +2988,22 @@ async def check_views():
     await panel.on_button(pclient, press("cv|21|0"))
     check("ноль кнопкой - не накручивать", panel_registry.views_for(panel_registry.categories[21]) == 0,
           str(panel_registry.views_for(panel_registry.categories[21])))
+
+    await panel.on_button(pclient, press("cv|21"))
+    await panel.on_message(pclient, Message(pclient, 9005, owner, text="1200-1600"))
+    check("введённый диапазон применён к каналу",
+          panel_registry.views_for(panel_registry.categories[21]) == 1200 and
+          panel_registry.views_max_for(panel_registry.categories[21]) == 1600,
+          panel_registry.views_text(panel_registry.categories[21]))
+    check("панель объясняет случайное число", "случайное число от 1200 до 1600" in pclient.replies[-1][1],
+          str(pclient.replies[-1][1][:140]))
+    await panel.on_button(pclient, press("cv|21"))
+    check("экран ввода показывает диапазон", "Сейчас: случайное число от 1200 до 1600" in pclient.edits[-1][2],
+          pclient.edits[-1][2][:200])
+    check("экран ввода объясняет формат", "например 1200-1600" in pclient.edits[-1][2], pclient.edits[-1][2][:300])
+    await panel.on_button(pclient, press("settings|21"))
+    check("в настройках темы виден диапазон", "случайное число от 1200 до 1600" in pclient.edits[-1][2],
+          pclient.edits[-1][2][:300])
 
     await panel.on_button(pclient, press("status"))
     check("статус не смешивает дефолты просмотров с результатами",
@@ -3020,6 +3107,7 @@ def _tenant_row(tenant_id: int = 777, balance: int = 0, until=None, target: str 
         "target_title": "Канал клиента",
         "target_ok": False,
         "views": 0,
+        "views_max": None,
         "reactions": True,
         "rewrite": True,
         "balance_rub": balance,
@@ -3098,8 +3186,9 @@ class MemoryStore:
         tenant = await self.ensure_tenant(tenant_id)
         tenant.target, tenant.target_id, tenant.target_title, tenant.target_ok = target, target_id, title or "", False
 
-    async def set_views(self, tenant_id, views):
-        (await self.ensure_tenant(tenant_id)).views = views
+    async def set_views(self, tenant_id, views, views_max=None):
+        tenant = await self.ensure_tenant(tenant_id)
+        tenant.views, tenant.views_max = views, views_max
 
     async def set_reactions(self, tenant_id, enabled):
         (await self.ensure_tenant(tenant_id)).reactions = enabled
@@ -3696,6 +3785,22 @@ async def check_cabinet_navigation(panel, client, store, nina):
     await tap("cviews|500")
     await say("777")
     check("готовое число отменяет дальнейший ввод", store.tenants[nina.id].views == 500 and nina.id not in cab.awaiting)
+    await tap("cviews")
+    await say("1200 до 1600")
+    check("диапазон сохранён в кабинете", store.tenants[nina.id].views == 1200 and store.tenants[nina.id].views_max == 1600,
+          f"{store.tenants[nina.id].views}-{store.tenants[nina.id].views_max}")
+    recent = " | ".join([r[1] for r in client.replies[-3:] if len(r) > 1 and r[1]] + [e[2] for e in client.edits[-3:] if len(e) > 2 and e[2]])
+    check("кабинет объясняет случайное число", "случайное число от 1200 до 1600" in recent, recent[:120])
+    body, _keyboard = await cab._view(nina.id, "views")
+    check("экран просмотров показывает диапазон", "Сейчас: заказывать от 1200 до 1600 на каждый пост (случайное число)" in body,
+          body[:220])
+    await tap("cviews")
+    await say("1600-1200")
+    check("перевёрнутый диапазон оставляем на повторе",
+          cab.awaiting.get(nina.id) == ("views", 0) and store.tenants[nina.id].views == 1200, str(cab.awaiting.get(nina.id)))
+    await say("0")
+    check("ноль в кабинете гасит и диапазон", store.tenants[nina.id].views == 0 and store.tenants[nina.id].views_max is None,
+          str(store.tenants[nina.id].views_max))
     await tap("cadd")
     await say("/start")
     check("старт отменяет старое ожидание", nina.id not in cab.awaiting)
@@ -3785,11 +3890,11 @@ async def check_tenants():
     bot.reactions._next_slot = time.monotonic() + 3600
     donor = world["donor_sport_1"]
 
-    async def tenant(user_id, chan, views=0, reactions=True, paid=True, quota=0):
+    async def tenant(user_id, chan, views=0, reactions=True, paid=True, quota=0, views_max=None):
         await store.ensure_tenant(user_id)
         await store.set_target(user_id, chan.username, chan.id, chan.title)
         store.tenants[user_id].target_ok = True
-        await store.set_views(user_id, views)
+        await store.set_views(user_id, views, views_max)
         await store.set_reactions(user_id, reactions)
         await store.add_donor(user_id, donor.username)
         store.donors[(user_id, donor.username)].chat_id = donor.id
@@ -3798,7 +3903,7 @@ async def check_tenants():
             await store.buy(user_id, "week")
         store.usage[user_id] = quota
 
-    await tenant(5001, chan_a, views=1000)
+    await tenant(5001, chan_a, views=1000, views_max=1200)
     await tenant(5002, chan_b, views=0, reactions=False)
     await tenant(5003, chan_c, paid=False)
     await tenant(5004, chan_d, views=500, quota=MAX_POSTS_PER_DAY)
@@ -3817,7 +3922,8 @@ async def check_tenants():
     check("с исчерпанным лимитом тоже", chan_d.id not in targets, str(targets))
 
     numbers = [value for chat, value in client.sent if chat == "promo_bot"]
-    check("клиенту идут его просмотры", "1000" in numbers, str(numbers))
+    check("клиент получает случайное число из своего диапазона",
+          any(value.isdigit() and 1000 <= int(value) <= 1200 for value in numbers), str(numbers))
     check("складу - число из переменной", "25" in numbers, str(numbers))
     check("нулевые просмотры не отправляются", "0" not in numbers, str(numbers))
     queued_links = list(bot.reactions._queue)

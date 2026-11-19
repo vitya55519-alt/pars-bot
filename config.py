@@ -1,7 +1,7 @@
 import os
 import re
 from dataclasses import dataclass, field
-from typing import List, Union
+from typing import List, Optional, Union
 
 MINIMAX_URL = "https://api.minimax.io/v1/chat/completions"
 DEFAULT_MODEL = "MiniMax-M3"
@@ -85,6 +85,28 @@ def parse_views(raw: str, low: int = 1) -> int:
     return value
 
 
+def parse_views_range(raw: str, low: int = 1):
+    """Просмотры из строки пользователя: одно число («144») или диапазон («1200-1600», «1200 до 1600»).
+
+    Возвращает пару (от, до); для одного числа «до» - None. Диапазон начинается
+    минимум с 1: ноль остаётся одиночным осознанным «не накручивать».
+    """
+    text = re.sub(r"[–—]", "-", str(raw or "").strip())
+    text = re.sub(r"\s*до\s*", "-", text, flags=re.IGNORECASE)
+    chunks = [chunk.strip() for chunk in text.split("-") if chunk.strip()]
+    if len(chunks) == 1:
+        return parse_views(chunks[0], low=low), None
+    if len(chunks) != 2:
+        raise ValueError("Напиши одно число или два через черточку, например 1200 или 1200-1600.")
+    minimum = parse_views(chunks[0], low=max(low, 1))
+    maximum = parse_views(chunks[1], low=1)
+    if maximum < minimum:
+        raise ValueError("В диапазоне первое число должно быть не больше второго, например 1200-1600.")
+    if maximum == minimum:
+        return minimum, None
+    return minimum, maximum
+
+
 @dataclass
 class Config:
     api_id: int
@@ -105,6 +127,7 @@ class Config:
     ai_retry_delay: int = 5
     promo_button: str = "Просмотры"
     promo_views: int = 0
+    promo_views_max: Optional[int] = None
     promo_delay: int = 3
     reactions_enabled: bool = True
     reactions_interval: int = 300
@@ -154,6 +177,11 @@ class Config:
         if missing:
             raise ConfigError("Не заданы переменные: " + ", ".join(missing))
 
+        try:
+            promo_views, promo_views_max = parse_views_range(_text("PROMO_VIEWS"), low=0)
+        except ValueError:
+            promo_views, promo_views_max = int(_number("PROMO_VIEWS", 0)), None
+
         return cls(
             api_id=int(_number("API_ID", 0)),
             api_hash=_text("API_HASH"),
@@ -172,7 +200,8 @@ class Config:
             ai_retries=int(_number("AI_RETRIES", 3)),
             ai_retry_delay=int(_number("AI_RETRY_DELAY", 5)),
             promo_button=_text("PROMO_BUTTON", "Просмотры"),
-            promo_views=int(_number("PROMO_VIEWS", 0)),
+            promo_views=promo_views,
+            promo_views_max=promo_views_max,
             promo_delay=int(_number("PROMO_DELAY", 3)),
             reactions_enabled=_flag("REACTIONS", True),
             reactions_interval=max(60, int(_number("REACTIONS_INTERVAL", 300))),
@@ -194,7 +223,11 @@ class Config:
             if self.promo_button:
                 steps.append(f"жму «{self.promo_button}»")
             steps.append("пересылаю пост")
-            steps.append(f"+{self.promo_views} просмотров" if self.promo_views else "число просмотров не задано")
+            steps.append(
+                f"+{self.promo_views}-{self.promo_views_max} просмотров (случайное число)"
+                if self.promo_views_max else
+                (f"+{self.promo_views} просмотров" if self.promo_views else "число просмотров не задано")
+            )
             promo = f"{self.promo_bot}: " + " -> ".join(steps)
         else:
             promo = "выключено"

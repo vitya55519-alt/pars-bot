@@ -142,7 +142,7 @@ class Controls:
                     (
                         f"Нейросеть: {'выключена переменной REWRITE - публикуем текст автора' if not self.cfg.ai_enabled else self.cfg.ai_model + (' (ключ задан)' if self.cfg.minimax_api_key else ' (ключа нет - публикуем оригинал)')}"
                     ),
-                    f"Промо-бот: {self.cfg.promo_bot or 'не задан'}, просмотры по умолчанию: {self.cfg.promo_views or 'не задано'} (свои у каждого канала - в боте)",
+                    f"Промо-бот: {self.cfg.promo_bot or 'не задан'}, просмотры по умолчанию: {self.registry.views_text() if self.cfg.promo_views else 'не задано'} (свои у каждого канала - в боте)",
                     f"Последняя публикация: {self.bot.last_publish or 'ещё не было'}",
                 ]
             ),

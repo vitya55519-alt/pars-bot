@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Set, Union
 
 from pyrogram.enums import ChatMemberStatus, ChatType
 
-from config import VIEWS_LIMIT, parse_views
+from config import VIEWS_LIMIT, parse_views_range
 from utils import call, chat_name, norm_title
 
 log = logging.getLogger("registry")
@@ -25,7 +25,7 @@ GENERAL_TOPIC_ID = 1
 TOPIC_NAME_LIMIT = 50
 GROUP_TITLE_LIMIT = 42
 MANAGER_STATUSES = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
-VIEWS_RE = re.compile(r"просмотры\s*[:=]\s*(\d{1,5})", re.I)
+VIEWS_RE = re.compile(r"просмотры\s*[:=]\s*(\d{1,5})(?:\s*-\s*(\d{1,5}))?", re.I)
 VIEWS_TEXT = "Просмотры: {}"
 REACTIONS_RE = re.compile(r"реакции\s*[:=]\s*(вкл|выкл)", re.I)
 REACTIONS_TEXT = "Реакции: {}"
@@ -86,6 +86,8 @@ class Category:
     problem: str = ""
     # свои настройки канала: None значит «не задано» - берётся значение по умолчанию
     views: Optional[int] = None
+    # верх границы диапазона: ставим на каждый пост случайное число от views до views_max
+    views_max: Optional[int] = None
     reactions: Optional[bool] = None
     rewrite: Optional[bool] = None
     settings_message: Optional[int] = None
@@ -99,7 +101,7 @@ class Category:
         donors = ", ".join(self.donor_names) or "нет"
         return f"Канал «{self.name}» -> постим в {where}\n    откуда берём посты: {donors}"
 
-    def settings_line(self, views: int, reactions: bool, rewrite: bool) -> str:
+    def settings_line(self, views: str, reactions: bool, rewrite: bool) -> str:
         return (
             f"    просмотры: {views} · реакции: {'вкл' if reactions else 'выкл'}"
             f" · переписывание: {'вкл' if rewrite else 'выкл'}"
@@ -121,6 +123,7 @@ class Registry:
         self.ready = False
         self.last_error = ""
         self.views = 0
+        self.views_max = None
         self.unreadable: List[str] = []
         self.suppressed: Set[int] = set()
         self._titles: Dict[str, ChatRef] = {}
@@ -246,8 +249,12 @@ class Registry:
         category.settings_message = message_id
         if views_match:
             value = int(views_match.group(1))
-            if 0 <= value <= VIEWS_LIMIT:
+            top = int(views_match.group(2)) if views_match.group(2) else None
+            if top is not None and not (1 <= value <= top <= VIEWS_LIMIT):
+                top = None
+            if 0 <= value <= VIEWS_LIMIT and (top is not None or not views_match.group(2)):
                 category.views = value
+                category.views_max = top
         if reactions_match:
             category.reactions = reactions_match.group(1).casefold() == "вкл"
         if rewrite_match:
@@ -269,8 +276,10 @@ class Registry:
     async def _read_views(self) -> None:
         """Служебное сообщение в общей теме склада хранит просмотры по умолчанию для новых каналов."""
         self.views = 0
+        self.views_max = None
         found_id = 0
         found_value = 0
+        found_top = None
         try:
             async for message in self.client.get_discussion_replies(
                 self.group_id, GENERAL_TOPIC_ID, limit=self.cfg.history_limit
@@ -279,16 +288,23 @@ class Registry:
                     continue
                 match = VIEWS_RE.search(message.text or "")
                 if match and message.id > found_id:
-                    found_id, found_value = message.id, int(match.group(1))
+                    top = int(match.group(2)) if match.group(2) else None
+                    if top is not None and not (1 <= int(match.group(1)) <= top <= VIEWS_LIMIT):
+                        continue
+                    found_id, found_value, found_top = message.id, int(match.group(1)), top
         except Exception as exc:  # noqa: BLE001 - без служебного сообщения живём как раньше, по PROMO_VIEWS
             log.warning("Служебное сообщение в группе не прочитано (%s) - беру просмотры из переменной.", type(exc).__name__)
             return
 
         if 1 <= found_value <= VIEWS_LIMIT:
             self.views = found_value
-            if self.cfg.promo_views != found_value:
-                log.info("Просмотры по умолчанию взяты из группы: %s (в переменной было %s).", found_value, self.cfg.promo_views)
+            self.views_max = found_top
+            shown = f"{found_value}-{found_top}" if found_top else str(found_value)
+            if self.cfg.promo_views != found_value or self.cfg.promo_views_max != found_top:
+                log.info("Просмотры по умолчанию взяты из группы: %s (в переменной было %s).",
+                         shown, self.cfg.promo_views_max and f"{self.cfg.promo_views}-{self.cfg.promo_views_max}" or self.cfg.promo_views)
                 self.cfg.promo_views = found_value
+                self.cfg.promo_views_max = found_top
 
     async def _open(self, ref: ChatRef, message_id: int) -> Optional[Donor]:
         try:
@@ -531,8 +547,18 @@ class Registry:
         return self.group_name
 
     def views_for(self, category: Category) -> int:
-        """Просмотры канала: своё число из темы, иначе значение по умолчанию."""
+        """Просмотры канала: своё число (или нижняя граница) из темы, иначе значение по умолчанию."""
         return category.views if category.views is not None else self.cfg.promo_views
+
+    def views_max_for(self, category: Category) -> Optional[int]:
+        """Верхняя граница диапазона: своё из темы, иначе общий дефолт. None - число одно."""
+        return category.views_max if category.views is not None else self.cfg.promo_views_max
+
+    def views_text(self, category: Optional[Category] = None) -> str:
+        """Как показать просмотры: «144» или «1200-1600»."""
+        low = self.views_for(category) if category else self.cfg.promo_views
+        high = self.views_max_for(category) if category else self.cfg.promo_views_max
+        return f"{low}-{high}" if high else str(low)
 
     def reactions_for(self, category: Category) -> bool:
         """Реакции канала: свой флаг из темы, иначе общая настройка REACTIONS."""
@@ -542,15 +568,16 @@ class Registry:
         """Переписывать ли тексты этого канала: своё значение из темы, иначе общий дефолт REWRITE_DEFAULT."""
         return category.rewrite if category.rewrite is not None else self.cfg.rewrite_default
 
-    async def save_category_views(self, topic_id: int, raw: str) -> int:
-        """Свои просмотры канала: число живёт служебным сообщением в его теме и переживает перезапуск."""
-        number = parse_views(raw, low=0)
+    async def save_category_views(self, topic_id: int, raw: str):
+        """Свои просмотры канала: число или диапазон «1200-1600» - служебным сообщением в его теме."""
+        number, top = parse_views_range(raw, low=0)
         category = self._category(topic_id)
         async with self.lock:
             category.views = number
+            category.views_max = top
             await self._write_settings(category)
-        log.info("Просмотры канала «%s»: %s (записано в тему).", category.name, number)
-        return number
+        log.info("Просмотры канала «%s»: %s (записано в тему).", category.name, self.views_text(category))
+        return number, top
 
     async def toggle_category_reactions(self, topic_id: int) -> bool:
         """Свои реакции канала: вкл/выкл только для него, остальные каналы не трогаются."""
@@ -576,7 +603,7 @@ class Registry:
         if category.target_ref:
             lines.append(TARGET_TEXT.format(category.target_ref))
         if category.views is not None:
-            lines.append(VIEWS_TEXT.format(category.views))
+            lines.append(VIEWS_TEXT.format(f"{category.views}-{category.views_max}" if category.views_max else category.views))
         if category.reactions is not None:
             lines.append(REACTIONS_TEXT.format("вкл" if category.reactions else "выкл"))
         if category.rewrite is not None:
@@ -700,7 +727,7 @@ class Registry:
             return "В группе пока нет ни одного канала: добавь его кнопкой «➕ Добавить канал»."
         return "\n".join(
             f"  {category.describe()}\n"
-            f"{category.settings_line(self.views_for(category), self.reactions_for(category), self.rewrite_for(category))}"
+            f"{category.settings_line(self.views_text(category), self.reactions_for(category), self.rewrite_for(category))}"
             for category in self.categories.values()
         )
 

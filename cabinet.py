@@ -11,7 +11,7 @@ import legal
 from pyrogram.errors import MessageNotModified
 
 from ai import cut
-from config import VIEWS_LIMIT, parse_views
+from config import VIEWS_LIMIT, parse_views_range
 from store import MAX_DONORS, MAX_POSTS_PER_DAY, MIN_TOPUP, PLANS, StoreError, Tenant, parse_ref
 from utils import TEXT_LIMIT, call, markup
 
@@ -68,7 +68,11 @@ def channel_line(tenant: Tenant) -> str:
 
 
 def views_line(tenant: Tenant) -> str:
-    return f"заказывать {tenant.views} на каждый пост" if tenant.views else "не заказывать (0)"
+    if not tenant.views:
+        return "не заказывать (0)"
+    if getattr(tenant, "views_max", None):
+        return f"заказывать от {tenant.views} до {tenant.views_max} на каждый пост (случайное число)"
+    return f"заказывать {tenant.views} на каждый пост"
 
 
 def add_row(buttons, row: List[Tuple[str, str]]):
@@ -325,14 +329,20 @@ class Cabinet:
             donor = await self.store.add_donor(user_id, parse_ref(text))
             self._note(user_id, f"Источник {ref_word(donor.ref)} добавлен. Рабочий аккаунт попробует подписаться на него.")
         elif kind == "views":
-            number = parse_views(text, low=0)
-            await self.store.set_views(user_id, number)
-            self._note(
-                user_id,
-                f"Сохранено: заказывать {number} просмотров на пост. Фактическое число не гарантируется."
-                if number
-                else "Сохранено: не заказывать просмотры.",
-            )
+            number, top = parse_views_range(text, low=0)
+            await self.store.set_views(user_id, number, top)
+            if number and top:
+                self._note(
+                    user_id,
+                    f"Сохранено: на каждый пост случайное число от {number} до {top}. Фактическое число не гарантируется.",
+                )
+            elif number:
+                self._note(
+                    user_id,
+                    f"Сохранено: заказывать {number} просмотров на пост. Фактическое число не гарантируется.",
+                )
+            else:
+                self._note(user_id, "Сохранено: не заказывать просмотры.")
         elif kind == "sum":
             request_id = await self.store.request_topup(user_id, self._rubles(text))
             self._note(user_id, f"Заявка №{request_id} принята и ждёт проверки платежа. После зачисления можно купить тариф.")
@@ -477,7 +487,9 @@ class Cabinet:
                 user_id,
                 "Просмотры\n\n"
                 f"Число для заказа на новый пост: от 0 до {VIEWS_LIMIT}. Ноль — не заказывать.\n"
-                + ("Пришли число сообщением или выбери кнопкой.\n\n" if waiting
+                "Можно указать диапазон, например 1200-1600: тогда на каждый пост бот будет "
+                "заказывать случайное число из этого диапазона.\n"
+                + ("Пришли число или диапазон сообщением, либо выбери кнопкой.\n\n" if waiting
                    else "Выбери число кнопкой или нажми «Ввести другое число».\n\n")
                 + "Это запрос внешнему сервису, а не гарантия количества просмотров.\n"
                 f"Сейчас: {views_line(tenant)}",

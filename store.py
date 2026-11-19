@@ -71,6 +71,7 @@ class Tenant:
     target_title: str = ""
     target_ok: bool = False
     views: int = 0
+    views_max: Optional[int] = None
     reactions: bool = True
     rewrite: bool = True
     balance: int = 0
@@ -250,9 +251,15 @@ class Store:
                 tenant_id,
             )
 
-    async def set_views(self, tenant_id: int, views: int) -> None:
+    async def set_views(self, tenant_id: int, views: int, views_max: Optional[int] = None) -> None:
+        """Просмотры клиента: одно число или диапазон; верхняя граница None - числа одно."""
         async with self.pool.acquire() as con:
-            await con.execute("UPDATE tenants SET views = $2, updated_at = now() WHERE id = $1", tenant_id, views)
+            await con.execute(
+                "UPDATE tenants SET views = $2, views_max = $3, updated_at = now() WHERE id = $1",
+                tenant_id,
+                views,
+                views_max,
+            )
 
     async def set_reactions(self, tenant_id: int, enabled: bool) -> None:
         async with self.pool.acquire() as con:
@@ -650,6 +657,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     target_title TEXT NOT NULL DEFAULT '',
     target_ok BOOLEAN NOT NULL DEFAULT FALSE,
     views INT NOT NULL DEFAULT 0,
+    views_max INT,
     reactions BOOLEAN NOT NULL DEFAULT TRUE,
     rewrite BOOLEAN NOT NULL DEFAULT TRUE,
     balance_rub INT NOT NULL DEFAULT 0,
@@ -730,6 +738,7 @@ MIGRATIONS = (
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS last_post_at TIMESTAMPTZ",
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS reactions_added INT",
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS rewrite BOOLEAN NOT NULL DEFAULT TRUE",
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS views_max INT",
     "ALTER TABLE owner_channels ADD COLUMN IF NOT EXISTS target_ref TEXT NOT NULL DEFAULT ''",
 )
 
@@ -767,6 +776,7 @@ def _tenant(row) -> Tenant:
         target_title=row["target_title"] or "",
         target_ok=bool(row["target_ok"]),
         views=int(row["views"] or 0),
+        views_max=int(row["views_max"]) if row["views_max"] is not None else None,
         reactions=bool(row["reactions"]),
         rewrite=bool(row["rewrite"]),
         balance=int(row["balance_rub"] or 0),

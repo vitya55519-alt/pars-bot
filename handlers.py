@@ -11,6 +11,7 @@
 import asyncio
 import datetime
 import logging
+import random
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple, Union
@@ -55,6 +56,8 @@ class Destination:
     name: str
     label: str
     views: Optional[int] = None
+    # верх границы диапазона: ставим на каждый пост случайное число от views до views_max
+    views_max: Optional[int] = None
     reactions: bool = True
     rewrite: bool = True
     tenant_id: int = 0
@@ -246,6 +249,7 @@ class ParsBot:
                         name=category.target_name,
                         label=f"мой канал {category.target_name}",
                         views=self.registry.views_for(category),
+                        views_max=self.registry.views_max_for(category),
                         reactions=self.registry.reactions_for(category),
                         rewrite=self.registry.rewrite_for(category),
                     )
@@ -272,6 +276,7 @@ class ParsBot:
             name=tenant.target_title or str(tenant.target),
             label=f"клиент {tenant.id}",
             views=tenant.views,
+            views_max=getattr(tenant, "views_max", None),
             reactions=tenant.reactions,
             rewrite=tenant.rewrite,
             tenant_id=tenant.id,
@@ -460,9 +465,17 @@ class ParsBot:
             return "текст без картинки"
         return "без текста и картинки"
 
+    def _roll_views(self, dest: Destination) -> Optional[int]:
+        """Диапазон просмотров даёт на каждый пост своё случайное число от нижней границы к верхней."""
+        if dest.views and dest.views_max and dest.views_max > dest.views:
+            value = random.randint(dest.views, dest.views_max)
+            log.info("%s: просмотры на этот пост - %s (диапазон %s-%s).", dest.label, value, dest.views, dest.views_max)
+            return value
+        return dest.views
+
     async def _boost(self, dest: Destination, message: Message) -> None:
         """Продвижение и реакции по настройкам адресата: у клиента своё число просмотров и свой флаг реакций."""
-        if await self.promo.push(message, dest.views):
+        if await self.promo.push(message, self._roll_views(dest)):
             self.stats["forwarded"] += 1
         if not dest.reactions:
             log.info("Реакции: у %s они выключены - пост в порядок накрутки не ставлю.", dest.label)
@@ -648,6 +661,7 @@ class ParsBot:
                 name=category.target_name,
                 label=f"мой канал {category.target_name} (догон)",
                 views=self.registry.views_for(category),
+                views_max=self.registry.views_max_for(category),
                 reactions=self.registry.reactions_for(category),
                 rewrite=self.registry.rewrite_for(category),
             )

@@ -226,7 +226,7 @@ class Panel:
     async def _apply_category_views(self, query, topic_id: int, raw: str) -> None:
         version = self._input_version.get(query.from_user.id, 0)
         try:
-            number = await self.registry.save_category_views(topic_id, raw)
+            number, top = await self.registry.save_category_views(topic_id, raw)
         except ValueError as exc:
             self.notice = str(exc)
             if self._input_version.get(query.from_user.id, 0) == version:
@@ -237,11 +237,14 @@ class Panel:
             self.notice = f"⚠ {exc}"
             await self._show(query, "cat", topic_id)
             return
+        shown = f"{number}-{top}" if top else str(number)
         self.notice = (
-            f"Просмотры темы «{self._name(topic_id)}»: заказывать {number} на каждый пост."
-            if number else f"Для темы «{self._name(topic_id)}» просмотры не заказываются."
+            f"Просмотры темы «{self._name(topic_id)}»: случайное число от {number} до {top} на каждый пост."
+            if top else
+            (f"Просмотры темы «{self._name(topic_id)}»: заказывать {number} на каждый пост."
+             if number else f"Для темы «{self._name(topic_id)}» просмотры не заказываются.")
         )
-        await self._show(query, "settings", topic_id, flash=str(number))
+        await self._show(query, "settings", topic_id, flash=shown)
 
     async def _toggle_category_reactions(self, query, topic_id: int) -> None:
         enabled = await self.registry.toggle_category_reactions(topic_id)
@@ -408,8 +411,13 @@ class Panel:
                 self.notice = f"Группа теперь называется «{name}». Каналы и темы внутри не изменились."
                 screen = ("admin", 0)
             elif kind == "cviews":
-                number = await registry.save_category_views(topic_id, text)
-                self.notice = f"Просмотры темы «{self._name(topic_id)}»: заказывать {number} на каждый пост."
+                number, top = await registry.save_category_views(topic_id, text)
+                self.notice = (
+                    f"Просмотры темы «{self._name(topic_id)}»: случайное число от {number} до {top} на каждый пост."
+                    if top else
+                    (f"Просмотры темы «{self._name(topic_id)}»: заказывать {number} на каждый пост."
+                     if number else f"Для темы «{self._name(topic_id)}» просмотры не заказываются.")
+                )
                 screen = ("settings", topic_id)
             elif kind == "credit":
                 digits = "".join(char for char in text if char.isdigit())
@@ -630,6 +638,7 @@ class Panel:
             return self._category_view(topic_id)
         rewrite = self.registry.rewrite_for(category)
         views = self.registry.views_for(category)
+        views_top = self.registry.views_max_for(category)
         reactions = self.registry.reactions_for(category)
         if not rewrite:
             text_state = "словами автора"
@@ -637,13 +646,19 @@ class Panel:
             text_state = f"{self.ai_line()}. Выбор переписывания сохранён"
         else:
             text_state = "переписываем с помощью нейросети"
+        if not views:
+            views_state = "не заказывать"
+        elif views_top:
+            views_state = f"заказывать случайное число от {views} до {views_top} на каждый пост"
+        else:
+            views_state = f"заказывать {views} на каждый пост"
         reaction_state = "заказывать" if reactions else "не заказывать"
         if reactions and not self.bot.reactions.enabled:
             reaction_state = "выбраны, но сервис реакций сейчас выключен"
         lines = [
             f"Настройки темы «{category.name}»", "",
             f"Текст: {text_state}.",
-            f"Просмотры: {'заказывать ' + str(views) + ' на каждый пост' if views else 'не заказывать'}.",
+            f"Просмотры: {views_state}.",
             f"Реакции: {reaction_state}.", "",
             "Это настройки новых постов, не отчёт о выполненных заказах.",
         ]
@@ -793,11 +808,17 @@ class Panel:
     def _category_views_view(self, topic_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         category = self.registry.categories.get(topic_id)
         current = self.registry.views_for(category) if category else self.cfg.promo_views
-        shown = f"{current} на каждый пост" if current else "не заказывать"
+        top = self.registry.views_max_for(category) if category else self.cfg.promo_views_max
+        if not current:
+            shown = "не заказывать"
+        elif top:
+            shown = f"случайное число от {current} до {top} на каждый пост"
+        else:
+            shown = f"{current} на каждый пост"
         text = (
             f"Тема «{self._name(topic_id)}» · просмотры\nСейчас: {shown}.\n\n"
-            f"Напиши одно число от 0 до {VIEWS_LIMIT} или выбери кнопкой. "
-            "Ноль — не заказывать просмотры.\n\n"
+            f"Напиши число от 0 до {VIEWS_LIMIT} или диапазон, например 1200-1600, либо выбери кнопкой. "
+            "Ноль — не заказывать просмотры. Диапазон — случайное число из него на каждый новый пост.\n\n"
             "Это размер заказа для новых постов, а не гарантия выполненных просмотров."
         )
         presets = [(str(count), f"cv|{topic_id}|{count}") for count in (500, 1000, 2000, 5000)]
