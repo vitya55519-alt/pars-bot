@@ -4010,8 +4010,8 @@ async def check_cabinet_navigation(panel, client, store, nina):
     for screen in ("home", "project", "settings", "donors", "channel", "text", "views", "reactions", "result", "guide", "plans"):
         body, keyboard = await cab._view(nina.id, screen)
         buttons = [button for row in keyboard.inline_keyboard for button in row]
-        check(f"экран клиента {screen}: помещается в Telegram", len(body) <= 4096 and all(len(b.callback_data.encode()) <= 64 for b in buttons))
-        check(f"экран клиента {screen}: нет админских команд", all(b.callback_data.startswith("c") for b in buttons) and not any(word in body for word in ("REWRITE", "DATABASE_URL", "PROMO_VIEWS", "Railway")))
+        check(f"экран клиента {screen}: помещается в Telegram", len(body) <= 4096 and all(len((b.callback_data or "").encode()) <= 64 for b in buttons))
+        check(f"экран клиента {screen}: нет админских команд", all((b.callback_data or "c").startswith("c") for b in buttons) and not any(word in body for word in ("REWRITE", "DATABASE_URL", "PROMO_VIEWS", "Railway")))
     check("отклонённая оплата не выглядит ожидающей", "отклонено" in cab._payment_line({"status": "rejected", "amount_rub": 600}))
     original_edit = client.edit_message_text
 
