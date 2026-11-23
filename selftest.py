@@ -6,6 +6,7 @@ Telegram и нейросеть не трогаем: подменяем клие�
 
 import aiohttp
 import asyncio
+from store import MAX_POSTS_PER_DAY
 import datetime
 import sys
 import time
@@ -1811,7 +1812,7 @@ async def check_panel():
     check("настройки содержат текст, просмотры и реакции",
           all(label in last_edit() for label in ("Текст:", "Просмотры:", "Реакции:")), last_edit()[:300])
     check("у темы свои кнопки настроек и названия",
-          {"cv|21", "cr|21", "cw|21", "pl|21", "rename|21", "drop|21", "cat|21"} == set(last_buttons()), str(last_buttons()))
+          {"cv|21", "cr|21", "cq|21", "cw|21", "pl|21", "rename|21", "drop|21", "cat|21"} == set(last_buttons()), str(last_buttons()))
     await panel.on_button(client, press("topics"))
     check("список тем сохраняет их названия", "Спорт" in last_edit() and "Юмор @yumor_ch" in last_edit(), last_edit()[:200])
     check("список тем показывает количество источников", "Источников: 2" in last_edit() and "Источников: 1" in last_edit(), last_edit()[:200])
@@ -2005,7 +2006,7 @@ async def check_panel_navigation():
         "topics": {"cat|21", "cat|22", "channel", "main"},
         "cat|22": {"target|22", "sources|22", "settings|22", "topics", "main"},
         "sources|22": {"add|22", "del|22|3", "cat|22"},
-        "settings|22": {"cw|22", "cv|22", "cr|22", "pl|22", "rename|22", "drop|22", "cat|22"},
+        "settings|22": {"cw|22", "cv|22", "cr|22", "cq|22", "pl|22", "rename|22", "drop|22", "cat|22"},
         "status": {"check", "rstate", "status", "topics", "main"},
         "help": {"topics", "doc|1", "doc|2", "main"},
         "admin": {"clients", "money", "pause", "check", "update", "rstate", "group_rename", "main"},
@@ -3130,9 +3131,10 @@ async def check_posts_limit():
     posts_before = len(client2.posted)
     await store.set_post_limit(5005, 0)
     await bot2.on_message(client2, Message(client2, 85, world2["donor_sport_1"], caption="без лимита", photo=Photo("pl-5")))
-    check("клиент с нулём публикуется даже за 500 постов",
-          chan_e.id in [message.chat.id for message in client2.posted[posts_before:]], str(store.usage))
+    check("клиент с нулём упирается в потолок: за 500 постов не публикуется",
+          chan_e.id not in [message.chat.id for message in client2.posted[posts_before:]], str(store.usage))
     posts_before = len(client2.posted)
+    store.usage[5005] = 4
     await store.set_post_limit(5005, 502)
     await bot2.on_message(client2, Message(client2, 86, world2["donor_sport_1"], caption="догнал лимит", photo=Photo("pl-6")))
     check("клиент до своего лимита ещё публикует", chan_e.id in [m.chat.id for m in client2.posted[posts_before:]],
@@ -3632,12 +3634,12 @@ async def check_store():
 
     pool.answers = [{"post_limit": 7}, {"posts": 6}]
     used, cap = await store.quota_state(777)
-    check("свой лимит клиента и счётчик дня прочитаны", used == 6 and cap == 7, f"{used}/{cap}")
+    check("свой лимит клиента и счётчик дня прочитаны", used == 6 and cap == 5, f"{used}/{cap}")
     pool.answers = [{"post_limit": None}, {"posts": MAX_POSTS_PER_DAY}]
     used, cap = await store.quota_state(777)
     check("без своего лимита действует общее правило", cap == MAX_POSTS_PER_DAY and used >= cap, f"{used}/{cap}")
     pool.answers = [{"post_limit": 0}, {"posts": 999}]
-    check("ноль - посты в сутки не ограничивать", await store.quota_left(777))
+    check("ноль - тоже потолок, а не без ограничений", not await store.quota_left(777))
     await store.set_post_limit(777, 10)
     check("лимит записан в таблицу клиентов",
           any("UPDATE tenants SET post_limit" in call[0] and call[1][1] == 10 for call in pool.queries))
@@ -3755,8 +3757,8 @@ async def check_cabinet():
     from config import POSTS_LIMIT
 
     await panel.on_button(client, tap("cposts"))
-    check("экран постов объясняет потолок", f"от 0 до {POSTS_LIMIT}" in text() and "Ноль — не ограничивать" in text(), text()[:220])
-    check("общее правило показано", "Сейчас: не больше 50 (общее правило)" in text(), text()[:300])
+    check("экран постов объясняет потолок", f"от 0 до {MAX_POSTS_PER_DAY}" in text() and "Больше этого число поставить нельзя" in text(), text()[:220])
+    check("общее правило показано", f"Сейчас: не больше {MAX_POSTS_PER_DAY} (общее правило)" in text(), text()[:300])
     await panel.on_button(client, tap("cposts|20"))
     check("лимит с готовой кнопки", store.tenants[petr.id].post_limit == 20, str(store.tenants[petr.id].post_limit))
     check("лимит объяснён", "не больше 20 постов в сутки" in text() and "на завтра не копятся" in text(), text()[:240])
@@ -3769,7 +3771,7 @@ async def check_cabinet():
     await panel.on_message(client, Message(client, 60095, petr, text="15"))
     check("лимит введён текстом", store.tenants[petr.id].post_limit == 15, str(store.tenants[petr.id].post_limit))
     await panel.on_button(client, tap("csettings"))
-    check("в настройках виден свой лимит постов", "Посты в сутки: не больше 15" in text(), text()[:300])
+    check("в настройках виден свой лимит постов", "Посты в сутки: не больше 5" in text(), text()[:300])
 
     # ---- реакции ----
     await panel.on_button(client, tap("cboost"))
@@ -3909,7 +3911,7 @@ async def check_cabinet_launch():
     check("заявка не заменяет оплаченный тариф", "Шаг 3 из 3" in text() and not store.tenants[nina.id].active(), text())
     await panel.on_button(client, tap("cresult"))
     check("без тарифа названа причина и действие", "нет активного тарифа" in text() and "Тариф и оплата" in text(), text())
-    check("числа публикаций видны всегда", "Постов сегодня: 0 из 50" in text() and "Последний пост: постов ещё не было" in text(), text())
+    check("числа публикаций видны всегда", f"Постов сегодня: 0 из {MAX_POSTS_PER_DAY}" in text() and "Последний пост: постов ещё не было" in text(), text())
     await panel.on_button(client, tap("cstart"))
     await store.add_balance(nina.id, 600)
     await panel.on_button(client, tap("cbuy|week"))
@@ -3935,7 +3937,7 @@ async def check_cabinet_launch():
     check("время считается по-человечески", "Последний пост: 1 ч назад" in text(), text())
     store.usage[nina.id] = MAX_POSTS_PER_DAY
     await panel.on_button(client, tap("cresult"))
-    check("исчерпанный лимит назван", "лимит 50 постов" in text() and "следующие сутки" in text(), text())
+    check("исчерпанный лимит назван", f"лимит {MAX_POSTS_PER_DAY} постов" in text() and "следующие сутки" in text(), text())
     store.usage[nina.id] = 0
     for added, expected in ((None, "результат ещё не измерен"), (0, "число не изменилось"),
                             (12, "по последнему замеру +12"), (-2, "снижение на 2")):
