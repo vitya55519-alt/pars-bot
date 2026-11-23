@@ -82,17 +82,13 @@ def posts_line(tenant: Tenant) -> str:
     cap = getattr(tenant, "post_limit", None)
     if cap is None:
         return f"не больше {MAX_POSTS_PER_DAY} (общее правило)"
-    if cap == 0:
-        return "не ограничивать"
-    return f"не больше {cap}"
+    return f"не больше {min(cap or MAX_POSTS_PER_DAY, MAX_POSTS_PER_DAY)}"
 
 
 def posts_plan_line(tenant: Tenant) -> str:
     """Фраза про лимит постов для экрана тарифа."""
     cap = getattr(tenant, "post_limit", None)
-    if cap == 0:
-        return "посты в сутки не ограничивать"
-    if cap is None:
+    if not cap:
         return f"до {MAX_POSTS_PER_DAY} постов в сутки (можно изменить в «Настройки»)"
     return f"до {cap} постов в сутки (можно изменить в «Настройки»)"
 
@@ -542,6 +538,7 @@ class Cabinet:
                 + ("Пришли число или диапазон сообщением, либо выбери кнопкой.\n\n" if waiting
                    else "Выбери число кнопкой или нажми «Ввести другое число».\n\n")
                 + "Это запрос внешнему сервису, а не гарантия количества просмотров.\n"
+                f"Честно: просмотров не больше {VIEWS_LIMIT} на пост. Поддержка: {self.cfg.support_url}\n\n"
                 f"Сейчас: {views_line(tenant)}",
             ), markup(*rows, [("Отмена" if waiting else "Назад: Настройки", "csettings")])
 
@@ -556,8 +553,8 @@ class Cabinet:
             return self._notice(
                 user_id,
                 "Посты в сутки\n\n"
-                f"Сколько постов в сутки брать из источников и публиковать в канал: от 0 до {POSTS_LIMIT}. "
-                "Ноль — не ограничивать.\n"
+                f"Сколько постов в сутки брать из источников и публиковать в канал: от 0 до {MAX_POSTS_PER_DAY} (потолок для канала). "
+                "Больше этого число поставить нельзя.\n"
                 "Счёт обнуляется в полночь по Москве. Лишние посты в тот же день пропускаются, на завтра не копятся.\n"
                 + ("Пришли число сообщением, либо выбери кнопкой.\n\n" if waiting
                    else "Выбери число кнопкой или нажми «Ввести своё число».\n\n")
@@ -567,11 +564,12 @@ class Cabinet:
         if kind == "reactions":
             return self._notice(
                 user_id,
-                "Реакции\n\nЗаказы для новых постов обрабатываются очередью. Доставка и сроки не гарантируются.\n"
+                self._reactions_head()
+                + (
                 "Для заказа разреши все реакции: канал → Изменить → Реакции.\n\n"
                 f"Заказ реакций: {self._reaction_setting(tenant)}.\n"
-                f"{self._reactions_line(tenant)}",
-            ), markup([self._reactions_cell(tenant)], [("Назад: Настройки", "csettings")])
+                f"{self._reactions_line(tenant)}"),
+            ), markup([self._reactions_cell(tenant)], [("Поддержка", "url:" + self.cfg.support_url)], [("Назад: Настройки", "csettings")])
 
         if kind == "result":
             return await self._result_view(user_id, tenant, now)
@@ -768,6 +766,15 @@ class Cabinet:
         rows.append([("В личный кабинет", "chome")])
         head = f"Настроить канал\nШаг {index + 1} из {len(STEPS)} — {STEP_TITLES[STEPS[index]]}\n\n"
         return head + body, markup(*rows)
+
+    def _reactions_head(self) -> str:
+        if self.cfg.smmplus_key:
+            return (
+                "Реакции\n\nНа каждый новый пост бот заказывает случайное число реакций от "
+                f"{self.cfg.smmplus_min} до 50 (меньше {self.cfg.smmplus_min} сервис не выполняет). "
+                "Доставка и сроки не гарантируются.\n"
+            )
+        return "Реакции\n\nЗаказы для новых постов обрабатываются очередью. Доставка и сроки не гарантируются.\n"
 
     def _reaction_setting(self, tenant: Tenant) -> str:
         if not tenant.reactions:

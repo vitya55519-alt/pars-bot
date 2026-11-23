@@ -153,6 +153,10 @@ class Config:
     panel_admins: List[int] = field(default_factory=list)
     database_url: str = ""
     worker_contact: str = ""
+    smmplus_key: str = ""
+    smmplus_service: int = 84
+    smmplus_min: int = 10
+    support_url: str = "https://t.me/Anya12965"
     payment_details: str = ""
 
     @property
@@ -226,6 +230,10 @@ class Config:
             panel_admins=_ids("PANEL_ADMINS"),
             database_url=_text("DATABASE_URL"),
             worker_contact=_text("WORKER_CONTACT"),
+            smmplus_key=_text("SMMPLUS_API_KEY"),
+            smmplus_service=int(_number("SMMPLUS_REACTIONS_SERVICE", 84)),
+            smmplus_min=int(_number("SMMPLUS_REACTIONS_MIN", 10)),
+            support_url=_text("SUPPORT_URL") or "https://t.me/Anya12965",
             payment_details=_text("PAYMENT_DETAILS"),
         )
 

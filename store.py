@@ -27,7 +27,7 @@ PLANS = {
 }
 
 MAX_DONORS = 10
-MAX_POSTS_PER_DAY = 50
+MAX_POSTS_PER_DAY = 5
 MIN_TOPUP = 100
 MAX_TOPUP = 300000
 
@@ -67,6 +67,13 @@ def parse_ref(text: str) -> ChatRef:
     raise ValueError(f"Не понимаю ссылку «{raw}». Нужно @юзернейм канала или ссылка вида https://t.me/channel.")
 
 
+def effective_cap(limit) -> int:
+    """Клиент: не больше MAX_POSTS_PER_DAY постов в сутки на канал; 0 и большие числа тоже упираются в потолок."""
+    if limit is None or int(limit) <= 0:
+        return MAX_POSTS_PER_DAY
+    return min(int(limit), MAX_POSTS_PER_DAY)
+
+
 @dataclass
 class Tenant:
     id: int
@@ -94,7 +101,7 @@ class Tenant:
 
     def cap_today(self) -> int:
         """Сколько постов можно в сутки: своё число, 0 - без лимита, не задано - общее правило."""
-        return MAX_POSTS_PER_DAY if self.post_limit is None else self.post_limit
+        return effective_cap(self.post_limit)
 
     def days_left(self, now: Optional[datetime.datetime] = None) -> int:
         if self.plan_until is None:
@@ -673,7 +680,7 @@ class Store:
                 tenant_id,
                 today(),
             )
-        cap = MAX_POSTS_PER_DAY if not row or row["post_limit"] is None else int(row["post_limit"])
+        cap = effective_cap(None if not row else row["post_limit"])
         return int(used or 0), cap
 
     async def quota_left(self, tenant_id: int) -> bool:

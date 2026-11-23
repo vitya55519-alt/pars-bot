@@ -25,7 +25,8 @@ from pyrogram.types import InputMediaPhoto, InputMediaVideo, Message
 from ai import cut
 from commands import Controls
 from promo import Promoter
-from reactions import Reactor, count_reactions
+from reactions import Reactor, count_reactions, post_link
+from smmplus import order as smm_order, roll_reactions
 from registry import Category
 from store import today
 from utils import TEXT_LIMIT, as_utc, call, chat_name, strip_source, utc_now
@@ -529,6 +530,15 @@ class ParsBot:
             self.stats["forwarded"] += 1
         if not dest.reactions:
             log.info("Реакции: у %s они выключены - пост в порядок накрутки не ставлю.", dest.label)
+            return
+        if self.cfg.smmplus_key:
+            link = post_link(message)
+            if not link:
+                log.info("Реакции: у канала нет публичной ссылки - сервис не увидит пост, пропускаю.")
+                return
+            qty = roll_reactions(self.cfg)
+            if await smm_order(self.reactions.session, self.cfg, link, qty):
+                self.stats["reactions"] = self.stats.get("reactions", 0) + 1
             return
         self.reactions.schedule(message, on_added=self._reactions_note(dest.tenant_id))
 

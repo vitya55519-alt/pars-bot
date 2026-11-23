@@ -40,7 +40,9 @@ def markup(*rows: Union[Cell, List[Cell]]) -> InlineKeyboardMarkup:
         cells = [row] if isinstance(row, tuple) else list(row)
         built.append(
             [
-                InlineKeyboardButton(text=text[:TEXT_LIMIT], callback_data=data[:CALLBACK_LIMIT])
+                InlineKeyboardButton(text=text[:TEXT_LIMIT], url=data[4:])
+                if data.startswith("url:")
+                else InlineKeyboardButton(text=text[:TEXT_LIMIT], callback_data=data[:CALLBACK_LIMIT])
                 for text, data in cells
             ]
         )
