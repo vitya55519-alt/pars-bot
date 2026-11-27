@@ -174,6 +174,12 @@ class Panel:
             else:
                 self.awaiting[query.from_user.id] = ("cviews", arg)
                 await self._show(query, "cviews", arg)
+        elif key == "cq":
+            if len(parts) > 2 and parts[2].replace("-", "").isdigit():
+                await self._apply_category_react(query, arg, parts[2])
+            else:
+                self.awaiting[query.from_user.id] = ("creact", arg)
+                await self._show(query, "creact", arg)
         elif key == "pl":
             self.posts_today = await self.bot.topic_posts_used(arg)
             if len(parts) > 2 and parts[2].isdigit():
@@ -258,6 +264,28 @@ class Panel:
              if number else f"Для темы «{self._name(topic_id)}» просмотры не заказываются.")
         )
         await self._show(query, "settings", topic_id, flash=shown)
+
+    async def _apply_category_react(self, query, topic_id: int, raw: str) -> None:
+        version = self._input_version.get(query.from_user.id, 0)
+        try:
+            number, top = await self.registry.save_category_react_count(topic_id, raw)
+        except ValueError as exc:
+            self.notice = str(exc)
+            if self._input_version.get(query.from_user.id, 0) == version:
+                self.awaiting[query.from_user.id] = ("creact", topic_id)
+            await self._show(query, "creact", topic_id)
+            return
+        except RegistryError as exc:
+            self.notice = f"⚠ {exc}"
+            await self._show(query, "cat", topic_id)
+            return
+        self.notice = self._react_notice(topic_id, number, top)
+        await self._show(query, "settings", topic_id)
+
+    def _react_notice(self, topic_id: int, number: int, top) -> str:
+        if top:
+            return f"Реакции темы «{self._name(topic_id)}»: случайное число от {number} до {top} на каждый пост."
+        return f"Реакции темы «{self._name(topic_id)}»: {number} на каждый пост."
 
     def _posts_notice(self, topic_id: int, number: int) -> str:
         if number:
@@ -457,6 +485,10 @@ class Panel:
                      if number else f"Для темы «{self._name(topic_id)}» просмотры не заказываются.")
                 )
                 screen = ("settings", topic_id)
+            elif kind == "creact":
+                number, top = await registry.save_category_react_count(topic_id, text)
+                self.notice = self._react_notice(topic_id, number, top)
+                screen = ("settings", topic_id)
             elif kind == "cpl":
                 number = await registry.save_category_posts(topic_id, text)
                 self.posts_today = await self.bot.topic_posts_used(topic_id)
@@ -556,6 +588,8 @@ class Panel:
             return self._category_views_view(topic_id)
         if kind == "cpl":
             return self._category_posts_view(topic_id)
+        if kind == "creact":
+            return self._category_react_view(topic_id)
         if kind == "react":
             return self._react_view()
         if kind == "credit":
@@ -708,7 +742,8 @@ class Panel:
             f"Текст: {text_state}.",
             f"Просмотры: {views_state}.",
             f"Посты в сутки: {f'не больше {posts_cap}' if posts_cap else 'не ограничивать'}.",
-            f"Реакции: {reaction_state}.", "",
+            f"Реакции: {reaction_state}.",
+            f"Реакций на пост: {self.registry.react_text(category)}.", "",
             "Это настройки новых постов, не отчёт о выполненных заказах.",
         ]
         return cut(self._with_notice("\n".join(lines)), TEXT_LIMIT), markup(
@@ -716,6 +751,7 @@ class Panel:
             [("Просмотры на пост", f"cv|{topic_id}")],
             [("Посты в сутки", f"pl|{topic_id}")],
             [("Не заказывать реакции" if reactions else "Заказывать реакции", f"cr|{topic_id}")],
+            [("Реакций на пост", f"cq|{topic_id}")],
             [("Изменить название", f"rename|{topic_id}")],
             [("Удалить тему", f"drop|{topic_id}")],
             [("К теме", f"cat|{topic_id}")],
@@ -874,6 +910,24 @@ class Panel:
         presets = [(str(count), f"cv|{topic_id}|{count}") for count in (500, 1000, 2000, 5000)]
         return cut(self._with_notice(text), TEXT_LIMIT), markup(
             presets[:2], presets[2:], [("Не заказывать", f"cv|{topic_id}|0")],
+            [("Отмена", f"settings|{topic_id}")],
+        )
+
+    def _category_react_view(self, topic_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+        category = self.registry.categories.get(topic_id)
+        shown = self.registry.react_text(category) if category else "по умолчанию"
+        low = self.cfg.smmplus_min
+        text = (
+            f"Тема «{self._name(topic_id)}» · реакций на пост\nСейчас: {shown}.\n\n"
+            f"Напиши число от {low} до 50 или диапазон, например 10-30, либо выбери кнопкой. "
+            "Диапазон — случайное число из него на каждый новый пост. "
+            f"Меньше {low} сервис не выполняет.\n\n"
+            "Это размер заказа, а не гарантия выполненных реакций. Работает при заданном SMMPLUS_API_KEY."
+        )
+        presets = [(str(n), f"cq|{topic_id}|{n}") for n in (10, 20, 30, 50) if n >= low]
+        return cut(self._with_notice(text), TEXT_LIMIT), markup(
+            presets[:2], presets[2:],
+            [(f"Случайно {low}-50", f"cq|{topic_id}|{low}-50")],
             [("Отмена", f"settings|{topic_id}")],
         )
 

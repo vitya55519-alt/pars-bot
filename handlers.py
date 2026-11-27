@@ -63,6 +63,7 @@ class Destination:
     topic_id: int = 0
     post_limit: Optional[int] = None
     reactions: bool = True
+    react_range: Optional[Tuple[int, int]] = None
     rewrite: bool = True
     tenant_id: int = 0
 
@@ -259,6 +260,7 @@ class ParsBot:
                         topic_id=category.topic_id,
                         post_limit=self.registry.posts_for(category),
                         reactions=self.registry.reactions_for(category),
+                        react_range=self.registry.react_range_for(category),
                         rewrite=self.registry.rewrite_for(category),
                     )
                 )
@@ -537,7 +539,7 @@ class ParsBot:
             if not link:
                 log.info("Реакции: у канала нет публичной ссылки - сервис не увидит пост, пропускаю.")
                 return
-            qty = roll_reactions(self.cfg)
+            qty = roll_reactions(self.cfg, *(dest.react_range or (None, None)))
             if await smm_order(self.reactions.session, self.cfg, link, qty):
                 self.stats["reactions"] = self.stats.get("reactions", 0) + 1
             return
@@ -726,6 +728,7 @@ class ParsBot:
                 topic_id=category.topic_id,
                 post_limit=self.registry.posts_for(category),
                 reactions=self.registry.reactions_for(category),
+                react_range=self.registry.react_range_for(category),
                 rewrite=self.registry.rewrite_for(category),
             )
             try:

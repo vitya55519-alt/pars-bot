@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Set, Union
 
 from pyrogram.enums import ChatMemberStatus, ChatType
 
-from config import POSTS_LIMIT, VIEWS_LIMIT, parse_post_limit, parse_views_range
+from config import POSTS_LIMIT, VIEWS_LIMIT, parse_post_limit, parse_reactions_range, parse_views_range
 from utils import call, chat_name, norm_title
 
 log = logging.getLogger("registry")
@@ -29,6 +29,8 @@ VIEWS_RE = re.compile(r"просмотры\s*[:=]\s*(\d{1,5})(?:\s*-\s*(\d{1,5})
 VIEWS_TEXT = "Просмотры: {}"
 REACTIONS_RE = re.compile(r"реакции\s*[:=]\s*(вкл|выкл)", re.I)
 REACTIONS_TEXT = "Реакции: {}"
+REACT_COUNT_RE = re.compile(r"реакций\s+на\s+пост\s*[:=]\s*(\d{1,2})(?:\s*-\s*(\d{1,2}))?", re.I)
+REACT_COUNT_TEXT = "Реакций на пост: {}"
 REWRITE_RE = re.compile(r"переписывание\s*[:=]\s*(вкл|выкл)", re.I)
 REWRITE_TEXT = "Переписывание: {}"
 POSTS_RE = re.compile(r"постов\s+в\s+сутки\s*[:=]\s*(\d{1,4})", re.I)
@@ -91,6 +93,9 @@ class Category:
     # верх границы диапазона: ставим на каждый пост случайное число от views до views_max
     views_max: Optional[int] = None
     reactions: Optional[bool] = None
+    # сколько реакций заказывать на пост: react_min или диапазон react_min-react_max; None - по умолчанию
+    react_min: Optional[int] = None
+    react_max: Optional[int] = None
     rewrite: Optional[bool] = None
     # свои посты в сутки: None - не ограничивать (для тем лимита по умолчанию нет), 0 тоже «не ограничивать»
     post_limit: Optional[int] = None
@@ -248,7 +253,8 @@ class Registry:
         rewrite_match = REWRITE_RE.search(text)
         target_match = TARGET_RE.search(text)
         posts_match = POSTS_RE.search(text)
-        if not views_match and not reactions_match and not rewrite_match and not target_match and not posts_match:
+        count_match = REACT_COUNT_RE.search(text)
+        if not (views_match or reactions_match or rewrite_match or target_match or posts_match or count_match):
             return False
         if message_id <= (category.settings_message or 0):
             return True
@@ -265,6 +271,11 @@ class Registry:
                 category.views_max = top
         if reactions_match:
             category.reactions = reactions_match.group(1).casefold() == "вкл"
+        if count_match:
+            low = int(count_match.group(1))
+            top = int(count_match.group(2)) if count_match.group(2) else None
+            if 1 <= low <= 50 and (top is None or low < top <= 50):
+                category.react_min, category.react_max = low, top
         if rewrite_match:
             category.rewrite = rewrite_match.group(1).casefold() == "вкл"
         if target_match:
@@ -572,6 +583,29 @@ class Registry:
         """Реакции канала: свой флаг из темы, иначе общая настройка REACTIONS."""
         return category.reactions if category.reactions is not None else self.cfg.reactions_enabled
 
+    def react_range_for(self, category: Category):
+        """Сколько реакций на пост: (от, до) из темы; без настройки - от нижней границы сервиса до 50."""
+        low = self.cfg.smmplus_min
+        if category.react_min is None:
+            return low, 50
+        return category.react_min, category.react_max or category.react_min
+
+    def react_text(self, category: Category) -> str:
+        low, high = self.react_range_for(category)
+        if category.react_min is None:
+            return f"случайное число от {low} до {high} (по умолчанию)"
+        return f"случайное число от {low} до {high} на каждый пост" if high != low else f"{low} на каждый пост"
+
+    async def save_category_react_count(self, topic_id: int, raw: str):
+        """Свои реакции на пост: число или диапазон «10-30» - служебным сообщением в теме канала."""
+        number, top = parse_reactions_range(raw, low=self.cfg.smmplus_min)
+        category = self._category(topic_id)
+        async with self.lock:
+            category.react_min, category.react_max = number, top
+            await self._write_settings(category)
+        log.info("Реакций на пост у канала «%s»: %s (записано в тему).", category.name, self.react_text(category))
+        return number, top
+
     def rewrite_for(self, category: Category) -> bool:
         """Переписывать ли тексты этого канала: своё значение из темы, иначе общий дефолт REWRITE_DEFAULT."""
         return category.rewrite if category.rewrite is not None else self.cfg.rewrite_default
@@ -633,6 +667,9 @@ class Registry:
             lines.append(VIEWS_TEXT.format(f"{category.views}-{category.views_max}" if category.views_max else category.views))
         if category.reactions is not None:
             lines.append(REACTIONS_TEXT.format("вкл" if category.reactions else "выкл"))
+        if category.react_min is not None:
+            lines.append(REACT_COUNT_TEXT.format(
+                f"{category.react_min}-{category.react_max}" if category.react_max else category.react_min))
         if category.rewrite is not None:
             lines.append(REWRITE_TEXT.format("вкл" if category.rewrite else "выкл"))
         if category.post_limit is not None:
