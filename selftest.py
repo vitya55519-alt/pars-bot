@@ -3218,8 +3218,9 @@ async def check_signature():
     ]
     world["client"].donor_messages[world["donor_sport_1"].id] = cards
     await bot.on_message(world["client"], cards[0])
-    album = world["client"].albums[-1]
-    check("альбом тоже без подписи", album[0].caption == "Хоккей завтра." and not album[1].caption, repr(album[0].caption))
+    single = world["client"].posted[-1]
+    check("альбом тоже без подписи: один файл с чистым текстом",
+          single.caption == "Хоккей завтра." and single.photo.file_id == "s2", repr(single.caption))
 
 
 def _schema_tables():
@@ -4252,34 +4253,29 @@ async def check_tenants():
         if bot.reactions._worker:
             bot.reactions._worker.cancel()
 
-    albums = client.albums[albums_before:]
+    posts = client.posted[before:]
     check("смешанный альбом ушёл ровно по одному разу складу и двум клиентам",
-          len(albums) == 3 and {album[0].chat.id for album in albums} == {world["sport"].id, chan_a.id, chan_b.id})
-    check("клиентские альбомы сохранили видео, фото, видео и одну подпись",
-          len(albums) == 3 and all(
-              len(album) == 3 and album[0].video and album[0].video.file_id == "tenant-album-v1"
-              and album[1].photo and album[1].photo.file_id == "tenant-album-p1"
-              and album[2].video and album[2].video.file_id == "tenant-album-v2"
-              and [item.caption or "" for item in album] == ["переписанный текст", "", ""]
-              for album in albums))
+          len(posts) == 3 and {post.chat.id for post in posts} == {world["sport"].id, chan_a.id, chan_b.id}
+          and len(client.albums) == albums_before)
+    check("клиентам ушло только первое видео и одна подпись",
+          len(posts) == 3 and all(
+              post.video and post.video.file_id == "tenant-album-v1" and (post.caption or "") == "переписанный текст"
+              for post in posts))
     check("повтор карточек не повторяет клиентский рерайт и публикации",
           ai.calls == ai_before + 1 and bot.stats["published"] == published_before + 3)
     check("каждый клиент платит один пост квоты за весь альбом",
           store.usage[5001] == quota_before[5001] + 1 and store.usage[5002] == quota_before[5002] + 1
           and store.usage[5003] == quota_before[5003] and store.usage[5004] == quota_before[5004], str(store.usage))
-    first_cards = {(album[0].chat.id, album[0].id) for album in albums}
+    first_cards = {(post.chat.id, post.id) for post in posts}
     forwarded = client.forwarded[promo_before:]
-    check("промо получает только первую карточку каждого альбома",
+    check("промо получает каждый одиночный пост один раз",
           len(forwarded) == 3 and {(chat_id, message_id) for _, chat_id, message_id in forwarded} == first_cards,
           str(forwarded))
     reacted = {(chat_id, message_id) for chat_id, message_id in first_cards if chat_id != chan_b.id}
-    check("реакции вызываются один раз на альбом, а не на каждую карточку",
+    check("реакции вызываются один раз на пост",
           len(scheduled) == 2 and set(scheduled) == reacted, str(scheduled))
-    check("кабинет запомнил первую карточку клиентского альбома",
-          any(album[0].chat.id == chan_a.id and store.tenants[5001].last_post_id == album[0].id for album in albums))
-    check("клиентские видеоальбомы не дублируются одиночными или текстовыми постами",
-          len(client.posted) == before and not [text for chat, text in client.sent[sent_before:]
-                                                if chat in {world["sport"].id, chan_a.id, chan_b.id}])
+    check("кабинет запомнил пост клиента",
+          any(post.chat.id == chan_a.id and store.tenants[5001].last_post_id == post.id for post in posts))
     check("смешанные клиентские альбомы без ошибок", bot.stats["errors"] == 0, str(bot.stats))
 
 
