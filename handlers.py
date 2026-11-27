@@ -441,7 +441,8 @@ class ParsBot:
         await asyncio.sleep(self.cfg.album_wait)
 
         items = await call(self.client.get_media_group, message.chat.id, message.id)
-        media_items = [item for item in items if post_media(item)][:TELEGRAM_ALBUM_LIMIT]
+        # В наши каналы идёт пост с одним файлом: берём только первое фото или первое видео альбома.
+        media_items = [item for item in items if post_media(item)][:1]
         original = next((item.caption for item in items if (item.caption or "").strip()), "").strip()
         if not original and not any(getattr(item, "video", None) for item in media_items):
             log.info("В альбоме %s нет текста или видео - пропуск.", group_id)

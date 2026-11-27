@@ -1048,18 +1048,14 @@ async def check_album():
     await bot.on_message(client, cards[2])
     await bot.on_message(client, cards[1])
 
-    check("альбом опубликован один раз", len(client.albums) == 1, str(len(client.albums)))
-    posted = client.albums[0]
-    check("все карточки на месте", len(posted) == 3, str(len(posted)))
-    check(
-        "подпись только на первой карточке",
-        posted[0].caption == "переписанный текст" and not posted[1].caption and not posted[2].caption,
-        str([item.caption for item in posted]),
-    )
+    check("альбом не уходит альбомом: в канал идёт один файл", len(client.albums) == 0 and len(client.posted) == 1,
+          f"{len(client.albums)}/{len(client.posted)}")
+    posted = client.posted[0]
+    check("взято только первое фото альбома", posted.photo and posted.photo.file_id == "a1", str(posted.photo))
+    check("подпись альбома перенесена на единственное фото", posted.caption == "переписанный текст", repr(posted.caption))
     check("нейросеть вызвана один раз", ai.calls == 1, str(ai.calls))
-    check("карточки по file_id", [item.photo.file_id for item in posted] == ["a1", "a2", "a3"])
-    check("альбом ушёл в канал темы", posted[0].chat.id == world["sport"].id)
-    check("промо по карточке с текстом", client.forwarded[0][2] == posted[0].id, str(client.forwarded))
+    check("пост ушёл в канал темы", posted.chat.id == world["sport"].id)
+    check("промо по этому посту", client.forwarded[0][2] == posted.id, str(client.forwarded))
 
 
 async def check_videos():
@@ -1114,44 +1110,49 @@ async def check_videos():
             Message(client, 111, donor, video=Video("mix-v1"), group="mixed-video"),
             Message(client, 112, donor, photo=Photo("mix-p1"), group="mixed-video", caption="Подпись второй карточки"),
             Message(client, 113, donor, video=Video("mix-v2"), group="mixed-video"),
-        ], [("video", "mix-v1"), ("photo", "mix-p1"), ("video", "mix-v2")]),
+        ], ("video", "mix-v1")),
         ("video-only", [
             Message(client, 121, donor, video=Video("only-v1"), group="video-only"),
             Message(client, 122, donor, video=Video("only-v2"), group="video-only", caption="Вторая часть обзора"),
-        ], [("video", "only-v1"), ("video", "only-v2")]),
+        ], ("video", "only-v1")),
+        ("photo-first", [
+            Message(client, 161, donor, photo=Photo("pf-p1"), group="photo-first"),
+            Message(client, 162, donor, video=Video("pf-v1"), group="photo-first", caption="Подпись"),
+        ], ("photo", "pf-p1")),
     ):
         client.donor_messages[donor.id] = cards
-        albums_before, calls_before, promo_before = len(client.albums), ai.calls, len(client.forwarded)
+        posts_before, albums_before, calls_before, promo_before = len(client.posted), len(client.albums), ai.calls, len(client.forwarded)
         for card in (cards[0], cards[-1], cards[1], cards[0]):
             await bot.on_message(client, card)
-        check(f"{group}: повторные карточки не дублируют альбом", len(client.albums) == albums_before + 1)
-        posted = client.albums[-1] if len(client.albums) > albums_before else []
-        check(f"{group}: все фото и видео сохранены по порядку", media_ids(posted) == expected, str(media_ids(posted)))
-        check(f"{group}: подпись второй карточки перенесена только на первую",
-              [item.caption or "" for item in posted] == ["переписанный текст"] + [""] * (len(cards) - 1))
+        check(f"{group}: повторные карточки дают один пост, а не альбом",
+              len(client.posted) == posts_before + 1 and len(client.albums) == albums_before)
+        posted = client.posted[-1]
+        check(f"{group}: взят только первый файл", media_ids([posted]) == [expected], str(media_ids([posted])))
+        check(f"{group}: подпись перенесена на единственный файл", (posted.caption or "") == "переписанный текст")
         check(f"{group}: рерайт и промо ровно один раз",
               ai.calls == calls_before + 1 and len(client.forwarded) == promo_before + 1
-              and posted and client.forwarded[-1][2] == posted[0].id)
+              and client.forwarded[-1][2] == posted.id)
 
-    calls_before, albums_before = ai.calls, len(client.albums)
-    for group, cards, expected in (
-        ("bare-mixed", [
-            Message(client, 131, donor, photo=Photo("bare-photo"), group="bare-mixed"),
-            Message(client, 132, donor, video=Video("bare-mixed-video"), group="bare-mixed"),
-        ], [("photo", "bare-photo"), ("video", "bare-mixed-video")]),
-        ("bare-videos", [
-            Message(client, 133, donor, video=Video("bare-only-v1"), group="bare-videos"),
-            Message(client, 134, donor, video=Video("bare-only-v2"), group="bare-videos"),
-        ], [("video", "bare-only-v1"), ("video", "bare-only-v2")]),
-    ):
-        client.donor_messages[donor.id] = cards
-        before = len(client.albums)
-        for card in cards:
-            await bot.on_message(client, card)
-        posted = client.albums[-1] if len(client.albums) > before else []
-        check(f"{group}: альбом без текста сохраняет все носители",
-              len(client.albums) == before + 1 and media_ids(posted) == expected and all(not item.caption for item in posted))
-    check("альбомы с видео без текста не вызывают ИИ", ai.calls == calls_before and len(client.albums) == albums_before + 2)
+    calls_before, albums_before, posts_before = ai.calls, len(client.albums), len(client.posted)
+    cards = [
+        Message(client, 131, donor, photo=Photo("bare-photo"), group="bare-mixed"),
+        Message(client, 132, donor, video=Video("bare-mixed-video"), group="bare-mixed"),
+    ]
+    client.donor_messages[donor.id] = cards
+    for card in cards:
+        await bot.on_message(client, card)
+    check("bare-mixed: первое фото без текста по-прежнему пропускается", len(client.posted) == posts_before)
+    cards = [
+        Message(client, 133, donor, video=Video("bare-only-v1"), group="bare-videos"),
+        Message(client, 134, donor, video=Video("bare-only-v2"), group="bare-videos"),
+    ]
+    client.donor_messages[donor.id] = cards
+    for card in cards:
+        await bot.on_message(client, card)
+    check("bare-videos: видео без текста уходит одним первым видео",
+          len(client.posted) == posts_before + 1 and client.posted[-1].video.file_id == "bare-only-v1"
+          and not client.posted[-1].caption and len(client.albums) == albums_before)
+    check("видео без текста не вызывают ИИ", ai.calls == calls_before)
 
     before = len(client.posted)
     albums_before, calls_before = len(client.albums), ai.calls
