@@ -16,9 +16,12 @@ API_URL = "https://smm.plus/api/v2"
 REACTIONS_MAX = 50
 
 
-def roll_reactions(cfg) -> int:
-    low = max(1, min(cfg.smmplus_min, REACTIONS_MAX))
-    return random.randint(low, REACTIONS_MAX)
+def roll_reactions(cfg, low: Optional[int] = None, high: Optional[int] = None) -> int:
+    """Случайное число реакций: из заданного диапазона канала, иначе от smmplus_min до 50."""
+    floor = max(1, min(cfg.smmplus_min, REACTIONS_MAX))
+    low = max(floor, min(low or floor, REACTIONS_MAX))
+    high = min(max(high or low, low), REACTIONS_MAX)
+    return random.randint(low, high)
 
 
 async def order(session: aiohttp.ClientSession, cfg, link: str, quantity: int) -> Optional[str]:

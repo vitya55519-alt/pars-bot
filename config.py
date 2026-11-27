@@ -97,6 +97,17 @@ def parse_post_limit(raw: str) -> int:
     return value
 
 
+def parse_reactions_range(raw: str, low: int = 10, high: int = 50):
+    """Реакции на пост: число («20») или диапазон («10-30») от low до high; для одного числа «до» - None."""
+    try:
+        number, top = parse_views_range(raw, low=1)
+    except ValueError:
+        raise ValueError(f"Напиши число от {low} до {high} или диапазон, например 10-30.") from None
+    if number < low or number > high or (top is not None and top > high):
+        raise ValueError(f"Реакций на пост от {low} до {high}: меньше {low} сервис не выполняет.")
+    return number, top
+
+
 def parse_views_range(raw: str, low: int = 1):
     """Просмотры из строки пользователя: одно число («144») или диапазон («1200-1600», «1200 до 1600»).
 
